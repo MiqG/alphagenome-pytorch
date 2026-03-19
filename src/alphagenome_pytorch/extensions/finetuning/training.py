@@ -1772,6 +1772,20 @@ def train_epoch_sequence_parallel(
                 pred = predictions[res]
                 targets = targets_dict[res].to(device)
 
+                # Slice targets to match local shard for this rank (sequence parallel)
+                # targets shape: (B, S_full, n_tracks) channels_last
+                full_len = targets.shape[1]
+                local_len = full_len // world_size
+                t_start = rank * local_len
+                if res == 1:
+                    # 1bp resolution: use full local_len
+                    targets = targets[:, t_start:t_start + local_len, :]
+                else:
+                    # 128bp resolution: use local_len // 128
+                    local_len_lowres = local_len // 128
+                    t_start_lowres = rank * local_len_lowres
+                    targets = targets[:, t_start_lowres:t_start_lowres + local_len_lowres, :]
+
                 head_module = head.module if hasattr(head, "module") else head
                 targets = head_module.scale(
                     targets, organism_idx, resolution=res, channels_last=True
