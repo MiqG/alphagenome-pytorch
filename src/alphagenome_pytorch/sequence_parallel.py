@@ -16,6 +16,7 @@ Architecture:
 
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_fn
 from typing import Optional, Tuple, Dict, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -108,8 +109,12 @@ class SequenceParallelism:
         world = self.world_size
 
         # Gather all raw (overlapped) shards
-        shards = [torch.zeros_like(x_local) for _ in range(world)]
-        dist.all_gather(shards, x_local)
+        # Use differentiable all_gather when grad is enabled (for encoder training via transformer)
+        if torch.is_grad_enabled() and x_local.requires_grad:
+            shards = list(dist_fn.all_gather(x_local))
+        else:
+            shards = [torch.zeros_like(x_local) for _ in range(world)]
+            dist.all_gather(shards, x_local)
 
         # Trim overlaps per rank
         trimmed = []
@@ -347,6 +352,22 @@ class SequenceParallelism:
         else:
             embeddings_1bp = None
             del intermediates_local
+
+        # Trim overlap from output embeddings to match non-overlapping region this rank owns
+        world = self.world_size
+        rank = self.rank
+        left_lo = self.overlap_lowres if rank > 0 else 0
+        right_lo = self.overlap_lowres if rank < world - 1 else 0
+
+        if left_lo or right_lo:
+            r_end = embeddings_128bp.shape[-1] - right_lo if right_lo else embeddings_128bp.shape[-1]
+            embeddings_128bp = embeddings_128bp[..., left_lo:r_end]
+
+        if need_1bp and embeddings_1bp is not None:
+            left_hi = left_lo * 128
+            right_hi = right_lo * 128
+            r_end = embeddings_1bp.shape[-1] - right_hi if right_hi else embeddings_1bp.shape[-1]
+            embeddings_1bp = embeddings_1bp[..., left_hi:r_end]
 
         # Return embeddings in NCL format - same contract as model.encode(channels_last=False)
         embeddings_dict: Dict[int, torch.Tensor] = {128: embeddings_128bp}
