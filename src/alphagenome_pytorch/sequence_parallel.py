@@ -37,7 +37,7 @@ class SequenceParallelism:
     def __init__(
         self,
         overlap_highres: int = 1024,
-        overlap_lowres: int = 32,
+        overlap_lowres: int = 8,
     ):
         """Initialize SequenceParallelism."""
         self.overlap_highres = overlap_highres
@@ -107,27 +107,48 @@ class SequenceParallelism:
             Full tensor (..., L) with overlap regions removed and shards concatenated.
         """
         world = self.world_size
-
-        # Gather all raw (overlapped) shards
+        device = x_local.device
+        
+        # Gather all raw (overlapped) shards        
+        # consider that shards can have different shapes
         # Use differentiable all_gather when grad is enabled (for encoder training via transformer)
-        if torch.is_grad_enabled() and x_local.requires_grad:
-            shards = list(dist_fn.all_gather(x_local))
-        else:
-            shards = [torch.zeros_like(x_local) for _ in range(world)]
-            dist.all_gather(shards, x_local)
+        # Gather actual lengths from all ranks (may differ due to overlap on boundary ranks)
+        local_len = torch.tensor(x_local.shape[-1], device=device, dtype=torch.long)
+        shape_list = [torch.zeros_like(local_len) for _ in range(world)]
+        dist.all_gather(shape_list, local_len)
+        shapes = [int(s.item()) for s in shape_list]
+        max_len = max(shapes)
+        *leading_dims, _ = x_local.shape
 
+        if torch.is_grad_enabled() and x_local.requires_grad:
+            # dist_fn.all_gather is differentiable but requires equal-sized tensors.
+            # Pad to max_len, gather, then unpad using the collected shapes.
+            pad = max_len - x_local.shape[-1]
+            x_padded = torch.nn.functional.pad(x_local, (0, pad))
+            gathered_padded = list(dist_fn.all_gather(x_padded))
+            shards = [g[..., :shapes[i]] for i, g in enumerate(gathered_padded)]
+        else:
+            shards = [
+                torch.zeros(*leading_dims, shapes[i], device=device, dtype=x_local.dtype)
+                for i in range(world)
+            ]
+            dist.all_gather(shards, x_local)
+            
         # Trim overlaps per rank
         trimmed = []
         for rank_idx, shard in enumerate(shards):
             # Left trim except rank 0
             left = overlap if rank_idx > 0 else 0
             # Right trim except last rank
-            right = shard.shape[-1] - overlap if rank_idx < world - 1 else shard.shape[-1]
-            trimmed.append(shard[..., left:right])
+            right = shard.shape[-1] - overlap if rank_idx < (world - 1) else shard.shape[-1]
+            
+            shard_trimmed = shard[..., left:right]
+            
+            trimmed.append(shard_trimmed)
 
         # Concatenate into final full tensor
         full = torch.cat(trimmed, dim=-1)
-
+        
         # Optional validation
         if expected_len is not None:
             assert full.shape[-1] == expected_len, (
@@ -272,6 +293,7 @@ class SequenceParallelism:
         sequence: torch.Tensor,
         organism_index: torch.Tensor,
         resolutions: Optional[Tuple[int, ...]] = (1, 128),
+        original_length: Optional[int] = None,
     ) -> Tuple[Dict[int, torch.Tensor], Any]:
         """Run a sequence-parallel forward pass through AlphaGenome.
 
@@ -287,6 +309,10 @@ class SequenceParallelism:
             organism_index: Organism index per sample (B,). 0=human, 1=mouse.
             resolutions: Resolutions to compute.  When 1 is absent, the decoder
                 is skipped for efficiency.
+            original_length: If the sequence was padded before this call, pass the
+                original (unpadded) length here.  The output embeddings will be
+                trimmed so each rank covers exactly original_length // world_size
+                positions, discarding the padding-derived positions.
 
         Returns:
             Tuple of (embeddings_dict, pair_activations) where embeddings_dict
@@ -295,7 +321,7 @@ class SequenceParallelism:
         """
         # Cast to compute dtype (mirrors _compute_embeddings_ncl)
         sequence = model.dtype_policy.cast_to_compute(sequence)
-
+        
         # sequence input is NLC (B, S, 4); convert to NCL (B, 4, S) for last-dim sharding
         sequence_ncl = sequence.transpose(1, 2)  # (B, 4, S)
         L_full = sequence_ncl.shape[-1]
@@ -303,11 +329,12 @@ class SequenceParallelism:
         # ===== LOCAL: Encoder =====
         # Shard along sequence dim (last dim in NCL)
         sequence_local_ncl = self.shard_sequence(sequence_ncl, self.overlap_highres)
+        
         # Encoder expects NLC (B, S, 4) - transpose back
         sequence_local_nlc = sequence_local_ncl.transpose(1, 2)
         trunk_local, intermediates_local = model.encoder(sequence_local_nlc)
         # trunk_local: (B, 1536, S_local//128) NCL
-
+        
         # ===== GLOBAL: Transformer =====
         # All-gather trunk in NCL format (last dim = sequence positions)
         expected_lowres_len = L_full // 128
@@ -322,7 +349,7 @@ class SequenceParallelism:
         # Add organism embedding (mirrors _compute_embeddings_ncl)
         org_emb = model.organism_embed(organism_index).unsqueeze(1)  # (B, 1, 1536)
         trunk_global_nlc = trunk_global_nlc + org_emb
-
+        
         # Run transformer globally
         trunk_global_nlc, pair_activations = model.tower(
             trunk_global_nlc, compute_dtype=model.dtype_policy.compute_dtype
@@ -369,12 +396,20 @@ class SequenceParallelism:
             r_end = embeddings_1bp.shape[-1] - right_hi if right_hi else embeddings_1bp.shape[-1]
             embeddings_1bp = embeddings_1bp[..., left_hi:r_end]
 
-        # Return embeddings in NCL format - same contract as model.encode(channels_last=False)
-        embeddings_dict: Dict[int, torch.Tensor] = {128: embeddings_128bp}
-        if embeddings_1bp is not None:
-            embeddings_dict[1] = embeddings_1bp
-
-        return embeddings_dict, pair_activations
+        # If the sequence was padded before this call, trim output embeddings back
+        # to the per-rank size that corresponds to the original (unpadded) length.
+        if original_length is not None and original_length < L_full:
+            world = self.world_size
+            local_orig_lo = (original_length // world) // 128
+            embeddings_128bp = embeddings_128bp[..., :local_orig_lo]
+            if embeddings_1bp is not None:
+                local_orig = original_length // world
+                embeddings_1bp = embeddings_1bp[..., :local_orig]
+            
+        # Pair Embeddings (B, S, S, D) - different format, not NCL
+        embeddings_pair = model.embedder_pair(pair_activations, organism_index)
+        
+        return embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp
 
 
 def create_sequence_parallel_strategy(
