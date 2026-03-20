@@ -21,6 +21,7 @@ from torch.amp import autocast
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 from tqdm import tqdm
 
 from alphagenome_pytorch.losses import multinomial_loss
@@ -1725,26 +1726,58 @@ def train_epoch_sequence_parallel(
         sequences = sequences.to(device)
         organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
 
+        # Align sequence length to world_size * 128 for sequence parallelism.
+        # This ensures each rank's base shard size is divisible by 128, so the
+        # encoder's strided convolutions produce exact token counts.
+        # this will be triggered when the world_size is not a multiple of 2
+        if sequence_parallel is not None and world_size > 1:
+            pad_multiple = world_size * 128 * 16  # lowres length must also be divisible by 16 for pair updates
+            seq_len = sequences.shape[1]
+            padded_len = ((seq_len + pad_multiple - 1) // pad_multiple) * pad_multiple
+            if padded_len > seq_len:
+                n_pad = padded_len - seq_len
+                if rank == 0:  # Print warning only once per batch
+                    import warnings
+                    warnings.warn(
+                        f"Sequence length {seq_len} not divisible by {pad_multiple}. "
+                        f"Padding to {padded_len} (+{n_pad} bp) for sequence parallelism.",
+                        stacklevel=2
+                    )
+                sequences = torch.nn.functional.pad(sequences, (0, 0, 0, n_pad))  # pad (S, 4) on S dim
+
         # ===== BACKBONE: sequence-parallel forward =====
         # Returns embeddings_dict in NCL format - same as model.encode(channels_last=False)
+        original_length = seq_len if padded_len > seq_len else None
+
+        def _build_embeddings_dict(embeddings_1bp, embeddings_128bp, need_1bp_):
+            d = {128: embeddings_128bp}
+            if need_1bp_ and embeddings_1bp is not None:
+                d[1] = embeddings_1bp
+            return d
+
         if frozen_backbone:
             with torch.no_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                    embeddings_dict, _ = sequence_parallel.forward(
+                    embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = sequence_parallel.forward(
                         model=model_module,
                         sequence=sequences,
                         organism_index=organism_idx,
                         resolutions=resolutions,
+                        original_length=original_length,
                     )
-            embeddings_dict = {res: emb.detach() for res, emb in embeddings_dict.items()}
+            embeddings_1bp = embeddings_1bp.detach() if embeddings_1bp is not None else None
+            embeddings_128bp = embeddings_128bp.detach()
+            embeddings_dict = _build_embeddings_dict(embeddings_1bp, embeddings_128bp, need_1bp)
         else:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                embeddings_dict, _ = sequence_parallel.forward(
+                embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = sequence_parallel.forward(
                     model=model_module,
                     sequence=sequences,
                     organism_index=organism_idx,
                     resolutions=resolutions,
+                    original_length=original_length,
                 )
+            embeddings_dict = _build_embeddings_dict(embeddings_1bp, embeddings_128bp, need_1bp)
 
         # ===== HEADS + LOSS (mirrors train_epoch_multihead exactly) =====
         loss = torch.tensor(0.0, device=device)
@@ -1759,9 +1792,16 @@ def train_epoch_sequence_parallel(
             targets_dict = modality_targets[modality]
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                predictions = head(
-                    embeddings_dict, organism_idx, return_scaled=True, channels_last=True
-                )
+                # contact_maps head takes embeddings_pair directly; all other
+                # GenomeTracksHead variants take embeddings_dict.
+                if modality == "contact_maps":
+                    predictions = head(
+                        embeddings_pair, organism_idx, channels_last=True
+                    )
+                else:
+                    predictions = head(
+                        embeddings_dict, organism_idx, return_scaled=True, channels_last=True
+                    )
 
             modality_loss = torch.tensor(0.0, device=device)
 
@@ -1772,19 +1812,14 @@ def train_epoch_sequence_parallel(
                 pred = predictions[res]
                 targets = targets_dict[res].to(device)
 
-                # Slice targets to match local shard for this rank (sequence parallel)
-                # targets shape: (B, S_full, n_tracks) channels_last
+                # Slice targets to match local shard for this rank (sequence parallel).
+                # Targets are at their native resolution (e.g. S_full for 1bp,
+                # S_full//128 for 128bp), so a single split by world_size works
+                # regardless of resolution.
                 full_len = targets.shape[1]
                 local_len = full_len // world_size
                 t_start = rank * local_len
-                if res == 1:
-                    # 1bp resolution: use full local_len
-                    targets = targets[:, t_start:t_start + local_len, :]
-                else:
-                    # 128bp resolution: use local_len // 128
-                    local_len_lowres = local_len // 128
-                    t_start_lowres = rank * local_len_lowres
-                    targets = targets[:, t_start_lowres:t_start_lowres + local_len_lowres, :]
+                targets = targets[:, t_start:t_start + local_len, :]
 
                 head_module = head.module if hasattr(head, "module") else head
                 targets = head_module.scale(
@@ -1824,6 +1859,18 @@ def train_epoch_sequence_parallel(
         is_last_batch = batch_idx == len(train_loader) - 1
 
         if is_accumulation_step or is_last_batch:
+            # Sequence parallelism bypasses DDP's forward() so its allreduce hook
+            # never fires. Manually allreduce gradients so all ranks apply the same
+            # parameter update.
+            if world_size > 1:
+                trainable_params = []
+                for head in heads.values():
+                    trainable_params.extend([p for p in head.parameters() if p.requires_grad])
+                trainable_params.extend([p for p in model.parameters() if p.requires_grad])
+                for p in trainable_params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
             trainable_params = []
             for head in heads.values():
                 trainable_params.extend([p for p in head.parameters() if p.requires_grad])
