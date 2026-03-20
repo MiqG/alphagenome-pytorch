@@ -328,6 +328,7 @@ def parse_args() -> argparse.Namespace:
     out.add_argument("--output-dir", type=str, default=DEFAULTS["output_dir"])
     out.add_argument("--run-name", type=str, default=None)
     out.add_argument("--save-every", type=int, default=DEFAULTS["save_every"])
+    out.add_argument("--no-save-checkpoints", action="store_true", help="Skip saving model checkpoints (keeps logs/config)")
 
     # Resume arguments
     resume = parser.add_argument_group("Resume / Checkpointing")
@@ -1058,7 +1059,7 @@ def main() -> None:
 
     def _save_preempt():
         """Save preemption checkpoint."""
-        if is_main_process(rank):
+        if is_main_process(rank) and not args.no_save_checkpoints:
             save_checkpoint(
                 path=output_dir / "checkpoint_preempt.pth",
                 epoch=max(0, current_epoch - 1),  # Last completed epoch
@@ -1222,7 +1223,7 @@ def main() -> None:
             logger.log_epoch(epoch, train_loss, val_loss, current_lr, is_best, extra, histograms)
 
             # Save checkpoints
-            if is_main_process(rank):
+            if is_main_process(rank) and not args.no_save_checkpoints:
                 if is_best:
                     best_val_loss = val_loss
                     save_checkpoint(
