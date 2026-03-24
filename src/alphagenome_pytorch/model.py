@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 from pathlib import Path
 import warnings
 
@@ -520,10 +520,12 @@ class AlphaGenome(nn.Module):
         self,
         dna_sequence,
         organism_index,
+        *,
         splice_site_positions=None,
         return_embeddings=False,
         return_scaled_predictions=False,
         resolutions=None,
+        heads: Optional[Tuple[str, ...]] = None,
         channels_last=True,
         embeddings_only=False,
         encoder_only=False,
@@ -540,6 +542,9 @@ class AlphaGenome(nn.Module):
                                        If False, return experimental space (for inference).
             resolutions: Tuple of resolutions to compute, e.g. (1, 128) or (128,).
                          If None, computes all resolutions.
+            heads: Tuple of head names to compute, e.g. ('atac',) or ('atac', 'dnase').
+                   If None, computes all heads. Use this to skip expensive unused heads
+                   during inference.
             channels_last: Format for embeddings and head outputs.
                 - True (default): NLC format (B, S, C) - user-friendly, matches JAX
                 - False: NCL format (B, C, S) - for training efficiency (0 transposes)
@@ -556,12 +561,39 @@ class AlphaGenome(nn.Module):
             resolution (1 or 128) to prediction tensors.
             If return_embeddings is True, also contains 'embeddings_1bp' and 'embeddings_128bp'.
             If encoder_only is True, returns ``{"encoder_output": tensor}`` only.
+
+        Raises:
+            ValueError: If unknown head names are specified in ``heads``.
         """
         if encoder_only:
             # Return raw CNN encoder output before organism embedding and transformer.
             trunk, _intermediates = self.encoder(dna_sequence)
             outputs = {"encoder_output": trunk}
             return self._cast_outputs(outputs)
+
+        # Validate heads parameter
+        if heads is not None:
+            # Build set of all valid head names
+            valid_heads = set(self.heads.keys())
+            if self.contact_maps_head is not None:
+                valid_heads.add('pair_activations')
+            if self.splice_sites_classification_head is not None:
+                valid_heads.add('splice_sites_classification')
+            if self.splice_sites_usage_head is not None:
+                valid_heads.add('splice_sites_usage')
+            if self.splice_sites_junction_head is not None:
+                valid_heads.add('splice_sites_junction')
+
+            # Check for unknown heads
+            unknown_heads = set(heads) - valid_heads
+            if unknown_heads:
+                raise ValueError(
+                    f"Unknown head names: {sorted(unknown_heads)}. "
+                    f"Available heads: {sorted(valid_heads)}"
+                )
+            head_set = set(heads)
+        else:
+            head_set = None
 
         # Compute embeddings (NCL format internally)
         embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
@@ -577,6 +609,8 @@ class AlphaGenome(nn.Module):
 
         if not embeddings_only:
             for name, head in self.heads.items():
+                if head_set is not None and name not in head_set:
+                    continue
                 outputs[name] = head(
                     embeddings_dict, organism_index,
                     return_scaled=return_scaled_predictions,
@@ -585,47 +619,70 @@ class AlphaGenome(nn.Module):
 
             # Contact Maps (pair activations format)
             if self.contact_maps_head is not None:
-                outputs['pair_activations'] = self.contact_maps_head(
-                    embeddings_pair, organism_index, channels_last=channels_last
-                )
+                if head_set is None or 'pair_activations' in head_set:
+                    outputs['pair_activations'] = self.contact_maps_head(
+                        embeddings_pair, organism_index, channels_last=channels_last
+                    )
 
             # Splice predictions (require 1bp embeddings)
-            if need_1bp:
-                if self.splice_sites_classification_head is not None:
-                    outputs['splice_sites_classification'] = self.splice_sites_classification_head(
+            need_splice = head_set is None or any(
+                k in head_set for k in ('splice_sites_classification', 'splice_sites_usage', 'splice_sites_junction')
+            )
+            if need_1bp and need_splice:
+                # Also compute classification when junction needs it for position generation
+                classification_output = None
+                need_classification = (
+                    head_set is None
+                    or 'splice_sites_classification' in head_set
+                    or (
+                        'splice_sites_junction' in head_set
+                        and splice_site_positions is None
+                    )
+                )
+                if self.splice_sites_classification_head is not None and need_classification:
+                    classification_output = self.splice_sites_classification_head(
                         embeddings_1bp, organism_index, channels_last=channels_last
                     )
+                    if head_set is None or 'splice_sites_classification' in head_set:
+                        outputs['splice_sites_classification'] = classification_output
                 if self.splice_sites_usage_head is not None:
-                    outputs['splice_sites_usage'] = self.splice_sites_usage_head(
-                        embeddings_1bp, organism_index, channels_last=channels_last
-                    )
+                    if head_set is None or 'splice_sites_usage' in head_set:
+                        outputs['splice_sites_usage'] = self.splice_sites_usage_head(
+                            embeddings_1bp, organism_index, channels_last=channels_last
+                        )
 
                 if self.splice_sites_junction_head is not None:
-                    # Use provided positions if given, otherwise generate from classification
-                    if splice_site_positions is not None:
-                        top_k_positions = splice_site_positions
-                    else:
-                        # probs: (B, S, 5) NLC - already correct format for generate_splice_site_positions
-                        splice_site_probs = outputs['splice_sites_classification']['probs']
+                    if head_set is None or 'splice_sites_junction' in head_set:
+                        # Use provided positions if given, otherwise generate from classification
+                        if splice_site_positions is not None:
+                            top_k_positions = splice_site_positions
+                        else:
+                            if classification_output is None:
+                                raise ValueError(
+                                    "splice_sites_junction requires either splice_site_positions "
+                                    "or an available splice_sites_classification head"
+                                )
+                            # probs: (B, S, 5) NLC - already correct format for generate_splice_site_positions
+                            splice_site_probs = classification_output['probs']
 
-                        # If NCL (channels_last=False), transpose back to NLC for generate_splice_site_positions
-                        if not channels_last:
-                            splice_site_probs = splice_site_probs.transpose(1, 2)
+                            # If NCL (channels_last=False), transpose back to NLC for generate_splice_site_positions
+                            if not channels_last:
+                                splice_site_probs = splice_site_probs.transpose(1, 2)
 
-                        top_k_positions = generate_splice_site_positions(
-                            ref=splice_site_probs,
-                            alt=None,
-                            true_splice_sites=None,
-                            k=512,
-                            pad_to_length=512,
-                            threshold=0.1,
+                            top_k_positions = generate_splice_site_positions(
+                                ref=splice_site_probs,
+                                alt=None,
+                                true_splice_sites=None,
+                                k=512,
+                                pad_to_length=512,
+                                threshold=0.1,
+                            )
+                        outputs['splice_sites_junction'] = self.splice_sites_junction_head(
+                            embeddings_1bp,
+                            organism_index,
+                            channels_last=channels_last,
+                            splice_site_positions=top_k_positions,
                         )
-                    outputs['splice_sites_junction'] = self.splice_sites_junction_head(
-                        embeddings_1bp,
-                        organism_index,
-                        channels_last=channels_last,
-                        splice_site_positions=top_k_positions,
-                    )
 
         if return_embeddings or embeddings_only:
             if channels_last:

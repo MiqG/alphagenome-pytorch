@@ -27,7 +27,6 @@ test = [
     "aiohttp",
     "requests",
     "pybigwig",
-    "pysam",
     "pyfaidx",
     "tqdm",
     "logomaker",
@@ -37,6 +36,11 @@ jax = [
     "jaxlib",
     "dm-haiku",
     "orbax-checkpoint",
+]
+inference = [
+    "pybigwig",
+    "pyfaidx",
+    "tqdm",
 ]
 finetuning = [
     "pybigwig",
