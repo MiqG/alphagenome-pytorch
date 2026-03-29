@@ -1132,6 +1132,8 @@ def train_epoch_multihead(
     save_every_steps: int | None = None,
     save_fn: Any | None = None,
     global_step_offset: int = 0,
+    skip_batches: int = 0,
+    save_state: dict | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1203,6 +1205,9 @@ def train_epoch_multihead(
     opt_step = 0
 
     for batch_idx, (sequences, modality_targets) in enumerate(pbar):
+        if batch_idx < skip_batches:
+            continue
+
         is_profiling = do_profile and batch_idx < profile_batches
 
         if is_profiling and batch_idx > 0:
@@ -1368,6 +1373,8 @@ def train_epoch_multihead(
             if save_every_steps is not None and save_fn is not None:
                 global_step = global_step_offset + opt_step
                 if global_step % save_every_steps == 0:
+                    if save_state is not None:
+                        save_state["batch_idx"] = batch_idx + 1
                     save_fn()
 
         raw_loss = loss.item()
@@ -1662,6 +1669,8 @@ def train_epoch_sequence_parallel(
     save_every_steps: int | None = None,
     save_fn: Any | None = None,
     global_step_offset: int = 0,
+    skip_batches: int = 0,
+    save_state: dict | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with sequence parallelism.
 
@@ -1737,6 +1746,9 @@ def train_epoch_sequence_parallel(
         pbar = train_loader
 
     for batch_idx, (sequences, modality_targets) in enumerate(pbar):
+        if batch_idx < skip_batches:
+            continue
+
         sequences = sequences.to(device)
         organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
 
@@ -1899,6 +1911,8 @@ def train_epoch_sequence_parallel(
             if save_every_steps is not None and save_fn is not None:
                 global_step = global_step_offset + opt_step
                 if global_step % save_every_steps == 0:
+                    if save_state is not None:
+                        save_state["batch_idx"] = batch_idx + 1
                     save_fn()
 
         # ===== LOGGING =====

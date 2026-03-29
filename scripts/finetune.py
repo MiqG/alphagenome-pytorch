@@ -985,6 +985,7 @@ def main() -> None:
     start_epoch = 1
     best_val_loss = float("inf")
     wandb_run_id = None
+    skip_batches = 0
 
     if resume_path and resume_path.exists():
         print_rank0(f"Resuming from: {resume_path}", rank)
@@ -996,6 +997,7 @@ def main() -> None:
             device="cpu",
         )
         start_epoch = ckpt["epoch"] + 1
+        skip_batches = ckpt.get("batch_idx", 0)
         best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
         wandb_run_id = ckpt.get("wandb_run_id")
         print_rank0(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
@@ -1058,6 +1060,7 @@ def main() -> None:
 
     # Preemption handler state
     current_epoch = start_epoch
+    _save_state: dict = {"batch_idx": 0}
 
     def _save_preempt():
         """Save preemption checkpoint."""
@@ -1074,6 +1077,7 @@ def main() -> None:
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
+                batch_idx=_save_state["batch_idx"],
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
 
@@ -1110,7 +1114,8 @@ def main() -> None:
 
             # Training
             steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
-            global_step_offset = (epoch - 1) * steps_per_epoch
+            epoch_skip = skip_batches if epoch == start_epoch else 0
+            global_step_offset = (epoch - 1) * steps_per_epoch + epoch_skip // args.gradient_accumulation_steps
             if args.sequence_parallel and sequence_parallel is not None:
                 # Sequence parallel training (distributes sequence across GPUs)
                 train_loss, per_modality_train_loss = train_epoch_sequence_parallel(
@@ -1142,6 +1147,8 @@ def main() -> None:
                     save_every_steps=args.save_every_steps,
                     save_fn=_save_preempt if not args.no_save_checkpoints else None,
                     global_step_offset=global_step_offset,
+                    skip_batches=epoch_skip,
+                    save_state=_save_state,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
@@ -1173,7 +1180,12 @@ def main() -> None:
                     save_every_steps=args.save_every_steps,
                     save_fn=_save_preempt if not args.no_save_checkpoints else None,
                     global_step_offset=global_step_offset,
+                    skip_batches=epoch_skip,
+                    save_state=_save_state,
                 )
+
+            skip_batches = 0  # Only skip on first resumed epoch
+            _save_state["batch_idx"] = 0
 
             if handler.preempted:
                 print_rank0("Preemption flag set - saving and exiting.", rank)
