@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
@@ -976,6 +977,216 @@ def collate_multimodal(
     return sequences, modality_targets
 
 
+class SpliceJunctionDataset(Dataset):
+    """Dataset for fine-tuning on splice junction data from STAR aligner output.
+
+    Reads STAR SJ.out.tab junction files and optional BigWig coverage files,
+    returning splice-site usage profiles as training targets at 1bp resolution.
+
+    Each STAR junction file contributes one splice-site usage track; each BigWig
+    file contributes one raw coverage track.  Tracks are concatenated in that
+    order along the last dimension.  The user is responsible for passing files in
+    a meaningful order — no strand filtering is applied internally.
+
+    Returns ``(sequence, targets_dict)`` where ``targets_dict[1]`` has shape
+    ``(seq_len, n_junc_files + n_bigwig_files)``.  Only 1bp resolution is
+    supported.
+
+    Args:
+        genome_fasta: Path to reference genome FASTA or a :class:`CachedGenome`.
+        bed_file: Path to BED file with intervals (chrom, start, end).
+        star_junction_files: List of paths to STAR SJ.out.tab files.
+        bigwig_files: Optional list of BigWig coverage files.
+        sequence_length: Desired sequence length; intervals are expanded /
+            truncated to this size from their centre.
+        min_unique_reads: Minimum uniquely-mapped reads for a junction to be
+            kept (default: 1).
+        filter_to_junctions: If True (default), discard intervals that contain
+            no complete splice junction across all provided files.
+    """
+
+    def __init__(
+        self,
+        genome_fasta: "str | CachedGenome",
+        bed_file: str,
+        star_junction_files: list,
+        bigwig_files: "list | None" = None,
+        sequence_length: int = 131_072,
+        min_unique_reads: int = 1,
+        filter_to_junctions: bool = True,
+    ):
+        super().__init__()
+        _ensure_genomic_deps()
+
+        from alphagenome_pytorch.extensions.finetuning.star_junctions import (
+            read_star_junctions,
+            junctions_to_splice_sites,
+            compute_splice_site_usage,
+            filter_intervals_with_junctions,
+        )
+        self._read_star_junctions = read_star_junctions
+        self._junctions_to_splice_sites = junctions_to_splice_sites
+        self._compute_splice_site_usage = compute_splice_site_usage
+
+        self.star_junction_files = [str(p) for p in star_junction_files]
+        self.bigwig_files = [str(p) for p in (bigwig_files or [])]
+        self.sequence_length = sequence_length
+        self.min_unique_reads = min_unique_reads
+
+        # Read intervals
+        intervals = pd.read_csv(
+            bed_file, sep="\t", header=None, usecols=[0, 1, 2],
+            names=["chrom", "start", "end"],
+        )
+
+        # Read and preprocess all junction files
+        self._all_juncs: list = []
+        for path in self.star_junction_files:
+            junc = read_star_junctions(path)
+            junc = junc.loc[junc["n_uniquely_mapped_reads"] >= min_unique_reads].copy()
+            junc = junc.loc[
+                junc["chrom"].str.contains("chr", na=False)
+                & junc["strand"].isin(["+", "-"])
+            ].drop_duplicates()
+            junc["exon_start"] = junc["intron_start"] - 1  # 1-based donor exon end
+            junc["exon_end"] = junc["intron_end"] + 1      # 1-based acceptor exon start
+            junc["count"] = junc["n_uniquely_mapped_reads"]
+            total = junc["count"].sum()
+            junc["cpm"] = 1e6 * junc["count"] / total if total > 0 else 0.0
+            self._all_juncs.append(junc)
+
+        # Union of all junctions (for interval filtering)
+        if self._all_juncs:
+            union_juncs = pd.concat(
+                [j[["chrom", "exon_start", "exon_end", "strand"]] for j in self._all_juncs],
+                ignore_index=True,
+            ).drop_duplicates()
+        else:
+            union_juncs = pd.DataFrame(columns=["chrom", "exon_start", "exon_end", "strand"])
+
+        # Optionally filter intervals to those overlapping at least one junction
+        if filter_to_junctions and not union_juncs.empty:
+            intervals, _ = filter_intervals_with_junctions(intervals, union_juncs)
+
+        # Expand / truncate intervals to sequence_length from centre
+        positions = []
+        for _, row in intervals.iterrows():
+            chrom, start, end = row["chrom"], int(row["start"]), int(row["end"])
+            if (end - start) != sequence_length:
+                center = (start + end) // 2
+                start = center - sequence_length // 2
+                end = center + sequence_length // 2
+            positions.append((chrom, start, end))
+        self._positions_list = positions
+
+        # Genome access
+        if isinstance(genome_fasta, CachedGenome):
+            self._genome_cache = genome_fasta
+            self._fasta_path = genome_fasta.fasta_path
+        else:
+            self._genome_cache = None
+            self._fasta_path = str(genome_fasta)
+        self._fasta = None
+
+        # BigWig handles opened lazily per worker
+        self._bw_handles = None
+        self._worker_pid = None
+
+    def _ensure_handles(self) -> None:
+        import os
+        pid = os.getpid()
+        if self._worker_pid != pid:
+            self._worker_pid = pid
+            if self._genome_cache is None:
+                self._fasta = pyfaidx.Fasta(self._fasta_path)
+            self._bw_handles = [pyBigWig.open(p) for p in self.bigwig_files]
+
+    def _get_sequence(self, chrom: str, start: int, end: int) -> np.ndarray:
+        if self._genome_cache is not None:
+            seq = self._genome_cache.fetch(chrom, max(0, start), end)
+            if start < 0:
+                pad = np.zeros((-start, 4), dtype=np.uint8)
+                seq = np.concatenate([pad, seq], axis=0)
+            return seq
+        from alphagenome_pytorch.utils.sequence import sequence_to_onehot
+        seq_str = str(self._fasta[chrom][max(0, start):end])
+        if start < 0:
+            seq_str = "N" * (-start) + seq_str
+        return sequence_to_onehot(seq_str)
+
+    def _get_splice_usage(
+        self, junc_df: pd.DataFrame, chrom: str, start: int, end: int,
+    ) -> np.ndarray:
+        """Return splice-site usage profile for one junction file. Shape: (seq_len,)."""
+        seq_len = end - start
+        mask = (
+            (junc_df["chrom"] == chrom)
+            & (junc_df["exon_start"] >= start)
+            & (junc_df["exon_end"] < end)
+        )
+        juncs_oi = junc_df.loc[mask]
+        usage = np.zeros(seq_len, dtype=np.float32)
+        if juncs_oi.empty:
+            return usage
+
+        sites = self._junctions_to_splice_sites(juncs_oi)
+        for _, site in sites[["chrom", "strand", "position"]].drop_duplicates().iterrows():
+            info = self._compute_splice_site_usage(
+                junc_df, site["chrom"], int(site["position"]), site["strand"]
+            )
+            idx = int(info["position"]) - start - 1  # 0-based relative index
+            if 0 <= idx < seq_len:
+                usage[idx] = float(info["splice_site_usage"])
+        return usage
+
+    def __len__(self) -> int:
+        return len(self._positions_list)
+
+    def __getitem__(self, idx: int):
+        """Get a single sample.
+
+        Returns:
+            Tuple of (sequence, targets_dict):
+                - sequence: One-hot encoded DNA (seq_len, 4)
+                - targets_dict: {1: tensor of shape (seq_len, n_junc + n_bigwig)}
+        """
+        self._ensure_handles()
+        chrom, start, end = self._positions_list[idx]
+        seq_len = end - start
+
+        sequence = torch.from_numpy(self._get_sequence(chrom, start, end)).float()
+
+        tracks = []
+
+        # Splice-site usage tracks (one per junction file)
+        for junc_df in self._all_juncs:
+            tracks.append(self._get_splice_usage(junc_df, chrom, start, end))
+
+        # BigWig coverage tracks
+        for bw in (self._bw_handles or []):
+            try:
+                sig = bw.values(chrom, max(0, start), end, numpy=True)
+                if sig is None:
+                    sig = np.zeros(seq_len, dtype=np.float32)
+                else:
+                    sig = np.asarray(sig, dtype=np.float32)
+                    sig = np.nan_to_num(sig, nan=0.0)
+                if start < 0:
+                    sig = np.concatenate([np.zeros(-start, dtype=np.float32), sig])
+            except Exception:
+                sig = np.zeros(seq_len, dtype=np.float32)
+            tracks.append(sig)
+
+        targets_1bp = np.stack(tracks, axis=-1) if tracks else np.zeros((seq_len, 0), dtype=np.float32)
+        targets_dict = {1: torch.from_numpy(targets_1bp).float()}
+        return sequence, targets_dict
+
+    @property
+    def n_tracks(self) -> int:
+        """Total number of output tracks (junction files + BigWig files)."""
+        return len(self.star_junction_files) + len(self.bigwig_files)
+
+
 # Backward-compatible aliases
 ATACDataset = GenomicDataset
 RNASeqDataset = GenomicDataset
@@ -984,6 +1195,7 @@ RNASeqDataset = GenomicDataset
 __all__ = [
     "GenomicDataset",
     "MultimodalDataset",
+    "SpliceJunctionDataset",
     "collate_multimodal",
     "ATACDataset",
     "RNASeqDataset",

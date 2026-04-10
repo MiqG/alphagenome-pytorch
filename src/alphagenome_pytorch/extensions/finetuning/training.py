@@ -133,6 +133,13 @@ MODALITY_CONFIGS: dict[str, ModalityConfig] = {
         embedding_dim=3072,
         positions_arg="positions",
     ),
+    "splice": ModalityConfig(
+        name="splice",
+        resolutions=(1,),
+        default_resolution_weights={1: 1.0},
+        embedding_dim=3072,
+        positions_arg="positions",
+    ),
 }
 
 

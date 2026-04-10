@@ -88,6 +88,7 @@ from alphagenome_pytorch.extensions.finetuning import (
     CachedGenome,
     GenomicDataset,
     MultimodalDataset,
+    SpliceJunctionDataset,
     compute_track_means,
     collate_genomic,
     collate_multimodal,
@@ -229,6 +230,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Max threads for parallel BigWig I/O (default: 16)",
+    )
+    data.add_argument(
+        "--star-junctions",
+        type=str,
+        nargs="+",
+        action="append",
+        dest="star_junctions",
+        help=(
+            "STAR SJ.out.tab file(s) for splice junction targets. "
+            "Repeat --star-junctions for each --modality splice group. "
+            "The user is responsible for strand-specific ordering."
+        ),
     )
 
     # Model arguments
@@ -451,6 +464,7 @@ def parse_args() -> argparse.Namespace:
         "save_every",
         "resume",
         "modality_weights",
+        "star_junctions",
     ):
         _apply_config_scalar(attr, config_data)
 
@@ -533,11 +547,35 @@ def parse_args() -> argparse.Namespace:
     args.modality_to_bigwigs = {}
     args.modality_resolutions = {}
     args.modality_weight_dict = {}
+    args.modality_to_star_junctions: dict[str, list[str]] = {}
+
+    # Pair up --star-junctions groups with splice modalities (in order)
+    splice_modalities = [m for m in args.modalities if m == "splice"]
+    star_junction_groups = args.star_junctions or []
+    if len(star_junction_groups) > len(splice_modalities):
+        parser.error(
+            f"Got {len(star_junction_groups)} --star-junctions groups but only "
+            f"{len(splice_modalities)} 'splice' modalities."
+        )
+    splice_junc_map = dict(zip(range(len(splice_modalities)), star_junction_groups))
+    splice_idx = 0
+
     for modality in args.modalities:
         spec = modality_specs.get(modality, {})
-        if "bigwig" not in spec or not spec["bigwig"]:
-            parser.error(f"No bigwig files specified for modality '{modality}'")
-        args.modality_to_bigwigs[modality] = list(spec["bigwig"])
+        if modality == "splice":
+            # BigWig is optional for splice; junction files are required
+            if splice_idx not in splice_junc_map:
+                parser.error(
+                    f"Modality 'splice' requires --star-junctions files. "
+                    f"Provide one --star-junctions group per splice modality."
+                )
+            args.modality_to_star_junctions[f"splice_{splice_idx}"] = splice_junc_map[splice_idx]
+            splice_idx += 1
+            args.modality_to_bigwigs[modality] = list(spec.get("bigwig", []))
+        else:
+            if "bigwig" not in spec or not spec["bigwig"]:
+                parser.error(f"No bigwig files specified for modality '{modality}'")
+            args.modality_to_bigwigs[modality] = list(spec["bigwig"])
         args.modality_resolutions[modality] = spec.get("resolutions", args.global_resolutions)
         args.modality_weight_dict[modality] = float(spec.get("task_weight", 1.0))
 
@@ -598,13 +636,27 @@ def create_datasets(
 
     # Build per-modality track names
     modality_track_names: dict[str, list[str]] = {}
+    splice_modality_idx = 0
     for modality, bigwigs in args.modality_to_bigwigs.items():
-        modality_track_names[modality] = [Path(bw).stem for bw in bigwigs]
-        print_rank0(
-            f"  {modality}: {len(bigwigs)} tracks, resolutions={args.modality_resolutions[modality]} - "
-            f"{modality_track_names[modality]}",
-            rank,
-        )
+        if modality == "splice":
+            junc_key = f"splice_{splice_modality_idx}"
+            junc_files = args.modality_to_star_junctions.get(junc_key, [])
+            junc_stems = [Path(p).stem for p in junc_files]
+            bw_stems = [Path(bw).stem for bw in bigwigs]
+            modality_track_names[modality] = junc_stems + bw_stems
+            print_rank0(
+                f"  {modality}: {len(junc_files)} junction files + {len(bigwigs)} BigWig tracks, "
+                f"resolutions={args.modality_resolutions[modality]}",
+                rank,
+            )
+            splice_modality_idx += 1
+        else:
+            modality_track_names[modality] = [Path(bw).stem for bw in bigwigs]
+            print_rank0(
+                f"  {modality}: {len(bigwigs)} tracks, resolutions={args.modality_resolutions[modality]} - "
+                f"{modality_track_names[modality]}",
+                rank,
+            )
 
     # Always create MultimodalDataset (even for single modality) to have a unified interface
     # This is required by train_epoch_sequence_parallel
@@ -612,28 +664,48 @@ def create_datasets(
     train_datasets = {}
     val_datasets = {}
 
+    splice_modality_idx = 0
     for modality, bigwigs in args.modality_to_bigwigs.items():
         resolutions = args.modality_resolutions[modality]
-        train_datasets[modality] = GenomicDataset(
-            genome_fasta=genome,
-            bigwig_files=bigwigs,
-            bed_file=args.train_bed,
-            resolutions=resolutions,
-            sequence_length=args.sequence_length,
-            cache_genome=cache_genome,
-            cache_signals=cache_signals,
-            max_io_workers=max_io_workers,
-        )
-        val_datasets[modality] = GenomicDataset(
-            genome_fasta=genome,
-            bigwig_files=bigwigs,
-            bed_file=args.val_bed,
-            resolutions=resolutions,
-            sequence_length=args.sequence_length,
-            cache_genome=cache_genome,
-            cache_signals=cache_signals,
-            max_io_workers=max_io_workers,
-        )
+        if modality == "splice":
+            junc_key = f"splice_{splice_modality_idx}"
+            junc_files = args.modality_to_star_junctions.get(junc_key, [])
+            train_datasets[modality] = SpliceJunctionDataset(
+                genome_fasta=genome,
+                bed_file=args.train_bed,
+                star_junction_files=junc_files,
+                bigwig_files=bigwigs or None,
+                sequence_length=args.sequence_length,
+            )
+            val_datasets[modality] = SpliceJunctionDataset(
+                genome_fasta=genome,
+                bed_file=args.val_bed,
+                star_junction_files=junc_files,
+                bigwig_files=bigwigs or None,
+                sequence_length=args.sequence_length,
+            )
+            splice_modality_idx += 1
+        else:
+            train_datasets[modality] = GenomicDataset(
+                genome_fasta=genome,
+                bigwig_files=bigwigs,
+                bed_file=args.train_bed,
+                resolutions=resolutions,
+                sequence_length=args.sequence_length,
+                cache_genome=cache_genome,
+                cache_signals=cache_signals,
+                max_io_workers=max_io_workers,
+            )
+            val_datasets[modality] = GenomicDataset(
+                genome_fasta=genome,
+                bigwig_files=bigwigs,
+                bed_file=args.val_bed,
+                resolutions=resolutions,
+                sequence_length=args.sequence_length,
+                cache_genome=cache_genome,
+                cache_signals=cache_signals,
+                max_io_workers=max_io_workers,
+            )
 
     train_dataset = MultimodalDataset(train_datasets)
     val_dataset = MultimodalDataset(val_datasets)
