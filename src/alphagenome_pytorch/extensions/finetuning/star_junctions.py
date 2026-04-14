@@ -103,10 +103,12 @@ def compute_splice_site_usage(
     position: int,
     strand: str,
 ) -> dict:
-    """Compute splice-site usage (PSI-like) for a single position.
+    """Compute splice-site usage for a single position.
 
-    Usage = reads crossing this site / total reads at this site.
-    Total reads = sum of all junctions that share this donor or acceptor.
+    Usage = reads at this site / total reads across all junctions on the same
+    chrom/strand.  The denominator is the sum of all junction read counts on
+    that chrom/strand, so values are in [0, 1] and reflect the relative
+    importance of this site compared to all splicing activity nearby.
 
     Args:
         all_junctions: Full junctions DataFrame (with 'exon_start', 'exon_end',
@@ -123,9 +125,9 @@ def compute_splice_site_usage(
     donor_mask = chrom_mask & (all_junctions["exon_start"] == position)
     acceptor_mask = chrom_mask & (all_junctions["exon_end"] == position)
 
-    site_reads = all_junctions.loc[donor_mask | acceptor_mask, "count"].sum()
-    total_reads = float(site_reads)
-    usage = 1.0 if total_reads == 0 else float(site_reads) / total_reads
+    site_reads = float(all_junctions.loc[donor_mask | acceptor_mask, "count"].sum())
+    total_reads = float(all_junctions.loc[chrom_mask, "count"].sum())
+    usage = 0.0 if total_reads == 0 else site_reads / total_reads
 
     return {
         "position": position,
@@ -203,5 +205,134 @@ def splice_sites_to_array(
             elif site["role"] == "acceptor":
                 arr[1, idx] = True
             arr[2, idx] = True
+
+    return arr
+
+
+# 5-class label indices matching the JAX SpliceSitesClassificationHead
+_CLASS_MAP = {
+    ("donor", "+"): 0,   # Donor+
+    ("acceptor", "+"): 1, # Acceptor+
+    ("donor", "-"): 2,   # Donor-
+    ("acceptor", "-"): 3, # Acceptor-
+}
+_CLASS_NONE = 4
+
+
+def junctions_to_classification_array(
+    all_juncs_list: list[pd.DataFrame],
+    chrom: str,
+    start: int,
+    seq_len: int,
+) -> np.ndarray:
+    """Build a 5-class one-hot classification array over the sequence window.
+
+    Takes the union of splice sites across all junction DataFrames (samples)
+    and assigns each position to one of five classes:
+        0: Donor on + strand
+        1: Acceptor on + strand
+        2: Donor on - strand
+        3: Acceptor on - strand
+        4: None (background)
+
+    Args:
+        all_juncs_list: List of junction DataFrames (one per sample), each
+            having columns: chrom, exon_start (1-based), exon_end (1-based),
+            strand, count.
+        chrom: Chromosome name of the window.
+        start: 0-based genomic start of the window.
+        seq_len: Length of the window in base pairs.
+
+    Returns:
+        Float32 array of shape (seq_len, 5) — one-hot over the 5 classes.
+    """
+    arr = np.zeros((seq_len, 5), dtype=np.float32)
+    arr[:, _CLASS_NONE] = 1.0  # default all positions to None
+
+    # Collect all unique sites across samples
+    end = start + seq_len  # 0-based exclusive
+    rows = []
+    for junc_df in all_juncs_list:
+        mask = junc_df["chrom"] == chrom
+        local = junc_df.loc[mask]
+        if local.empty:
+            continue
+        # Donors: exon_start is 1-based → 0-based index = exon_start - 1 - start
+        donors = local[["strand", "exon_start"]].copy()
+        donors["role"] = "donor"
+        donors = donors.rename(columns={"exon_start": "pos1based"})
+        # Acceptors: exon_end is 1-based
+        acceptors = local[["strand", "exon_end"]].copy()
+        acceptors["role"] = "acceptor"
+        acceptors = acceptors.rename(columns={"exon_end": "pos1based"})
+        rows.extend([donors, acceptors])
+
+    if not rows:
+        return arr
+
+    sites = pd.concat(rows, ignore_index=True).drop_duplicates(
+        subset=["strand", "pos1based", "role"]
+    )
+
+    for _, site in sites.iterrows():
+        idx = int(site["pos1based"]) - 1 - start  # convert 1-based to 0-based relative
+        if 0 <= idx < seq_len:
+            cls = _CLASS_MAP.get((site["role"], site["strand"]))
+            if cls is not None:
+                arr[idx, _CLASS_NONE] = 0.0
+                arr[idx, cls] = 1.0
+
+    return arr
+
+
+def junctions_to_usage_array(
+    junc_df: pd.DataFrame,
+    chrom: str,
+    start: int,
+    seq_len: int,
+) -> np.ndarray:
+    """Build a per-position usage array for one sample within a window.
+
+    Each splice site position receives the fraction of total junction reads
+    (within the window) that pass through that site.  A junction contributes
+    its fractional count to both its donor and acceptor positions, so the
+    array values sum to ≤ 2.0 and each individual value is in [0, 1].
+
+    Args:
+        junc_df: Junction DataFrame for one sample with columns: chrom,
+            exon_start (1-based), exon_end (1-based), strand, count.
+        chrom: Chromosome name of the window.
+        start: 0-based genomic start of the window.
+        seq_len: Length of the window in base pairs.
+
+    Returns:
+        Float32 array of shape (seq_len,).
+    """
+    arr = np.zeros(seq_len, dtype=np.float32)
+    end = start + seq_len  # 0-based exclusive
+
+    mask = (
+        (junc_df["chrom"] == chrom)
+        & (junc_df["exon_start"] > start)   # exon_start is 1-based; >start ≡ ≥start+1
+        & (junc_df["exon_start"] <= end)
+        & (junc_df["exon_end"] > start)
+        & (junc_df["exon_end"] <= end)
+    )
+    local = junc_df.loc[mask]
+    if local.empty:
+        return arr
+
+    total = float(local["count"].sum())
+    if total == 0:
+        return arr
+
+    for _, junc in local.iterrows():
+        frac = junc["count"] / total
+        donor_idx = int(junc["exon_start"]) - 1 - start   # 1-based → 0-based relative
+        accept_idx = int(junc["exon_end"]) - 1 - start
+        if 0 <= donor_idx < seq_len:
+            arr[donor_idx] += frac
+        if 0 <= accept_idx < seq_len:
+            arr[accept_idx] += frac
 
     return arr

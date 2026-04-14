@@ -25,6 +25,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from alphagenome_pytorch.losses import multinomial_loss
+from alphagenome_pytorch.extensions.finetuning.heads import SpliceSitesFinetuningHead
 
 # Number of segments for multinomial loss computation.
 # AlphaGenome divides sequences into 8 equal segments for numerical stability.
@@ -1289,47 +1290,61 @@ def train_epoch_multihead(
             modality_weight = modality_weights.get(modality, 1.0)
             res_weights = resolution_weights.get(modality, {})
             targets_dict = modality_targets[modality]
+            head_module = head.module if hasattr(head, "module") else head
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                predictions = head(
-                    embeddings_dict, organism_idx, return_scaled=True, channels_last=True
-                )
+                # Embeddings are NCL (channels-first, channels_last=False).
+                # Splice head must be told this so it doesn't incorrectly transpose.
+                if isinstance(head_module, SpliceSitesFinetuningHead):
+                    predictions = head(
+                        embeddings_dict, organism_idx, return_scaled=True, channels_last=False
+                    )
+                else:
+                    predictions = head(
+                        embeddings_dict, organism_idx, return_scaled=True, channels_last=True
+                    )
 
             modality_loss = torch.tensor(0.0, device=device)
 
-            for res, weight in res_weights.items():
-                if res not in predictions or res not in targets_dict:
-                    continue
-
-                pred = predictions[res]
-                targets = targets_dict[res].to(device)
-
-                head_module = head.module if hasattr(head, "module") else head
-                targets = head_module.scale(
-                    targets, organism_idx, resolution=res, channels_last=True
+            if isinstance(head_module, SpliceSitesFinetuningHead):
+                modality_loss, splice_components = head_module.compute_loss(
+                    predictions, targets_dict, device
                 )
-                mask = torch.ones(pred.shape[0], 1, pred.shape[-1], dtype=torch.bool, device=device)
+                for k, v in splice_components.items():
+                    loss_components[f"{modality}_{k}"] = v
+            else:
+                for res, weight in res_weights.items():
+                    if res not in predictions or res not in targets_dict:
+                        continue
 
-                current_seq_len = pred.shape[-2]
-                multinomial_res = _compute_multinomial_resolution(
-                    current_seq_len, num_segments, min_segment_size
-                )
+                    pred = predictions[res]
+                    targets = targets_dict[res].to(device)
 
-                loss_dict = multinomial_loss(
-                    y_pred=pred,
-                    y_true=targets,
-                    mask=mask,
-                    multinomial_resolution=multinomial_res,
-                    positional_weight=positional_weight,
-                    count_weight=count_weight,
-                    channels_last=True,
-                )
+                    targets = head_module.scale(
+                        targets, organism_idx, resolution=res, channels_last=True
+                    )
+                    mask = torch.ones(pred.shape[0], 1, pred.shape[-1], dtype=torch.bool, device=device)
 
-                res_loss = loss_dict["loss"] * weight
-                modality_loss = modality_loss + res_loss
-                loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
-                loss_components[f"{modality}_loss_{res}bp_count"] = loss_dict["loss_total"].item()
-                loss_components[f"{modality}_loss_{res}bp_positional"] = loss_dict["loss_positional"].item()
+                    current_seq_len = pred.shape[-2]
+                    multinomial_res = _compute_multinomial_resolution(
+                        current_seq_len, num_segments, min_segment_size
+                    )
+
+                    loss_dict = multinomial_loss(
+                        y_pred=pred,
+                        y_true=targets,
+                        mask=mask,
+                        multinomial_resolution=multinomial_res,
+                        positional_weight=positional_weight,
+                        count_weight=count_weight,
+                        channels_last=True,
+                    )
+
+                    res_loss = loss_dict["loss"] * weight
+                    modality_loss = modality_loss + res_loss
+                    loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
+                    loss_components[f"{modality}_loss_{res}bp_count"] = loss_dict["loss_total"].item()
+                    loss_components[f"{modality}_loss_{res}bp_positional"] = loss_dict["loss_positional"].item()
 
             weighted_modality_loss = modality_loss * modality_weight
             loss = loss + weighted_modality_loss
@@ -1548,51 +1563,56 @@ def validate_multihead(
                 predictions_scaled = head(
                     embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                 )
-                if compute_pearson:
+                if compute_pearson and not isinstance(head_module, SpliceSitesFinetuningHead):
                     predictions_unscaled = head(
                         embeddings_dict, organism_idx, return_scaled=False, channels_last=True
                     )
 
             modality_loss = torch.tensor(0.0, device=device)
 
-            for res, weight in res_weights.items():
-                if res not in predictions_scaled or res not in targets_dict:
-                    continue
-
-                pred_scaled = predictions_scaled[res]
-                targets = targets_dict[res].to(device)
-                targets_scaled = head_module.scale(
-                    targets, organism_idx, resolution=res, channels_last=True
+            if isinstance(head_module, SpliceSitesFinetuningHead):
+                modality_loss, _ = head_module.compute_loss(
+                    predictions_scaled, targets_dict, device
                 )
-                mask = torch.ones(
-                    pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
-                )
+            else:
+                for res, weight in res_weights.items():
+                    if res not in predictions_scaled or res not in targets_dict:
+                        continue
 
-                current_seq_len = pred_scaled.shape[-2]
-                multinomial_res = _compute_multinomial_resolution(
-                    current_seq_len, num_segments, min_segment_size
-                )
+                    pred_scaled = predictions_scaled[res]
+                    targets = targets_dict[res].to(device)
+                    targets_scaled = head_module.scale(
+                        targets, organism_idx, resolution=res, channels_last=True
+                    )
+                    mask = torch.ones(
+                        pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
+                    )
 
-                loss_dict = multinomial_loss(
-                    y_pred=pred_scaled,
-                    y_true=targets_scaled,
-                    mask=mask,
-                    multinomial_resolution=multinomial_res,
-                    positional_weight=positional_weight,
-                    count_weight=count_weight,
-                    channels_last=True,
-                )
+                    current_seq_len = pred_scaled.shape[-2]
+                    multinomial_res = _compute_multinomial_resolution(
+                        current_seq_len, num_segments, min_segment_size
+                    )
 
-                res_loss = loss_dict["loss"] * weight
-                modality_loss = modality_loss + res_loss
+                    loss_dict = multinomial_loss(
+                        y_pred=pred_scaled,
+                        y_true=targets_scaled,
+                        mask=mask,
+                        multinomial_resolution=multinomial_res,
+                        positional_weight=positional_weight,
+                        count_weight=count_weight,
+                        channels_last=True,
+                    )
 
-                # Accumulate for Pearson R
-                if compute_pearson:
-                    pred_unscaled = predictions_unscaled[res]
-                    batch_profile_r = profile_pearson_r(pred_unscaled, targets)
-                    accumulated_profile_r[modality][res].append(batch_profile_r.float().cpu())
-                    accumulated_pred_counts[modality][res].append(pred_unscaled.sum(dim=1).float().cpu())
-                    accumulated_true_counts[modality][res].append(targets.sum(dim=1).float().cpu())
+                    res_loss = loss_dict["loss"] * weight
+                    modality_loss = modality_loss + res_loss
+
+                    # Accumulate for Pearson R
+                    if compute_pearson:
+                        pred_unscaled = predictions_unscaled[res]
+                        batch_profile_r = profile_pearson_r(pred_unscaled, targets)
+                        accumulated_profile_r[modality][res].append(batch_profile_r.float().cpu())
+                        accumulated_pred_counts[modality][res].append(pred_unscaled.sum(dim=1).float().cpu())
+                        accumulated_true_counts[modality][res].append(targets.sum(dim=1).float().cpu())
 
             weighted_modality_loss = modality_loss * modality_weight
             loss = loss + weighted_modality_loss
@@ -1824,12 +1844,20 @@ def train_epoch_sequence_parallel(
             res_weights = resolution_weights.get(modality, {})
             targets_dict = modality_targets[modality]
 
+            head_module = head.module if hasattr(head, "module") else head
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 # contact_maps head takes embeddings_pair directly; all other
                 # GenomeTracksHead variants take embeddings_dict.
+                # Sequence-parallel embeddings are in NCL (channels-first) format,
+                # so splice head must be called with channels_last=False.
                 if modality == "contact_maps":
                     predictions = head(
                         embeddings_pair, organism_idx, channels_last=True
+                    )
+                elif isinstance(head_module, SpliceSitesFinetuningHead):
+                    predictions = head(
+                        embeddings_dict, organism_idx, return_scaled=True, channels_last=False
                     )
                 else:
                     predictions = head(
@@ -1838,46 +1866,60 @@ def train_epoch_sequence_parallel(
 
             modality_loss = torch.tensor(0.0, device=device)
 
-            for res, weight in res_weights.items():
-                if res not in predictions or res not in targets_dict:
-                    continue
-
-                pred = predictions[res]
-                targets = targets_dict[res].to(device)
-
-                # Slice targets to match local shard for this rank (sequence parallel).
-                # Targets are at their native resolution (e.g. S_full for 1bp,
-                # S_full//128 for 128bp), so a single split by world_size works
-                # regardless of resolution.
-                full_len = targets.shape[1]
-                local_len = full_len // world_size
-                t_start = rank * local_len
-                targets = targets[:, t_start:t_start + local_len, :]
-
-                head_module = head.module if hasattr(head, "module") else head
-                targets = head_module.scale(
-                    targets, organism_idx, resolution=res, channels_last=True
+            if isinstance(head_module, SpliceSitesFinetuningHead):
+                # Slice and move targets for sequence-parallel shard, then compute splice loss.
+                splice_targets_dict = {}
+                for res, tgt in targets_dict.items():
+                    tgt = tgt.to(device)
+                    full_len = tgt.shape[1]
+                    local_len = full_len // world_size
+                    t_start = rank * local_len
+                    splice_targets_dict[res] = tgt[:, t_start:t_start + local_len, :]
+                modality_loss, splice_components = head_module.compute_loss(
+                    predictions, splice_targets_dict, device
                 )
-                mask = torch.ones(pred.shape[0], 1, pred.shape[-1], dtype=torch.bool, device=device)
+                for k, v in splice_components.items():
+                    loss_components[f"{modality}_{k}"] = v
+            else:
+                for res, weight in res_weights.items():
+                    if res not in predictions or res not in targets_dict:
+                        continue
 
-                current_seq_len = pred.shape[-2]
-                multinomial_res = _compute_multinomial_resolution(
-                    current_seq_len, num_segments, min_segment_size
-                )
+                    pred = predictions[res]
+                    targets = targets_dict[res].to(device)
 
-                loss_dict = multinomial_loss(
-                    y_pred=pred,
-                    y_true=targets,
-                    mask=mask,
-                    multinomial_resolution=multinomial_res,
-                    positional_weight=positional_weight,
-                    count_weight=count_weight,
-                    channels_last=True,
-                )
+                    # Slice targets to match local shard for this rank (sequence parallel).
+                    # Targets are at their native resolution (e.g. S_full for 1bp,
+                    # S_full//128 for 128bp), so a single split by world_size works
+                    # regardless of resolution.
+                    full_len = targets.shape[1]
+                    local_len = full_len // world_size
+                    t_start = rank * local_len
+                    targets = targets[:, t_start:t_start + local_len, :]
 
-                res_loss = loss_dict["loss"] * weight
-                modality_loss = modality_loss + res_loss
-                loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
+                    targets = head_module.scale(
+                        targets, organism_idx, resolution=res, channels_last=True
+                    )
+                    mask = torch.ones(pred.shape[0], 1, pred.shape[-1], dtype=torch.bool, device=device)
+
+                    current_seq_len = pred.shape[-2]
+                    multinomial_res = _compute_multinomial_resolution(
+                        current_seq_len, num_segments, min_segment_size
+                    )
+
+                    loss_dict = multinomial_loss(
+                        y_pred=pred,
+                        y_true=targets,
+                        mask=mask,
+                        multinomial_resolution=multinomial_res,
+                        positional_weight=positional_weight,
+                        count_weight=count_weight,
+                        channels_last=True,
+                    )
+
+                    res_loss = loss_dict["loss"] * weight
+                    modality_loss = modality_loss + res_loss
+                    loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
 
             weighted_modality_loss = modality_loss * modality_weight
             loss = loss + weighted_modality_loss

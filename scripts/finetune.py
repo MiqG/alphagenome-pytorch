@@ -115,7 +115,7 @@ from alphagenome_pytorch.extensions.finetuning import (
 )
 from alphagenome_pytorch.extensions.finetuning.adapters import get_adapter_params
 from alphagenome_pytorch.extensions.finetuning.checkpointing import save_checkpoint, load_checkpoint
-from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
+from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head, SpliceSitesFinetuningHead
 from alphagenome_pytorch.extensions.finetuning.transfer import (
     load_trunk,
     remove_all_heads,
@@ -549,9 +549,15 @@ def parse_args() -> argparse.Namespace:
     args.modality_weight_dict = {}
     args.modality_to_star_junctions: dict[str, list[str]] = {}
 
+    # Auto-inject 'splice' modalities for each --star-junctions group so that
+    # users don't need to explicitly pass --modality splice alongside --star-junctions.
+    star_junction_groups = args.star_junctions or []
+    explicit_splice_count = sum(1 for m in args.modalities if m == "splice")
+    for _ in range(len(star_junction_groups) - explicit_splice_count):
+        args.modalities.append("splice")
+
     # Pair up --star-junctions groups with splice modalities (in order)
     splice_modalities = [m for m in args.modalities if m == "splice"]
-    star_junction_groups = args.star_junctions or []
     if len(star_junction_groups) > len(splice_modalities):
         parser.error(
             f"Got {len(star_junction_groups)} --star-junctions groups but only "
@@ -642,8 +648,9 @@ def create_datasets(
             junc_key = f"splice_{splice_modality_idx}"
             junc_files = args.modality_to_star_junctions.get(junc_key, [])
             junc_stems = [Path(p).stem for p in junc_files]
-            bw_stems = [Path(bw).stem for bw in bigwigs]
-            modality_track_names[modality] = junc_stems + bw_stems
+            modality_track_names[modality] = [
+                "cls_donor_pos", "cls_acceptor_pos", "cls_donor_neg", "cls_acceptor_neg", "cls_none"
+            ] + junc_stems
             print_rank0(
                 f"  {modality}: {len(junc_files)} junction files + {len(bigwigs)} BigWig tracks, "
                 f"resolutions={args.modality_resolutions[modality]}",
@@ -674,15 +681,15 @@ def create_datasets(
                 genome_fasta=genome,
                 bed_file=args.train_bed,
                 star_junction_files=junc_files,
-                bigwig_files=bigwigs or None,
                 sequence_length=args.sequence_length,
+                filter_to_junctions=False,
             )
             val_datasets[modality] = SpliceJunctionDataset(
                 genome_fasta=genome,
                 bed_file=args.val_bed,
                 star_junction_files=junc_files,
-                bigwig_files=bigwigs or None,
                 sequence_length=args.sequence_length,
+                filter_to_junctions=False,
             )
             splice_modality_idx += 1
         else:
@@ -831,15 +838,19 @@ def create_model(
         track_means = modality_track_means.get(modality)
         resolutions = modality_resolutions[modality]
 
-        head = create_finetuning_head(
-            assay_type=modality,
-            n_tracks=n_tracks,
-            resolutions=resolutions if not is_encoder_only else (128,),
-            num_organisms=1,
-            track_means=track_means,
-            init_scheme=args.head_init_scheme,
-            encoder_only=is_encoder_only,
-        )
+        if modality == "splice":
+            n_samples = n_tracks - SpliceSitesFinetuningHead.N_CLASSES
+            head = SpliceSitesFinetuningHead(in_channels=1536, n_samples=n_samples)
+        else:
+            head = create_finetuning_head(
+                assay_type=modality,
+                n_tracks=n_tracks,
+                resolutions=resolutions if not is_encoder_only else (128,),
+                num_organisms=1,
+                track_means=track_means,
+                init_scheme=args.head_init_scheme,
+                encoder_only=is_encoder_only,
+            )
         add_head(model, modality, head)
         heads[modality] = head
         head_resolutions = (128,) if is_encoder_only else resolutions
@@ -995,6 +1006,10 @@ def main() -> None:
     if is_main_process(rank):
         print("Computing track means...")
         for modality, bigwigs in args.modality_to_bigwigs.items():
+            if not bigwigs:
+                modality_track_means[modality] = None
+                print(f"  {modality}: no bigwig tracks, skipping track means")
+                continue
             modality_track_means[modality] = compute_track_means(
                 bigwigs,
                 args.train_bed,

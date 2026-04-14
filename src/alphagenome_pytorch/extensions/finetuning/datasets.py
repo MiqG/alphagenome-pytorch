@@ -980,23 +980,23 @@ def collate_multimodal(
 class SpliceJunctionDataset(Dataset):
     """Dataset for fine-tuning on splice junction data from STAR aligner output.
 
-    Reads STAR SJ.out.tab junction files and optional BigWig coverage files,
-    returning splice-site usage profiles as training targets at 1bp resolution.
+    Reads STAR SJ.out.tab junction files and returns two types of targets at
+    1 bp resolution concatenated along the last dimension:
 
-    Each STAR junction file contributes one splice-site usage track; each BigWig
-    file contributes one raw coverage track.  Tracks are concatenated in that
-    order along the last dimension.  The user is responsible for passing files in
-    a meaningful order — no strand filtering is applied internally.
+    1. **Classification** (first 5 channels): 5-class one-hot per base —
+       Donor+, Acceptor+, Donor−, Acceptor−, None — built from the union of
+       splice sites across all junction files.
+    2. **Usage** (remaining channels): per-sample fractional usage in [0, 1].
+       Each splice-site position receives the fraction of total junction reads
+       within the window that pass through that site.
 
     Returns ``(sequence, targets_dict)`` where ``targets_dict[1]`` has shape
-    ``(seq_len, n_junc_files + n_bigwig_files)``.  Only 1bp resolution is
-    supported.
+    ``(seq_len, 5 + n_junc_files)``.  Only 1 bp resolution is supported.
 
     Args:
         genome_fasta: Path to reference genome FASTA or a :class:`CachedGenome`.
         bed_file: Path to BED file with intervals (chrom, start, end).
         star_junction_files: List of paths to STAR SJ.out.tab files.
-        bigwig_files: Optional list of BigWig coverage files.
         sequence_length: Desired sequence length; intervals are expanded /
             truncated to this size from their centre.
         min_unique_reads: Minimum uniquely-mapped reads for a junction to be
@@ -1005,12 +1005,13 @@ class SpliceJunctionDataset(Dataset):
             no complete splice junction across all provided files.
     """
 
+    N_CLASSIFICATION_CLASSES = 5
+
     def __init__(
         self,
         genome_fasta: "str | CachedGenome",
         bed_file: str,
         star_junction_files: list,
-        bigwig_files: "list | None" = None,
         sequence_length: int = 131_072,
         min_unique_reads: int = 1,
         filter_to_junctions: bool = True,
@@ -1020,16 +1021,15 @@ class SpliceJunctionDataset(Dataset):
 
         from alphagenome_pytorch.extensions.finetuning.star_junctions import (
             read_star_junctions,
-            junctions_to_splice_sites,
-            compute_splice_site_usage,
             filter_intervals_with_junctions,
+            junctions_to_classification_array,
+            junctions_to_usage_array,
         )
-        self._read_star_junctions = read_star_junctions
-        self._junctions_to_splice_sites = junctions_to_splice_sites
-        self._compute_splice_site_usage = compute_splice_site_usage
+        self._filter_intervals_with_junctions = filter_intervals_with_junctions
+        self._junctions_to_classification_array = junctions_to_classification_array
+        self._junctions_to_usage_array = junctions_to_usage_array
 
         self.star_junction_files = [str(p) for p in star_junction_files]
-        self.bigwig_files = [str(p) for p in (bigwig_files or [])]
         self.sequence_length = sequence_length
         self.min_unique_reads = min_unique_reads
 
@@ -1051,8 +1051,6 @@ class SpliceJunctionDataset(Dataset):
             junc["exon_start"] = junc["intron_start"] - 1  # 1-based donor exon end
             junc["exon_end"] = junc["intron_end"] + 1      # 1-based acceptor exon start
             junc["count"] = junc["n_uniquely_mapped_reads"]
-            total = junc["count"].sum()
-            junc["cpm"] = 1e6 * junc["count"] / total if total > 0 else 0.0
             self._all_juncs.append(junc)
 
         # Union of all junctions (for interval filtering)
@@ -1087,9 +1085,6 @@ class SpliceJunctionDataset(Dataset):
             self._genome_cache = None
             self._fasta_path = str(genome_fasta)
         self._fasta = None
-
-        # BigWig handles opened lazily per worker
-        self._bw_handles = None
         self._worker_pid = None
 
     def _ensure_handles(self) -> None:
@@ -1099,7 +1094,6 @@ class SpliceJunctionDataset(Dataset):
             self._worker_pid = pid
             if self._genome_cache is None:
                 self._fasta = pyfaidx.Fasta(self._fasta_path)
-            self._bw_handles = [pyBigWig.open(p) for p in self.bigwig_files]
 
     def _get_sequence(self, chrom: str, start: int, end: int) -> np.ndarray:
         if self._genome_cache is not None:
@@ -1114,31 +1108,6 @@ class SpliceJunctionDataset(Dataset):
             seq_str = "N" * (-start) + seq_str
         return sequence_to_onehot(seq_str)
 
-    def _get_splice_usage(
-        self, junc_df: pd.DataFrame, chrom: str, start: int, end: int,
-    ) -> np.ndarray:
-        """Return splice-site usage profile for one junction file. Shape: (seq_len,)."""
-        seq_len = end - start
-        mask = (
-            (junc_df["chrom"] == chrom)
-            & (junc_df["exon_start"] >= start)
-            & (junc_df["exon_end"] < end)
-        )
-        juncs_oi = junc_df.loc[mask]
-        usage = np.zeros(seq_len, dtype=np.float32)
-        if juncs_oi.empty:
-            return usage
-
-        sites = self._junctions_to_splice_sites(juncs_oi)
-        for _, site in sites[["chrom", "strand", "position"]].drop_duplicates().iterrows():
-            info = self._compute_splice_site_usage(
-                junc_df, site["chrom"], int(site["position"]), site["strand"]
-            )
-            idx = int(info["position"]) - start - 1  # 0-based relative index
-            if 0 <= idx < seq_len:
-                usage[idx] = float(info["splice_site_usage"])
-        return usage
-
     def __len__(self) -> int:
         return len(self._positions_list)
 
@@ -1148,7 +1117,10 @@ class SpliceJunctionDataset(Dataset):
         Returns:
             Tuple of (sequence, targets_dict):
                 - sequence: One-hot encoded DNA (seq_len, 4)
-                - targets_dict: {1: tensor of shape (seq_len, n_junc + n_bigwig)}
+                - targets_dict: {1: tensor of shape (seq_len, 5 + n_junc_files)}
+                  First 5 channels: 5-class one-hot classification (Donor+,
+                  Acceptor+, Donor-, Acceptor-, None). Remaining channels:
+                  per-sample fractional usage in [0, 1].
         """
         self._ensure_handles()
         chrom, start, end = self._positions_list[idx]
@@ -1156,35 +1128,26 @@ class SpliceJunctionDataset(Dataset):
 
         sequence = torch.from_numpy(self._get_sequence(chrom, start, end)).float()
 
-        tracks = []
+        # Classification targets: (seq_len, 5) — union across all samples
+        cls_arr = self._junctions_to_classification_array(
+            self._all_juncs, chrom, start, seq_len
+        )
 
-        # Splice-site usage tracks (one per junction file)
-        for junc_df in self._all_juncs:
-            tracks.append(self._get_splice_usage(junc_df, chrom, start, end))
+        # Usage targets: (seq_len, n_junc_files) — one channel per sample
+        usage_tracks = [
+            self._junctions_to_usage_array(junc_df, chrom, start, seq_len)
+            for junc_df in self._all_juncs
+        ]
+        usage_arr = np.stack(usage_tracks, axis=-1)  # (seq_len, n_samples)
 
-        # BigWig coverage tracks
-        for bw in (self._bw_handles or []):
-            try:
-                sig = bw.values(chrom, max(0, start), end, numpy=True)
-                if sig is None:
-                    sig = np.zeros(seq_len, dtype=np.float32)
-                else:
-                    sig = np.asarray(sig, dtype=np.float32)
-                    sig = np.nan_to_num(sig, nan=0.0)
-                if start < 0:
-                    sig = np.concatenate([np.zeros(-start, dtype=np.float32), sig])
-            except Exception:
-                sig = np.zeros(seq_len, dtype=np.float32)
-            tracks.append(sig)
-
-        targets_1bp = np.stack(tracks, axis=-1) if tracks else np.zeros((seq_len, 0), dtype=np.float32)
+        targets_1bp = np.concatenate([cls_arr, usage_arr], axis=-1)  # (seq_len, 5+n_samples)
         targets_dict = {1: torch.from_numpy(targets_1bp).float()}
         return sequence, targets_dict
 
     @property
     def n_tracks(self) -> int:
-        """Total number of output tracks (junction files + BigWig files)."""
-        return len(self.star_junction_files) + len(self.bigwig_files)
+        """Total number of output channels (5 classification + n junction files)."""
+        return self.N_CLASSIFICATION_CLASSES + len(self.star_junction_files)
 
 
 # Backward-compatible aliases
