@@ -177,6 +177,17 @@ def _compute_splice_loss(head, predictions, targets_dict, device):
         return loss, {"usage_loss": loss.item()}
 
     elif isinstance(head, SpliceSitesJunctionHead):
+        import sys
+        # DEBUG: Check what's in targets_dict on first call
+        if not hasattr(_compute_splice_loss, "_logged"):
+            print(f"DEBUG _compute_splice_loss:", file=sys.stderr)
+            print(f"  targets_dict keys: {list(targets_dict.keys())}", file=sys.stderr)
+            for k, v in targets_dict.items():
+                if hasattr(v, 'shape'):
+                    print(f"    {k}: shape={v.shape}, dtype={v.dtype}, sum={v.sum().item():.2f}", file=sys.stderr)
+            print(f"  predictions keys: {list(predictions.keys())}", file=sys.stderr)
+            _compute_splice_loss._logged = True
+
         if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
             return torch.tensor(0.0, device=device), {}
         junc_matrix = targets_dict["junction_matrix"].to(device)

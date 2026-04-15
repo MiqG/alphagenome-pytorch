@@ -969,10 +969,18 @@ def collate_multimodal(
     first_item = batch[0][1]
     for modality in first_item.keys():
         modality_targets[modality] = {}
-        for res in first_item[modality].keys():
-            modality_targets[modality][res] = torch.stack([
-                item[1][modality][res] for item in batch
-            ])
+        for key in first_item[modality].keys():
+            # Handle both integer keys (resolutions) and string keys (junction metadata)
+            if isinstance(key, int):
+                # Resolution-based targets: stack across batch
+                modality_targets[modality][key] = torch.stack([
+                    item[1][modality][key] for item in batch
+                ])
+            elif isinstance(key, str):
+                # String keys (junction_positions, junction_matrix): also stack across batch
+                modality_targets[modality][key] = torch.stack([
+                    item[1][modality][key] for item in batch
+                ])
 
     return sequences, modality_targets
 
