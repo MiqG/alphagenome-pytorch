@@ -34,7 +34,12 @@ import torch
 import torch.nn as nn
 
 from alphagenome_pytorch import AlphaGenome
-from alphagenome_pytorch.heads import GenomeTracksHead
+from alphagenome_pytorch.heads import (
+    GenomeTracksHead,
+    SpliceSitesClassificationHead,
+    SpliceSitesUsageHead,
+    SpliceSitesJunctionHead,
+)
 from alphagenome_pytorch.extensions.finetuning.adapters import (
     apply_lora,
     apply_locon,
@@ -44,6 +49,13 @@ from alphagenome_pytorch.extensions.finetuning.adapters import (
     unfreeze_norm_layers,
 )
 from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head
+
+# Splice head types that should not go into model.heads dict
+SPLICE_HEAD_TYPES = (
+    SpliceSitesClassificationHead,
+    SpliceSitesUsageHead,
+    SpliceSitesJunctionHead,
+)
 
 
 @dataclass
@@ -203,15 +215,21 @@ def remove_all_heads(model: AlphaGenome) -> AlphaGenome:
 def add_head(
     model: AlphaGenome,
     name: str,
-    head: GenomeTracksHead,
+    head: nn.Module,
     replace: bool = False,
 ) -> None:
     """Register a new head on the model.
 
+    Genomic track heads (GenomeTracksHead) are added to model.heads dict.
+    Splice heads are registered as separate attributes:
+    - splice_site → model.splice_sites_classification_head
+    - splice_usage → model.splice_sites_usage_head
+    - splice_junctions → model.splice_sites_junction_head
+
     Args:
         model: AlphaGenome model instance.
-        name: Name for the head (e.g., 'my_atac').
-        head: GenomeTracksHead instance to add.
+        name: Name for the head or modality type (e.g., 'my_atac', 'splice_site').
+        head: GenomeTracksHead or splice head instance to add.
         replace: If True, overwrite existing head with same name.
             If False (default), raises ValueError if head exists.
 
@@ -222,6 +240,27 @@ def add_head(
         >>> head = create_finetuning_head('atac', n_tracks=4)
         >>> add_head(model, 'my_atac', head)
     """
+    # Handle splice heads: register as separate attributes
+    if isinstance(head, SPLICE_HEAD_TYPES):
+        splice_attr_map = {
+            'splice_site': 'splice_sites_classification_head',
+            'splice_usage': 'splice_sites_usage_head',
+            'splice_junctions': 'splice_sites_junction_head',
+        }
+        attr_name = splice_attr_map.get(name)
+        if attr_name is None:
+            raise ValueError(
+                f"Splice head with name '{name}' not recognized. "
+                f"Must be one of: {list(splice_attr_map.keys())}"
+            )
+        if hasattr(model, attr_name) and getattr(model, attr_name) is not None and not replace:
+            raise ValueError(
+                f"Head '{attr_name}' already exists. Use replace=True to overwrite."
+            )
+        setattr(model, attr_name, head)
+        return
+
+    # Handle genomic track heads: add to heads dict
     if name in model.heads and not replace:
         raise ValueError(
             f"Head '{name}' already exists. Use replace=True to overwrite."

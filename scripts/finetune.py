@@ -127,6 +127,18 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
 
 
 # =============================================================================
+# Valid Modalities
+# =============================================================================
+
+# Genomic track modalities from MODALITY_CONFIGS
+GENOMIC_MODALITIES = set(MODALITY_CONFIGS.keys())
+# Splice-specific modalities (not in MODALITY_CONFIGS, handled separately)
+SPLICE_MODALITIES = {'splice_site', 'splice_usage', 'splice_junctions'}
+# All valid modalities
+ALL_VALID_MODALITIES = GENOMIC_MODALITIES | SPLICE_MODALITIES
+
+
+# =============================================================================
 # Default Configuration
 # =============================================================================
 
@@ -254,8 +266,9 @@ def parse_args() -> argparse.Namespace:
         type=str,
         action="append",
         dest="modalities",
-        choices=list(MODALITY_CONFIGS.keys()),
-        help="Assay modality type. Repeat --modality for each --bigwig group in multi-modality mode.",
+        help="Assay modality type. Genomic: " + ", ".join(sorted(GENOMIC_MODALITIES)) +
+             ". Splice: " + ", ".join(sorted(SPLICE_MODALITIES)) +
+             ". Repeat --modality for each data group. Splice modalities can be comma-separated (e.g., 'splice_site,splice_usage,splice_junctions').",
     )
     model.add_argument(
         "--modality-weights",
@@ -485,14 +498,26 @@ def parse_args() -> argparse.Namespace:
     args.global_resolutions = _parse_resolutions_value(args.resolutions, "global resolutions")
     args.resolutions = ",".join(str(r) for r in args.global_resolutions)
 
+    # Validate CLI modalities (including comma-separated)
+    if args.modalities:
+        for mod_entry in args.modalities:
+            for sub_mod in mod_entry.split(","):
+                sub_mod = sub_mod.strip()
+                if sub_mod not in ALL_VALID_MODALITIES:
+                    parser.error(
+                        f"Invalid modality '{sub_mod}' in --modality {mod_entry}. "
+                        f"Valid modalities: {', '.join(sorted(ALL_VALID_MODALITIES))}"
+                    )
+
     raw_modalities = config_data.get("modalities", {}) or {}
     if not isinstance(raw_modalities, dict):
         parser.error("Config key 'modalities' must be a mapping of modality -> settings")
 
     modality_specs: dict[str, dict[str, Any]] = {}
     for modality, mod_cfg in raw_modalities.items():
-        if modality not in MODALITY_CONFIGS:
-            parser.error(f"Unknown modality in config: {modality}")
+        # Allow both genomic modalities (in MODALITY_CONFIGS) and splice modalities
+        if modality not in ALL_VALID_MODALITIES:
+            parser.error(f"Unknown modality in config: {modality}. Valid: {', '.join(sorted(ALL_VALID_MODALITIES))}")
         if not isinstance(mod_cfg, dict):
             parser.error(f"modalities.{modality} must be a mapping")
         spec: dict[str, Any] = {}
@@ -515,26 +540,47 @@ def parse_args() -> argparse.Namespace:
     if args.bigwigs is not None:
         if args.modalities is None:
             args.modalities = [DEFAULTS["modality"]]
-        if len(args.modalities) != len(args.bigwigs):
+        # Pair --modality with --bigwig groups in order
+        # Each --modality entry (which may contain comma-separated sub-modalities)
+        # is paired with the corresponding --bigwig group
+        genomic_modality_count = sum(
+            1 for m in args.modalities if not any(s in SPLICE_MODALITIES for s in m.split(","))
+        )
+        if genomic_modality_count != len(args.bigwigs):
             parser.error(
-                f"Number of --modality ({len(args.modalities)}) must match number of --bigwig groups ({len(args.bigwigs)}). "
-                "Each --modality should be followed by --bigwig FILES."
+                f"Number of genomic modalities ({genomic_modality_count}) must match number of --bigwig groups ({len(args.bigwigs)}). "
+                "Splice modalities (splice_site, splice_usage, splice_junctions) do not require --bigwig."
             )
-        for modality, bigwigs in zip(args.modalities, args.bigwigs):
-            if modality in cli_modality_to_bigwigs:
-                parser.error(f"Duplicate modality: {modality}")
-            cli_modality_to_bigwigs[modality] = bigwigs
-    elif args.modalities is not None and "--modality" in cli_flags:
-        parser.error("--modality requires matching --bigwig entries")
+        bigwig_idx = 0
+        for modality_entry in args.modalities:
+            # Expand comma-separated modalities for validation
+            sub_mods = [m.strip() for m in modality_entry.split(",")]
+            is_genomic = not any(m in SPLICE_MODALITIES for m in sub_mods)
+            if is_genomic:
+                if bigwig_idx >= len(args.bigwigs):
+                    parser.error(f"Not enough --bigwig groups for modality {modality_entry}")
+                for sub_mod in sub_mods:
+                    if sub_mod in cli_modality_to_bigwigs:
+                        parser.error(f"Duplicate modality: {sub_mod}")
+                    cli_modality_to_bigwigs[sub_mod] = args.bigwigs[bigwig_idx]
+                bigwig_idx += 1
 
+    # Merge CLI bigwigs into modality_specs
     for modality, bigwigs in cli_modality_to_bigwigs.items():
         merged = dict(modality_specs.get(modality, {}))
         merged["bigwig"] = list(bigwigs)
         modality_specs[modality] = merged
 
-    args.modalities = list(modality_specs.keys())
+    # Preserve original CLI modality entries (which may be comma-separated)
+    cli_modalities = args.modalities or []
+    # Add any config-only modalities that weren't on CLI
+    if config_modalities_from_config := [m for m in modality_specs.keys() if m not in cli_modality_to_bigwigs.keys() and m not in [s.strip() for entry in (cli_modalities or []) for s in entry.split(",")]]:
+        # Only add config modalities if they're genomic (not splice, which must be on CLI)
+        cli_modalities.extend(config_modalities_from_config)
+
+    args.modalities = cli_modalities if cli_modalities else list(modality_specs.keys())
     if not args.modalities:
-        parser.error("--bigwig is required (or provide modalities in --config)")
+        parser.error("--modality or config modalities required. Use --modality rna_seq --bigwig [...] or config [modalities] section")
 
     # Required scalar args after config merge
     for flag, value in (
@@ -551,35 +597,36 @@ def parse_args() -> argparse.Namespace:
     args.modality_weight_dict = {}
     args.modality_to_star_junctions: dict[str, list[str]] = {}
 
-    # Auto-inject 'splice' modalities for each --star-junctions group so that
-    # users don't need to explicitly pass --modality splice alongside --star-junctions.
-    star_junction_groups = args.star_junctions or []
-    explicit_splice_count = sum(1 for m in args.modalities if m in ("splice", "splice_junction"))
-    for _ in range(len(star_junction_groups) - explicit_splice_count):
-        args.modalities.append("splice")
+    # Expand comma-separated modalities: "splice_site,splice_junctions" → ["splice_site", "splice_junctions"]
+    # All sub-modalities share the same --star-junctions group from the same entry.
+    flat_modalities = []
+    flat_modality_specs = {}
+    junc_group_idx = 0
 
-    # Pair up --star-junctions groups with splice/splice_junction modalities (in order)
-    splice_modalities = [m for m in args.modalities if m in ("splice", "splice_junction")]
-    if len(star_junction_groups) > len(splice_modalities):
-        parser.error(
-            f"Got {len(star_junction_groups)} --star-junctions groups but only "
-            f"{len(splice_modalities)} 'splice' modalities."
-        )
-    splice_junc_map = dict(zip(range(len(splice_modalities)), star_junction_groups))
-    splice_idx = 0
+    for mod_entry in args.modalities:
+        sub_mods = [m.strip() for m in mod_entry.split(",")]
+        spec = modality_specs.get(mod_entry, {})
+        junc_group = None
+        if any(m in SPLICE_MODALITIES for m in sub_mods):
+            star_junction_groups = args.star_junctions or []
+            if junc_group_idx < len(star_junction_groups):
+                junc_group = star_junction_groups[junc_group_idx]
+            junc_group_idx += 1
+        for sub_mod in sub_mods:
+            flat_modalities.append(sub_mod)
+            flat_modality_specs[sub_mod] = {**spec, "junc_group": junc_group}
+
+    args.modalities = flat_modalities
 
     for modality in args.modalities:
-        spec = modality_specs.get(modality, {})
-        if modality in ("splice", "splice_junction"):
-            # BigWig is optional for splice/splice_junction; junction files are required
-            if splice_idx not in splice_junc_map:
-                parser.error(
-                    f"Modality '{modality}' requires --star-junctions files. "
-                    f"Provide one --star-junctions group per splice modality."
-                )
-            args.modality_to_star_junctions[f"splice_{splice_idx}"] = splice_junc_map[splice_idx]
-            splice_idx += 1
-            args.modality_to_bigwigs[modality] = list(spec.get("bigwig", []))
+        spec = flat_modality_specs.get(modality, modality_specs.get(modality, {}))
+        junc_group = spec.get("junc_group")
+        if modality in SPLICE_MODALITIES:
+            # Splice modalities require junction files (no BigWig required)
+            if junc_group is None:
+                parser.error(f"Modality '{modality}' requires --star-junctions files.")
+            args.modality_to_star_junctions[modality] = junc_group
+            args.modality_to_bigwigs[modality] = []
         else:
             if "bigwig" not in spec or not spec["bigwig"]:
                 parser.error(f"No bigwig files specified for modality '{modality}'")
@@ -644,23 +691,31 @@ def create_datasets(
 
     # Build per-modality track names
     modality_track_names: dict[str, list[str]] = {}
-    splice_modality_idx = 0
-    for modality, bigwigs in args.modality_to_bigwigs.items():
-        if modality in ("splice", "splice_junction"):
-            junc_key = f"splice_{splice_modality_idx}"
-            junc_files = args.modality_to_star_junctions.get(junc_key, [])
+    SPLICE_MODALITIES = {'splice_site', 'splice_usage', 'splice_junctions'}
+
+    for modality in args.modalities:
+        if modality in SPLICE_MODALITIES:
+            junc_files = args.modality_to_star_junctions.get(modality, [])
             junc_stems = [Path(p).stem for p in junc_files]
-            # Splice modality includes 5 classification classes + junction samples
-            modality_track_names[modality] = [
-                "cls_donor_pos", "cls_acceptor_pos", "cls_donor_neg", "cls_acceptor_neg", "cls_none"
-            ] + junc_stems
+            if modality == "splice_site":
+                # Classification only: always 5 classes
+                modality_track_names[modality] = [
+                    "cls_donor_pos", "cls_acceptor_pos", "cls_donor_neg", "cls_acceptor_neg", "cls_none"
+                ]
+            elif modality == "splice_usage":
+                # Usage prediction: one track per junction file
+                modality_track_names[modality] = junc_stems
+            elif modality == "splice_junctions":
+                # Junction counting: one track per junction file
+                modality_track_names[modality] = junc_stems
             print_rank0(
-                f"  {modality}: {len(junc_files)} junction files + {len(bigwigs)} BigWig tracks, "
-                f"resolutions={args.modality_resolutions[modality]}",
+                f"  {modality}: {len(junc_files)} junction files, "
+                f"resolutions={args.modality_resolutions[modality]}, "
+                f"tracks={len(modality_track_names[modality])}",
                 rank,
             )
-            splice_modality_idx += 1
         else:
+            bigwigs = args.modality_to_bigwigs.get(modality, [])
             modality_track_names[modality] = [Path(bw).stem for bw in bigwigs]
             print_rank0(
                 f"  {modality}: {len(bigwigs)} tracks, resolutions={args.modality_resolutions[modality]} - "
@@ -674,28 +729,35 @@ def create_datasets(
     train_datasets = {}
     val_datasets = {}
 
-    splice_modality_idx = 0
-    for modality, bigwigs in args.modality_to_bigwigs.items():
+    SPLICE_MODALITIES = {'splice_site', 'splice_usage', 'splice_junctions'}
+    _splice_dataset_cache = {}  # Cache to share datasets for co-expanded sub-modalities
+
+    for modality in args.modalities:
         resolutions = args.modality_resolutions[modality]
-        if modality in ("splice", "splice_junction"):
-            junc_key = f"splice_{splice_modality_idx}"
-            junc_files = args.modality_to_star_junctions.get(junc_key, [])
-            train_datasets[modality] = SpliceJunctionDataset(
-                genome_fasta=genome,
-                bed_file=args.train_bed,
-                star_junction_files=junc_files,
-                sequence_length=args.sequence_length,
-                filter_to_junctions=False,
-            )
-            val_datasets[modality] = SpliceJunctionDataset(
-                genome_fasta=genome,
-                bed_file=args.val_bed,
-                star_junction_files=junc_files,
-                sequence_length=args.sequence_length,
-                filter_to_junctions=False,
-            )
-            splice_modality_idx += 1
+        if modality in SPLICE_MODALITIES:
+            junc_files = args.modality_to_star_junctions.get(modality, [])
+            # Cache by junction files tuple to share datasets for co-expanded modalities
+            junc_key = tuple(sorted(junc_files))
+            if junc_key not in _splice_dataset_cache:
+                _splice_dataset_cache[junc_key] = (
+                    SpliceJunctionDataset(
+                        genome_fasta=genome,
+                        bed_file=args.train_bed,
+                        star_junction_files=junc_files,
+                        sequence_length=args.sequence_length,
+                        filter_to_junctions=False,
+                    ),
+                    SpliceJunctionDataset(
+                        genome_fasta=genome,
+                        bed_file=args.val_bed,
+                        star_junction_files=junc_files,
+                        sequence_length=args.sequence_length,
+                        filter_to_junctions=False,
+                    ),
+                )
+            train_datasets[modality], val_datasets[modality] = _splice_dataset_cache[junc_key]
         else:
+            bigwigs = args.modality_to_bigwigs.get(modality, [])
             train_datasets[modality] = GenomicDataset(
                 genome_fasta=genome,
                 bigwig_files=bigwigs,
@@ -913,7 +975,28 @@ def create_model(
 
     # Get head references from GPU model
     model_module = model.module if isinstance(model, DDP) else model
-    heads = {modality: model_module.heads[modality] for modality in heads}
+
+    # Map modality names to head references (handle both genomic and splice heads)
+    splice_modality_map = {
+        'splice_site': 'splice_sites_classification_head',
+        'splice_usage': 'splice_sites_usage_head',
+        'splice_junctions': 'splice_sites_junction_head',
+    }
+
+    heads_from_model = {}
+    for modality in heads:
+        if modality in splice_modality_map:
+            # Splice heads are registered as separate attributes
+            attr_name = splice_modality_map[modality]
+            if hasattr(model_module, attr_name):
+                heads_from_model[modality] = getattr(model_module, attr_name)
+            else:
+                raise ValueError(f"Splice head '{attr_name}' not found on model")
+        else:
+            # Genomic track heads are in the heads dict
+            heads_from_model[modality] = model_module.heads[modality]
+
+    heads = heads_from_model
 
     # Optionally compile
     if args.compile:

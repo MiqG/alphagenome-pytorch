@@ -24,14 +24,26 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from tqdm import tqdm
 
-from alphagenome_pytorch.losses import multinomial_loss
+from alphagenome_pytorch.losses import (
+    multinomial_loss,
+    cross_entropy_loss_from_logits,
+    binary_crossentropy_from_logits,
+)
+from alphagenome_pytorch.heads import (
+    SpliceSitesClassificationHead,
+    SpliceSitesUsageHead,
+    SpliceSitesJunctionHead,
+)
 from alphagenome_pytorch.extensions.finetuning.heads import (
-    SpliceSitesFinetuningAdapter,
+    _compute_junction_strand_loss,
 )
 
 # Number of segments for multinomial loss computation.
 # AlphaGenome divides sequences into 8 equal segments for numerical stability.
 NUM_SEGMENTS = 8
+
+# Tuple of all splice head types for isinstance checks
+SPLICE_HEAD_TYPES = (SpliceSitesClassificationHead, SpliceSitesUsageHead, SpliceSitesJunctionHead)
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
@@ -64,6 +76,124 @@ def collate_genomic(
         targets_dict[res] = torch.stack([item[1][res] for item in batch])
 
     return sequences, targets_dict
+
+
+def _call_splice_head(head, embeddings_dict, organism_idx, positions, channels_last):
+    """Call a splice head with the training-loop's embeddings_dict interface.
+
+    Unwraps embeddings_dict[1] and calls the correct forward signature per head type.
+
+    Args:
+        head: SpliceSitesClassificationHead, SpliceSitesUsageHead, or SpliceSitesJunctionHead.
+        embeddings_dict: Dict with key 1 → embeddings tensor (B, C, S) or (B, S, C).
+        organism_idx: Organism indices, shape (B,) or (B, 1).
+        positions: Optional splice-site positions (B, 4, K); required for junction head.
+        channels_last: If True, embeddings are (B, S, C); if False, (B, C, S).
+
+    Returns:
+        Dict compatible with _compute_splice_loss():
+        - {1: logits} for classification/usage heads
+        - {pos_counts: ..., neg_counts: ...} for junction head
+        - {} if junction head and positions is None
+    """
+    if 1 not in embeddings_dict:
+        available_keys = list(embeddings_dict.keys())
+        raise ValueError(
+            f"embeddings_dict missing key 1 for splice heads. Available: {available_keys}. "
+            f"Make sure resolutions include 1bp for splice modalities."
+        )
+    emb = embeddings_dict[1]
+    org = organism_idx[:, 0] if organism_idx.ndim > 1 else organism_idx
+    org = torch.zeros_like(org)
+
+    # Debug: Check embedding shape
+    assert emb.ndim == 3, f"Expected 3D embeddings, got shape {emb.shape}"
+
+    if isinstance(head, SpliceSitesJunctionHead):
+        if positions is None:
+            return {}
+        out = head(emb, org, channels_last=channels_last, splice_site_positions=positions)
+        n_tissues = head._num_tissues
+        return {
+            "pos_counts": out["pred_counts"][..., :n_tissues],
+            "neg_counts": out["pred_counts"][..., n_tissues:],
+        }
+    else:
+        out = head(emb, org, channels_last=channels_last)
+        logits = out["logits"]  # (B, S, C) if channels_last, else (B, C, S)
+        # Always transpose to NLC (B, S, C) for training loop compatibility
+        if channels_last:
+            # Already NLC, no transpose needed
+            pass
+        else:
+            # NCL to NLC: (B, C, S) → (B, S, C)
+            logits = logits.transpose(1, 2)
+        return {1: logits}
+
+
+def _compute_splice_loss(head, predictions, targets_dict, device):
+    """Compute loss for any of the three splice head types.
+
+    Args:
+        head: SpliceSitesClassificationHead, SpliceSitesUsageHead, or SpliceSitesJunctionHead.
+        predictions: Dict returned by _call_splice_head.
+        targets_dict: Dict with integer keys (resolutions) and string keys
+            ('junction_positions', 'junction_matrix').
+        device: Torch device.
+
+    Returns:
+        (loss_tensor, components_dict) where components_dict has keys like
+        'cls_loss', 'usage_loss', 'junction_pos_loss', 'junction_neg_loss'.
+    """
+    N_CLASSES = 5
+    label_smoothing = 1e-7
+
+    if isinstance(head, SpliceSitesClassificationHead):
+        pred = predictions[1]
+        all_targets = targets_dict[1].to(device)
+        # Extract only classification targets (first 5 channels)
+        target = all_targets[:, :N_CLASSES] if all_targets.ndim > 1 else all_targets[..., :N_CLASSES]
+        mask = target.any(dim=-1, keepdim=True).expand_as(pred)
+        target_smooth = (1.0 - label_smoothing) * target.float() + label_smoothing / N_CLASSES
+        loss = cross_entropy_loss_from_logits(
+            y_pred_logits=pred,
+            y_true=target_smooth,
+            mask=mask,
+            axis=-1,
+        )
+        return loss, {"cls_loss": loss.item()}
+
+    elif isinstance(head, SpliceSitesUsageHead):
+        pred = predictions[1]
+        all_targets = targets_dict[1].to(device)
+        # Extract only usage targets (channels after the first 5 classification channels)
+        target = all_targets[:, N_CLASSES:] if all_targets.ndim > 1 else all_targets[..., N_CLASSES:]
+        mask = (target > 0).any(dim=-1, keepdim=True).expand_as(pred)
+        loss = binary_crossentropy_from_logits(
+            y_pred=pred,
+            y_true=target.float(),
+            mask=mask,
+        )
+        return loss, {"usage_loss": loss.item()}
+
+    elif isinstance(head, SpliceSitesJunctionHead):
+        if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
+            return torch.tensor(0.0, device=device), {}
+        junc_matrix = targets_dict["junction_matrix"].to(device)
+        positions = targets_dict["junction_positions"].to(device)
+        n_s = head._num_tissues
+        pos_loss = _compute_junction_strand_loss(
+            predictions["pos_counts"], junc_matrix[..., :n_s],
+            positions[:, 0, :].long(), positions[:, 1, :].long(), device,
+        )
+        neg_loss = _compute_junction_strand_loss(
+            predictions["neg_counts"], junc_matrix[..., n_s:],
+            positions[:, 2, :].long(), positions[:, 3, :].long(), device,
+        )
+        loss = pos_loss + neg_loss
+        return loss, {"junction_pos_loss": pos_loss.item(), "junction_neg_loss": neg_loss.item()}
+
+    return torch.tensor(0.0, device=device), {}
 
 
 @dataclass
@@ -1304,13 +1434,13 @@ def train_epoch_multihead(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 # Embeddings are NCL (channels-first, channels_last=False).
                 # Splice heads must be told this so they don't incorrectly transpose.
-                if isinstance(head_module, SpliceSitesFinetuningAdapter):
+                if isinstance(head_module, SPLICE_HEAD_TYPES):
                     _positions = targets_dict.get("junction_positions")
                     if _positions is not None:
                         _positions = _positions.to(device)
-                    predictions = head(
-                        embeddings_dict, organism_idx,
-                        positions=_positions, channels_last=False,
+                    predictions = _call_splice_head(
+                        head_module, embeddings_dict, organism_idx,
+                        _positions, channels_last=False,
                     )
                 else:
                     predictions = head(
@@ -1319,9 +1449,9 @@ def train_epoch_multihead(
 
             modality_loss = torch.tensor(0.0, device=device)
 
-            if isinstance(head_module, SpliceSitesFinetuningAdapter):
-                modality_loss, splice_components = head_module.compute_loss(
-                    predictions, targets_dict, device
+            if isinstance(head_module, SPLICE_HEAD_TYPES):
+                modality_loss, splice_components = _compute_splice_loss(
+                    head_module, predictions, targets_dict, device
                 )
                 for k, v in splice_components.items():
                     loss_components[f"{modality}_{k}"] = v
@@ -1573,28 +1703,28 @@ def validate_multihead(
             head_module = head.module if hasattr(head, "module") else head
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                if isinstance(head_module, SpliceSitesFinetuningAdapter):
+                if isinstance(head_module, SPLICE_HEAD_TYPES):
                     _positions = targets_dict.get("junction_positions")
                     if _positions is not None:
                         _positions = _positions.to(device)
-                    predictions_scaled = head(
-                        embeddings_dict, organism_idx,
-                        positions=_positions, channels_last=True,
+                    predictions_scaled = _call_splice_head(
+                        head_module, embeddings_dict, organism_idx,
+                        _positions, channels_last=True,
                     )
                 else:
                     predictions_scaled = head(
                         embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                     )
-                if compute_pearson and not isinstance(head_module, SpliceSitesFinetuningAdapter):
+                if compute_pearson and not isinstance(head_module, SPLICE_HEAD_TYPES):
                     predictions_unscaled = head(
                         embeddings_dict, organism_idx, return_scaled=False, channels_last=True
                     )
 
             modality_loss = torch.tensor(0.0, device=device)
 
-            if isinstance(head_module, SpliceSitesFinetuningAdapter):
-                modality_loss, _ = head_module.compute_loss(
-                    predictions_scaled, targets_dict, device
+            if isinstance(head_module, SPLICE_HEAD_TYPES):
+                modality_loss, _ = _compute_splice_loss(
+                    head_module, predictions_scaled, targets_dict, device
                 )
             else:
                 for res, weight in res_weights.items():
@@ -1877,14 +2007,14 @@ def train_epoch_sequence_parallel(
                     predictions = head(
                         embeddings_pair, organism_idx, channels_last=True
                     )
-                elif isinstance(head_module, SpliceSitesFinetuningAdapter):
+                elif isinstance(head_module, SPLICE_HEAD_TYPES):
                     # Junction positions are not sharded — pass directly.
                     _positions = targets_dict.get("junction_positions")
                     if _positions is not None:
                         _positions = _positions.to(device)
-                    predictions = head(
-                        embeddings_dict, organism_idx,
-                        positions=_positions, channels_last=False,
+                    predictions = _call_splice_head(
+                        head_module, embeddings_dict, organism_idx,
+                        _positions, channels_last=False,
                     )
                 else:
                     predictions = head(
@@ -1893,19 +2023,21 @@ def train_epoch_sequence_parallel(
 
             modality_loss = torch.tensor(0.0, device=device)
 
-            if isinstance(head_module, SpliceSitesFinetuningAdapter):
+            if isinstance(head_module, SPLICE_HEAD_TYPES):
                 # Slice and move targets for sequence-parallel shard, then compute splice loss.
+                # Preserve string keys (junction_positions, junction_matrix) without slicing.
                 splice_targets_dict = {}
                 for res, tgt in targets_dict.items():
-                    if not isinstance(res, int):
-                        continue
                     tgt = tgt.to(device)
-                    full_len = tgt.shape[1]
-                    local_len = full_len // world_size
-                    t_start = rank * local_len
-                    splice_targets_dict[res] = tgt[:, t_start:t_start + local_len, :]
-                modality_loss, splice_components = head_module.compute_loss(
-                    predictions, splice_targets_dict, device
+                    if isinstance(res, int):
+                        # Slice sequence-length dimension for integer keys (resolutions)
+                        full_len = tgt.shape[1]
+                        local_len = full_len // world_size
+                        t_start = rank * local_len
+                        tgt = tgt[:, t_start:t_start + local_len, :]
+                    splice_targets_dict[res] = tgt
+                modality_loss, splice_components = _compute_splice_loss(
+                    head_module, predictions, splice_targets_dict, device
                 )
                 for k, v in splice_components.items():
                     loss_components[f"{modality}_{k}"] = v
