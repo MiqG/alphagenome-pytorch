@@ -152,7 +152,7 @@ def _compute_splice_loss(head, predictions, targets_dict, device):
         pred = predictions[1]
         all_targets = targets_dict[1].to(device)
         # Extract only classification targets (first 5 channels)
-        target = all_targets[:, :N_CLASSES] if all_targets.ndim > 1 else all_targets[..., :N_CLASSES]
+        target = all_targets[..., :N_CLASSES]
         mask = target.any(dim=-1, keepdim=True).expand_as(pred)
         target_smooth = (1.0 - label_smoothing) * target.float() + label_smoothing / N_CLASSES
         loss = cross_entropy_loss_from_logits(
@@ -167,7 +167,7 @@ def _compute_splice_loss(head, predictions, targets_dict, device):
         pred = predictions[1]
         all_targets = targets_dict[1].to(device)
         # Extract only usage targets (channels after the first 5 classification channels)
-        target = all_targets[:, N_CLASSES:] if all_targets.ndim > 1 else all_targets[..., N_CLASSES:]
+        target = all_targets[..., N_CLASSES:]
         mask = (target > 0).any(dim=-1, keepdim=True).expand_as(pred)
         loss = binary_crossentropy_from_logits(
             y_pred=pred,
