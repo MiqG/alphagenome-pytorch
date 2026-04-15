@@ -285,6 +285,110 @@ def junctions_to_classification_array(
     return arr
 
 
+def junctions_to_junction_matrix(
+    all_juncs_list: list[pd.DataFrame],
+    cls_arr: np.ndarray,
+    chrom: str,
+    start: int,
+    seq_len: int,
+    max_splice_sites: int = 256,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a sparse donor×acceptor count matrix for a genomic window.
+
+    Selects the top ``max_splice_sites`` donor and acceptor positions (separately
+    per strand) from ``cls_arr`` — the 5-class classification array already
+    computed for this window.  For every STAR junction whose donor and acceptor
+    both fall within the selected positions, the read count is placed at the
+    corresponding matrix entry.
+
+    Args:
+        all_juncs_list: List of junction DataFrames (one per sample), each with
+            columns: chrom, exon_start (1-based), exon_end (1-based), strand, count.
+        cls_arr: Float32 array of shape ``(seq_len, 5)`` — the 5-class one-hot
+            classification array (Donor+, Acceptor+, Donor−, Acceptor−, None).
+        chrom: Chromosome name of the window.
+        start: 0-based genomic start of the window.
+        seq_len: Length of the window in base pairs.
+        max_splice_sites: Maximum number of splice sites per role (padded with -1).
+
+    Returns:
+        positions: int32 array of shape ``(4, max_splice_sites)`` — relative
+            0-based positions for [pos_donors, pos_acceptors, neg_donors,
+            neg_acceptors], padded with ``-1``.
+        matrix: float32 array of shape
+            ``(max_splice_sites, max_splice_sites, 2 * n_samples)`` —
+            ``matrix[d, a, s]`` is the read count for the positive-strand
+            junction from ``pos_donors[d]`` to ``pos_acceptors[a]`` in sample
+            ``s``.  The second half of the last dimension (indices
+            ``n_samples … 2*n_samples-1``) holds the same for the negative
+            strand using ``neg_donors`` and ``neg_acceptors``.
+    """
+    n_samples = len(all_juncs_list)
+
+    # Extract positions for each role from cls_arr columns
+    # 0=Donor+, 1=Acceptor+, 2=Donor-, 3=Acceptor-
+    pos_donor_pos = np.where(cls_arr[:, 0] > 0)[0][:max_splice_sites]
+    pos_accept_pos = np.where(cls_arr[:, 1] > 0)[0][:max_splice_sites]
+    neg_donor_pos = np.where(cls_arr[:, 2] > 0)[0][:max_splice_sites]
+    neg_accept_pos = np.where(cls_arr[:, 3] > 0)[0][:max_splice_sites]
+
+    def _pad(arr: np.ndarray) -> np.ndarray:
+        out = np.full(max_splice_sites, -1, dtype=np.int32)
+        out[: len(arr)] = arr
+        return out
+
+    positions = np.stack([
+        _pad(pos_donor_pos),
+        _pad(pos_accept_pos),
+        _pad(neg_donor_pos),
+        _pad(neg_accept_pos),
+    ])  # (4, max_splice_sites)
+
+    matrix = np.zeros(
+        (max_splice_sites, max_splice_sites, 2 * n_samples), dtype=np.float32
+    )
+
+    # Build reverse-lookup maps: 0-based relative position → index in positions array
+    pos_donor_map = {int(p): i for i, p in enumerate(pos_donor_pos)}
+    pos_accept_map = {int(p): i for i, p in enumerate(pos_accept_pos)}
+    neg_donor_map = {int(p): i for i, p in enumerate(neg_donor_pos)}
+    neg_accept_map = {int(p): i for i, p in enumerate(neg_accept_pos)}
+
+    end = start + seq_len
+
+    for s, junc_df in enumerate(all_juncs_list):
+        mask = (
+            (junc_df["chrom"] == chrom)
+            & (junc_df["exon_start"] > start)   # 1-based exon_start > start → ≥ start+1
+            & (junc_df["exon_start"] <= end)
+            & (junc_df["exon_end"] > start)
+            & (junc_df["exon_end"] <= end)
+        )
+        local = junc_df.loc[mask]
+        if local.empty:
+            continue
+
+        for _, junc in local.iterrows():
+            # 1-based exon coords → 0-based relative index
+            d_rel = int(junc["exon_start"]) - 1 - start
+            a_rel = int(junc["exon_end"]) - 1 - start
+            count = float(junc["count"])
+            strand = junc["strand"]
+
+            if strand == "+":
+                d_idx = pos_donor_map.get(d_rel)
+                a_idx = pos_accept_map.get(a_rel)
+                if d_idx is not None and a_idx is not None:
+                    matrix[d_idx, a_idx, s] += count
+            elif strand == "-":
+                d_idx = neg_donor_map.get(d_rel)
+                a_idx = neg_accept_map.get(a_rel)
+                if d_idx is not None and a_idx is not None:
+                    matrix[d_idx, a_idx, n_samples + s] += count
+
+    return positions, matrix
+
+
 def junctions_to_usage_array(
     junc_df: pd.DataFrame,
     chrom: str,

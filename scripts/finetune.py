@@ -115,7 +115,9 @@ from alphagenome_pytorch.extensions.finetuning import (
 )
 from alphagenome_pytorch.extensions.finetuning.adapters import get_adapter_params
 from alphagenome_pytorch.extensions.finetuning.checkpointing import save_checkpoint, load_checkpoint
-from alphagenome_pytorch.extensions.finetuning.heads import create_finetuning_head, SpliceSitesFinetuningHead
+from alphagenome_pytorch.extensions.finetuning.heads import (
+    create_finetuning_head,
+)
 from alphagenome_pytorch.extensions.finetuning.transfer import (
     load_trunk,
     remove_all_heads,
@@ -552,12 +554,12 @@ def parse_args() -> argparse.Namespace:
     # Auto-inject 'splice' modalities for each --star-junctions group so that
     # users don't need to explicitly pass --modality splice alongside --star-junctions.
     star_junction_groups = args.star_junctions or []
-    explicit_splice_count = sum(1 for m in args.modalities if m == "splice")
+    explicit_splice_count = sum(1 for m in args.modalities if m in ("splice", "splice_junction"))
     for _ in range(len(star_junction_groups) - explicit_splice_count):
         args.modalities.append("splice")
 
-    # Pair up --star-junctions groups with splice modalities (in order)
-    splice_modalities = [m for m in args.modalities if m == "splice"]
+    # Pair up --star-junctions groups with splice/splice_junction modalities (in order)
+    splice_modalities = [m for m in args.modalities if m in ("splice", "splice_junction")]
     if len(star_junction_groups) > len(splice_modalities):
         parser.error(
             f"Got {len(star_junction_groups)} --star-junctions groups but only "
@@ -568,11 +570,11 @@ def parse_args() -> argparse.Namespace:
 
     for modality in args.modalities:
         spec = modality_specs.get(modality, {})
-        if modality == "splice":
-            # BigWig is optional for splice; junction files are required
+        if modality in ("splice", "splice_junction"):
+            # BigWig is optional for splice/splice_junction; junction files are required
             if splice_idx not in splice_junc_map:
                 parser.error(
-                    f"Modality 'splice' requires --star-junctions files. "
+                    f"Modality '{modality}' requires --star-junctions files. "
                     f"Provide one --star-junctions group per splice modality."
                 )
             args.modality_to_star_junctions[f"splice_{splice_idx}"] = splice_junc_map[splice_idx]
@@ -644,10 +646,11 @@ def create_datasets(
     modality_track_names: dict[str, list[str]] = {}
     splice_modality_idx = 0
     for modality, bigwigs in args.modality_to_bigwigs.items():
-        if modality == "splice":
+        if modality in ("splice", "splice_junction"):
             junc_key = f"splice_{splice_modality_idx}"
             junc_files = args.modality_to_star_junctions.get(junc_key, [])
             junc_stems = [Path(p).stem for p in junc_files]
+            # Splice modality includes 5 classification classes + junction samples
             modality_track_names[modality] = [
                 "cls_donor_pos", "cls_acceptor_pos", "cls_donor_neg", "cls_acceptor_neg", "cls_none"
             ] + junc_stems
@@ -674,7 +677,7 @@ def create_datasets(
     splice_modality_idx = 0
     for modality, bigwigs in args.modality_to_bigwigs.items():
         resolutions = args.modality_resolutions[modality]
-        if modality == "splice":
+        if modality in ("splice", "splice_junction"):
             junc_key = f"splice_{splice_modality_idx}"
             junc_files = args.modality_to_star_junctions.get(junc_key, [])
             train_datasets[modality] = SpliceJunctionDataset(
@@ -838,19 +841,15 @@ def create_model(
         track_means = modality_track_means.get(modality)
         resolutions = modality_resolutions[modality]
 
-        if modality == "splice":
-            n_samples = n_tracks - SpliceSitesFinetuningHead.N_CLASSES
-            head = SpliceSitesFinetuningHead(in_channels=1536, n_samples=n_samples)
-        else:
-            head = create_finetuning_head(
-                assay_type=modality,
-                n_tracks=n_tracks,
-                resolutions=resolutions if not is_encoder_only else (128,),
-                num_organisms=1,
-                track_means=track_means,
-                init_scheme=args.head_init_scheme,
-                encoder_only=is_encoder_only,
-            )
+        head = create_finetuning_head(
+            assay_type=modality,
+            n_tracks=n_tracks,
+            resolutions=resolutions if not is_encoder_only else (128,),
+            num_organisms=1,
+            track_means=track_means,
+            init_scheme=args.head_init_scheme,
+            encoder_only=is_encoder_only,
+        )
         add_head(model, modality, head)
         heads[modality] = head
         head_resolutions = (128,) if is_encoder_only else resolutions

@@ -25,7 +25,9 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from alphagenome_pytorch.losses import multinomial_loss
-from alphagenome_pytorch.extensions.finetuning.heads import SpliceSitesFinetuningHead
+from alphagenome_pytorch.extensions.finetuning.heads import (
+    SpliceSitesFinetuningAdapter,
+)
 
 # Number of segments for multinomial loss computation.
 # AlphaGenome divides sequences into 8 equal segments for numerical stability.
@@ -136,6 +138,13 @@ MODALITY_CONFIGS: dict[str, ModalityConfig] = {
     ),
     "splice": ModalityConfig(
         name="splice",
+        resolutions=(1,),
+        default_resolution_weights={1: 1.0},
+        embedding_dim=3072,
+        positions_arg="positions",
+    ),
+    "splice_junction": ModalityConfig(
+        name="splice_junction",
         resolutions=(1,),
         default_resolution_weights={1: 1.0},
         embedding_dim=3072,
@@ -1294,10 +1303,14 @@ def train_epoch_multihead(
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 # Embeddings are NCL (channels-first, channels_last=False).
-                # Splice head must be told this so it doesn't incorrectly transpose.
-                if isinstance(head_module, SpliceSitesFinetuningHead):
+                # Splice heads must be told this so they don't incorrectly transpose.
+                if isinstance(head_module, SpliceSitesFinetuningAdapter):
+                    _positions = targets_dict.get("junction_positions")
+                    if _positions is not None:
+                        _positions = _positions.to(device)
                     predictions = head(
-                        embeddings_dict, organism_idx, return_scaled=True, channels_last=False
+                        embeddings_dict, organism_idx,
+                        positions=_positions, channels_last=False,
                     )
                 else:
                     predictions = head(
@@ -1306,7 +1319,7 @@ def train_epoch_multihead(
 
             modality_loss = torch.tensor(0.0, device=device)
 
-            if isinstance(head_module, SpliceSitesFinetuningHead):
+            if isinstance(head_module, SpliceSitesFinetuningAdapter):
                 modality_loss, splice_components = head_module.compute_loss(
                     predictions, targets_dict, device
                 )
@@ -1560,17 +1573,26 @@ def validate_multihead(
             head_module = head.module if hasattr(head, "module") else head
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                predictions_scaled = head(
-                    embeddings_dict, organism_idx, return_scaled=True, channels_last=True
-                )
-                if compute_pearson and not isinstance(head_module, SpliceSitesFinetuningHead):
+                if isinstance(head_module, SpliceSitesFinetuningAdapter):
+                    _positions = targets_dict.get("junction_positions")
+                    if _positions is not None:
+                        _positions = _positions.to(device)
+                    predictions_scaled = head(
+                        embeddings_dict, organism_idx,
+                        positions=_positions, channels_last=True,
+                    )
+                else:
+                    predictions_scaled = head(
+                        embeddings_dict, organism_idx, return_scaled=True, channels_last=True
+                    )
+                if compute_pearson and not isinstance(head_module, SpliceSitesFinetuningAdapter):
                     predictions_unscaled = head(
                         embeddings_dict, organism_idx, return_scaled=False, channels_last=True
                     )
 
             modality_loss = torch.tensor(0.0, device=device)
 
-            if isinstance(head_module, SpliceSitesFinetuningHead):
+            if isinstance(head_module, SpliceSitesFinetuningAdapter):
                 modality_loss, _ = head_module.compute_loss(
                     predictions_scaled, targets_dict, device
                 )
@@ -1855,9 +1877,14 @@ def train_epoch_sequence_parallel(
                     predictions = head(
                         embeddings_pair, organism_idx, channels_last=True
                     )
-                elif isinstance(head_module, SpliceSitesFinetuningHead):
+                elif isinstance(head_module, SpliceSitesFinetuningAdapter):
+                    # Junction positions are not sharded — pass directly.
+                    _positions = targets_dict.get("junction_positions")
+                    if _positions is not None:
+                        _positions = _positions.to(device)
                     predictions = head(
-                        embeddings_dict, organism_idx, return_scaled=True, channels_last=False
+                        embeddings_dict, organism_idx,
+                        positions=_positions, channels_last=False,
                     )
                 else:
                     predictions = head(
@@ -1866,10 +1893,12 @@ def train_epoch_sequence_parallel(
 
             modality_loss = torch.tensor(0.0, device=device)
 
-            if isinstance(head_module, SpliceSitesFinetuningHead):
+            if isinstance(head_module, SpliceSitesFinetuningAdapter):
                 # Slice and move targets for sequence-parallel shard, then compute splice loss.
                 splice_targets_dict = {}
                 for res, tgt in targets_dict.items():
+                    if not isinstance(res, int):
+                        continue
                     tgt = tgt.to(device)
                     full_len = tgt.shape[1]
                     local_len = full_len // world_size

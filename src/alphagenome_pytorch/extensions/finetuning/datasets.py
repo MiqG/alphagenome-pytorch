@@ -1024,10 +1024,12 @@ class SpliceJunctionDataset(Dataset):
             filter_intervals_with_junctions,
             junctions_to_classification_array,
             junctions_to_usage_array,
+            junctions_to_junction_matrix,
         )
         self._filter_intervals_with_junctions = filter_intervals_with_junctions
         self._junctions_to_classification_array = junctions_to_classification_array
         self._junctions_to_usage_array = junctions_to_usage_array
+        self._junctions_to_junction_matrix = junctions_to_junction_matrix
 
         self.star_junction_files = [str(p) for p in star_junction_files]
         self.sequence_length = sequence_length
@@ -1117,10 +1119,18 @@ class SpliceJunctionDataset(Dataset):
         Returns:
             Tuple of (sequence, targets_dict):
                 - sequence: One-hot encoded DNA (seq_len, 4)
-                - targets_dict: {1: tensor of shape (seq_len, 5 + n_junc_files)}
-                  First 5 channels: 5-class one-hot classification (Donor+,
-                  Acceptor+, Donor-, Acceptor-, None). Remaining channels:
-                  per-sample fractional usage in [0, 1].
+                - targets_dict: dict with the following keys:
+                    - 1: tensor of shape (seq_len, 5 + n_junc_files) —
+                      first 5 channels: 5-class one-hot classification
+                      (Donor+, Acceptor+, Donor-, Acceptor-, None);
+                      remaining channels: per-sample fractional usage in [0, 1].
+                    - "junction_positions": int32 tensor of shape (4, max_splice_sites)
+                      — relative 0-based positions for [pos_donors, pos_acceptors,
+                      neg_donors, neg_acceptors], padded with -1.
+                    - "junction_matrix": float32 tensor of shape
+                      (max_splice_sites, max_splice_sites, 2 * n_samples) —
+                      donor×acceptor read-count matrix (pos strand first half,
+                      neg strand second half of last dim).
         """
         self._ensure_handles()
         chrom, start, end = self._positions_list[idx]
@@ -1141,7 +1151,17 @@ class SpliceJunctionDataset(Dataset):
         usage_arr = np.stack(usage_tracks, axis=-1)  # (seq_len, n_samples)
 
         targets_1bp = np.concatenate([cls_arr, usage_arr], axis=-1)  # (seq_len, 5+n_samples)
-        targets_dict = {1: torch.from_numpy(targets_1bp).float()}
+
+        # Junction matrix targets
+        junc_positions, junc_matrix = self._junctions_to_junction_matrix(
+            self._all_juncs, cls_arr, chrom, start, seq_len
+        )
+
+        targets_dict = {
+            1: torch.from_numpy(targets_1bp).float(),
+            "junction_positions": torch.from_numpy(junc_positions),
+            "junction_matrix": torch.from_numpy(junc_matrix),
+        }
         return sequence, targets_dict
 
     @property
