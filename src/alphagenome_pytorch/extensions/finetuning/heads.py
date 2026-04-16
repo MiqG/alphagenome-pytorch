@@ -38,25 +38,38 @@ def _soft_clip_counts(counts: Tensor, clip: float = 10.0) -> Tensor:
 
 
 def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_pos, device):
-    """Compute strand-specific junction loss: soft-clipped Poisson + ratio CE.
+    """Compute strand-specific junction loss: soft-clipped Poisson + multinomial ratio CE.
+
+    Matches JAX SpliceSitesJunctionHead.loss (line 998-1053) which combines:
+    1. Cross-entropy loss on donor and acceptor ratio distributions (weight 1.0 each)
+    2. Poisson loss on donor/acceptor marginal counts (weight 0.2 each)
+
+    The ratio losses use raw target counts to preserve distribution structure.
+    The Poisson losses use soft-clipped targets to reduce outlier impact.
 
     Args:
         pred_counts: (B, D, A, n_samples) predicted junction counts
-        target_counts: (B, D, A, n_samples) target junction counts
+        target_counts: (B, D, A, n_samples) target junction counts (raw, unclipped)
         donor_pos: (B, D) donor positions (neg values are invalid)
         accept_pos: (B, A) acceptor positions (neg values are invalid)
         device: torch device
 
     Returns:
-        Loss scalar: 0.2 * (d_loss + a_loss) + ratio_loss
+        Loss scalar: donor_ratios_loss + acceptor_ratios_loss + 0.2 * (d_loss + a_loss)
+
+    Reference:
+        JAX: alphagenome_research.model.losses.cross_entropy_loss (lines 167-184)
     """
     valid_d = (donor_pos >= 0).unsqueeze(-1)   # (B, D, 1)
     valid_a = (accept_pos >= 0).unsqueeze(-1)  # (B, A, 1)
+    eps = 1e-7
 
-    # Apply soft clipping to targets (JAX reference: line 1014-1017)
+    # Soft clipping ONLY for Poisson marginals (not for CE ratio targets)
     clipped_target = _soft_clip_counts(target_counts)
 
-    pred_donor_total = pred_counts.sum(dim=2)   # (B, D, n_samples)
+    # ===== Poisson loss on donor/acceptor marginals =====
+    # Uses soft-clipped targets to reduce outlier impact
+    pred_donor_total = pred_counts.sum(dim=2)    # (B, D, n_samples)
     true_donor_total = clipped_target.sum(dim=2)
     d_loss = poisson_loss(
         y_true=true_donor_total,
@@ -64,7 +77,7 @@ def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_
         mask=valid_d.expand_as(pred_donor_total),
     )
 
-    pred_accept_total = pred_counts.sum(dim=1)  # (B, A, n_samples)
+    pred_accept_total = pred_counts.sum(dim=1)   # (B, A, n_samples)
     true_accept_total = clipped_target.sum(dim=1)
     a_loss = poisson_loss(
         y_true=true_accept_total,
@@ -72,18 +85,45 @@ def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_
         mask=valid_a.expand_as(pred_accept_total),
     )
 
-    has_reads = clipped_target.sum(dim=(1, 2, 3)) > 0
-    ratio_loss = torch.tensor(0.0, device=device)
-    if has_reads.any():
-        p = pred_counts[has_reads]
-        t = clipped_target[has_reads]
-        t_sum_d = t.sum(dim=1, keepdim=True).clamp(min=1e-7)
-        ratio_loss = ratio_loss - (t / t_sum_d * p.log().clamp(min=-100)).sum() / has_reads.sum()
-        t_sum_a = t.sum(dim=2, keepdim=True).clamp(min=1e-7)
-        ratio_loss = ratio_loss - (t / t_sum_a * p.log().clamp(min=-100)).sum() / has_reads.sum()
+    # ===== Cross-entropy loss on ratio distributions (RAW targets) =====
+    # Implements JAX cross_entropy_loss(y_true, y_pred, axis) which computes:
+    # log_normalizer = log(sum_axis(pred + eps))
+    # log_likelihood = sum_axis(p_true * log(pred + eps))
+    #     where p_true = target / sum_axis(target)
+    # loss_per_element = log_normalizer - log_likelihood
+    # = log(sum_pred) - sum(p_true * log(pred))
+    # = cross_entropy(p_true, pred/sum_pred) when pred > 0
 
-    # Return weighted loss: Poisson @ 0.2×, ratio @ 1.0× (JAX: line 1048-1051)
-    return 0.2 * (d_loss + a_loss) + ratio_loss
+    has_reads = (target_counts.sum(dim=(1, 2, 3)) > 0).to(device)
+    ratio_loss = torch.tensor(0.0, device=device, dtype=pred_counts.dtype, requires_grad=True)
+
+    if has_reads.any():
+        p = pred_counts[has_reads]  # (n_batch, D, A, n_samples)
+        t = target_counts[has_reads]  # (n_batch, D, A, n_samples) -- raw, not clipped
+
+        # Ratio CE along donor axis: p(acceptor | donor)
+        # Sum over donors (dim=1): shapes become (n_batch, A, n_samples)
+        t_sum_d = t.sum(dim=1, keepdim=True).clamp(min=eps)  # (n_batch, 1, A, n_samples)
+        p_true_d = t / t_sum_d
+        p_masked_d = p + eps
+        log_norm_d = torch.log(p_masked_d.sum(dim=1, keepdim=True))  # (n_batch, 1, A, n_samples)
+        log_lik_d = (p_true_d * torch.log(p_masked_d)).sum(dim=1, keepdim=True)  # (n_batch, 1, A, n_samples)
+        ratio_loss_d = log_norm_d - log_lik_d  # (n_batch, 1, A, n_samples)
+
+        # Ratio CE along acceptor axis: p(donor | acceptor)
+        # Sum over acceptors (dim=2): shapes become (n_batch, D, n_samples)
+        t_sum_a = t.sum(dim=2, keepdim=True).clamp(min=eps)  # (n_batch, D, 1, n_samples)
+        p_true_a = t / t_sum_a
+        log_norm_a = torch.log(p_masked_d.sum(dim=2, keepdim=True))  # (n_batch, D, 1, n_samples)
+        log_lik_a = (p_true_a * torch.log(p_masked_d)).sum(dim=2, keepdim=True)  # (n_batch, D, 1, n_samples)
+        ratio_loss_a = log_norm_a - log_lik_a  # (n_batch, D, 1, n_samples)
+
+        # Average over batch and sample dimensions (matching JAX _safe_masked_mean)
+        n_batch = has_reads.sum().float()
+        ratio_loss = (ratio_loss_d.sum() + ratio_loss_a.sum()) / n_batch
+
+    # Return weighted sum: CE losses @ 1.0×, Poisson losses @ 0.2× (JAX line 1048-1051)
+    return ratio_loss + 0.2 * (d_loss + a_loss)
 
 
 # All supported assay types and their squashing behavior

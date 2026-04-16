@@ -1031,12 +1031,13 @@ class SpliceJunctionDataset(Dataset):
             read_star_junctions,
             filter_intervals_with_junctions,
             junctions_to_classification_array,
-            junctions_to_usage_array,
+            junctions_to_usage_arrays_by_strand,
             junctions_to_junction_matrix,
+            normalize_junctions_per_sample,
         )
         self._filter_intervals_with_junctions = filter_intervals_with_junctions
         self._junctions_to_classification_array = junctions_to_classification_array
-        self._junctions_to_usage_array = junctions_to_usage_array
+        self._junctions_to_usage_arrays_by_strand = junctions_to_usage_arrays_by_strand
         self._junctions_to_junction_matrix = junctions_to_junction_matrix
 
         self.star_junction_files = [str(p) for p in star_junction_files]
@@ -1061,6 +1062,8 @@ class SpliceJunctionDataset(Dataset):
             junc["exon_start"] = junc["intron_start"] - 1  # 1-based donor exon end
             junc["exon_end"] = junc["intron_end"] + 1      # 1-based acceptor exon start
             junc["count"] = junc["n_uniquely_mapped_reads"]
+            # Normalize: CPM + clip at 99.99th percentile + scale by mean
+            junc = normalize_junctions_per_sample(junc)
             self._all_juncs.append(junc)
 
         # Union of all junctions (for interval filtering)
@@ -1151,12 +1154,13 @@ class SpliceJunctionDataset(Dataset):
             self._all_juncs, chrom, start, seq_len
         )
 
-        # Usage targets: (seq_len, n_junc_files) — one channel per sample
-        usage_tracks = [
-            self._junctions_to_usage_array(junc_df, chrom, start, seq_len)
-            for junc_df in self._all_juncs
-        ]
-        usage_arr = np.stack(usage_tracks, axis=-1)  # (seq_len, n_samples)
+        # Usage targets: (seq_len, 2*n_junc_files) — two channels per sample (pos/neg strand)
+        usage_tracks = []
+        for junc_df in self._all_juncs:
+            pos_arr, neg_arr = self._junctions_to_usage_arrays_by_strand(junc_df, chrom, start, seq_len)
+            usage_tracks.append(pos_arr)
+            usage_tracks.append(neg_arr)
+        usage_arr = np.stack(usage_tracks, axis=-1)  # (seq_len, 2*n_samples)
 
         targets_1bp = np.concatenate([cls_arr, usage_arr], axis=-1)  # (seq_len, 5+n_samples)
 
@@ -1174,8 +1178,8 @@ class SpliceJunctionDataset(Dataset):
 
     @property
     def n_tracks(self) -> int:
-        """Total number of output channels (5 classification + n junction files)."""
-        return self.N_CLASSIFICATION_CLASSES + len(self.star_junction_files)
+        """Total number of output channels (5 classification + 2*n_samples for strand-specific usage)."""
+        return self.N_CLASSIFICATION_CLASSES + 2 * len(self.star_junction_files)
 
 
 # Backward-compatible aliases

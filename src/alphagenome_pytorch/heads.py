@@ -554,9 +554,12 @@ class SpliceSitesJunctionHead(nn.Module):
         )
 
         def make_rope_params():
-            return nn.Parameter(torch.zeros(
-                self._num_organisms, 2, self._num_tissues, self._hidden_dim
-            ))
+            params = torch.zeros(self._num_organisms, 2, self._num_tissues, self._hidden_dim)
+            # Initialize scale (index 0) to 1.0 (identity for multiplication) and offset (index 1) to 0.0
+            # This allows gradients to flow immediately: x_transformed = 1 * x + 0 = x
+            params[:, 0, :, :] = 1.0  # scale = 1 (identity)
+            params[:, 1, :, :] = 0.0  # offset = 0 (no shift)
+            return nn.Parameter(params)
 
         self.rope_params = nn.ParameterDict({
             "pos_donor": make_rope_params(),

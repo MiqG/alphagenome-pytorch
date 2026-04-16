@@ -389,6 +389,191 @@ def junctions_to_junction_matrix(
     return positions, matrix
 
 
+def normalize_junctions_to_cpm(junc_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize junction counts to CPM (counts per million) within a sample.
+
+    Divides each junction's count by the total junction reads in the sample,
+    scaled to 1 million.
+
+    Args:
+        junc_df: Junction DataFrame with 'count' column.
+
+    Returns:
+        DataFrame with counts normalized to CPM.
+    """
+    df = junc_df.copy()
+    total_reads = df["count"].sum()
+    if total_reads > 0:
+        df["count"] = (df["count"] / total_reads) * 1e6
+    else:
+        df["count"] = 0.0
+    return df
+
+
+def normalize_junctions_per_sample(junc_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize junction counts within a single sample (full pipeline).
+
+    Applies three normalization steps:
+    1. CPM normalize: counts per million total filtered reads
+    2. Clip at 99.99th percentile: removes extreme outliers
+    3. Scale by mean of nonzero values: centers scale around expressed junctions
+
+    This matches the AlphaGenome paper's preprocessing for fine-tuning.
+
+    Args:
+        junc_df: Junction DataFrame with 'count' column.
+
+    Returns:
+        Normalized DataFrame with same structure.
+
+    Example:
+        >>> junc = read_star_junctions('sample.sj.out.tab')
+        >>> junc = junc.loc[junc['n_uniquely_mapped_reads'] >= 1].copy()
+        >>> junc['count'] = junc['n_uniquely_mapped_reads']
+        >>> normalized = normalize_junctions_per_sample(junc)
+    """
+    df = junc_df.copy()
+
+    # Step 1: CPM normalize
+    total_reads = df["count"].sum()
+    if total_reads > 0:
+        df["count"] = (df["count"] / total_reads) * 1e6
+    else:
+        return df  # All zeros, return as-is
+
+    # Step 2: Clip at 99.99th percentile
+    threshold = float(np.percentile(df["count"], 99.99))
+    df["count"] = np.minimum(df["count"], threshold)
+
+    # Step 3: Scale by mean of nonzero values
+    nonzero = df.loc[df["count"] > 0, "count"]
+    if len(nonzero) > 0:
+        mean_val = float(nonzero.mean())
+        if mean_val > 0:
+            df["count"] = df["count"] / mean_val
+
+    return df
+
+
+def compute_tissue_normalization_params(
+    junc_dfs_by_sample: dict[str, pd.DataFrame],
+    sample_to_tissue: dict[str, str],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Compute tissue-specific clipping threshold and scaling mean.
+
+    For each tissue, computes:
+    1. 99.99th percentile of all junction counts in that tissue
+    2. Mean of clipped, nonzero junction counts in that tissue
+
+    Args:
+        junc_dfs_by_sample: Dict mapping sample name to junction DataFrame
+            (should be CPM-normalized already).
+        sample_to_tissue: Dict mapping sample name to tissue label.
+
+    Returns:
+        (thresholds, means) tuple where:
+        - thresholds: Dict mapping tissue to 99.99th percentile value
+        - means: Dict mapping tissue to mean of nonzero clipped counts
+    """
+    # Group samples by tissue
+    tissue_samples: dict[str, list[str]] = {}
+    for sample, tissue in sample_to_tissue.items():
+        if tissue not in tissue_samples:
+            tissue_samples[tissue] = []
+        tissue_samples[tissue].append(sample)
+
+    thresholds: dict[str, float] = {}
+    means: dict[str, float] = {}
+
+    for tissue, samples in tissue_samples.items():
+        # Collect all counts in this tissue
+        all_counts: list[float] = []
+        for sample in samples:
+            if sample in junc_dfs_by_sample:
+                all_counts.extend(junc_dfs_by_sample[sample]["count"].values)
+
+        if not all_counts:
+            continue
+
+        all_counts_arr = np.asarray(all_counts, dtype=np.float32)
+
+        # Compute 99.99th percentile
+        threshold = float(np.percentile(all_counts_arr, 99.99))
+        thresholds[tissue] = threshold
+
+        # Compute mean of clipped, nonzero values
+        clipped_counts = np.minimum(all_counts_arr, threshold)
+        nonzero_clipped = clipped_counts[clipped_counts > 0]
+        if len(nonzero_clipped) > 0:
+            means[tissue] = float(np.mean(nonzero_clipped))
+        else:
+            means[tissue] = 1.0  # Fallback if all zero
+
+    return thresholds, means
+
+
+def normalize_junctions_tissue_level(
+    junc_dfs_by_sample: dict[str, pd.DataFrame],
+    sample_to_tissue: dict[str, str],
+    thresholds: dict[str, float] | None = None,
+    means: dict[str, float] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Apply tissue-specific clipping and scaling to junction counts.
+
+    For each tissue:
+    1. Clips counts at 99.99th percentile
+    2. Scales by dividing by mean of expressed junctions (count > 0)
+
+    Args:
+        junc_dfs_by_sample: Dict mapping sample name to junction DataFrame
+            (should be CPM-normalized).
+        sample_to_tissue: Dict mapping sample name to tissue label.
+        thresholds: Optional pre-computed tissue thresholds (99.99th percentile).
+            If None, computed from the data.
+        means: Optional pre-computed tissue means. If None, computed from data.
+
+    Returns:
+        Dict mapping sample name to normalized DataFrame.
+
+    Example:
+        >>> # First normalize each sample to CPM
+        >>> cpm_dfs = {s: normalize_junctions_to_cpm(df)
+        ...            for s, df in junc_dfs.items()}
+        >>> # Then apply tissue-level scaling
+        >>> normalized = normalize_junctions_tissue_level(
+        ...     cpm_dfs,
+        ...     sample_to_tissue={'sample1': 'tissue_A', 'sample2': 'tissue_A'},
+        ... )
+    """
+    if thresholds is None or means is None:
+        thresholds, means = compute_tissue_normalization_params(
+            junc_dfs_by_sample, sample_to_tissue
+        )
+
+    normalized: dict[str, pd.DataFrame] = {}
+    for sample, junc_df in junc_dfs_by_sample.items():
+        tissue = sample_to_tissue.get(sample)
+        if tissue is None:
+            # No tissue mapping, return as-is
+            normalized[sample] = junc_df.copy()
+            continue
+
+        df = junc_df.copy()
+
+        # Clip at tissue threshold
+        threshold = thresholds.get(tissue, np.inf)
+        df["count"] = np.minimum(df["count"], threshold)
+
+        # Scale by tissue mean
+        mean = means.get(tissue, 1.0)
+        if mean > 0:
+            df["count"] = df["count"] / mean
+
+        normalized[sample] = df
+
+    return normalized
+
+
 def junctions_to_usage_array(
     junc_df: pd.DataFrame,
     chrom: str,
@@ -438,5 +623,73 @@ def junctions_to_usage_array(
             arr[donor_idx] += frac
         if 0 <= accept_idx < seq_len:
             arr[accept_idx] += frac
+
+    return arr
+
+
+def junctions_to_usage_arrays_by_strand(
+    junc_df: pd.DataFrame,
+    chrom: str,
+    start: int,
+    seq_len: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build per-position usage arrays per strand for one sample within a window.
+
+    Returns separate usage arrays for positive and negative strands.
+    Each array represents the fraction of that strand's junction reads
+    passing through each splice site position.
+
+    Args:
+        junc_df: Junction DataFrame with columns: chrom, exon_start (1-based),
+            exon_end (1-based), strand, count.
+        chrom: Chromosome name of the window.
+        start: 0-based genomic start of the window.
+        seq_len: Length of the window in base pairs.
+
+    Returns:
+        Tuple of two float32 arrays of shape (seq_len,):
+            - pos_arr: usage for positive strand
+            - neg_arr: usage for negative strand
+    """
+    pos_arr = np.zeros(seq_len, dtype=np.float32)
+    neg_arr = np.zeros(seq_len, dtype=np.float32)
+    end = start + seq_len  # 0-based exclusive
+
+    mask = (
+        (junc_df["chrom"] == chrom)
+        & (junc_df["exon_start"] > start)
+        & (junc_df["exon_start"] <= end)
+        & (junc_df["exon_end"] > start)
+        & (junc_df["exon_end"] <= end)
+    )
+    local = junc_df.loc[mask]
+    if local.empty:
+        return pos_arr, neg_arr
+
+    # Compute total reads per strand
+    pos_total = float(local[local["strand"] == "+"]["count"].sum())
+    neg_total = float(local[local["strand"] == "-"]["count"].sum())
+
+    # Build usage arrays per strand
+    for _, junc in local.iterrows():
+        donor_idx = int(junc["exon_start"]) - 1 - start
+        accept_idx = int(junc["exon_end"]) - 1 - start
+
+        if junc["strand"] == "+":
+            if pos_total > 0:
+                frac = junc["count"] / pos_total
+                if 0 <= donor_idx < seq_len:
+                    pos_arr[donor_idx] += frac
+                if 0 <= accept_idx < seq_len:
+                    pos_arr[accept_idx] += frac
+        elif junc["strand"] == "-":
+            if neg_total > 0:
+                frac = junc["count"] / neg_total
+                if 0 <= donor_idx < seq_len:
+                    neg_arr[donor_idx] += frac
+                if 0 <= accept_idx < seq_len:
+                    neg_arr[accept_idx] += frac
+
+    return pos_arr, neg_arr
 
     return arr

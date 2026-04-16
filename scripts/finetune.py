@@ -703,11 +703,13 @@ def create_datasets(
                     "cls_donor_pos", "cls_acceptor_pos", "cls_donor_neg", "cls_acceptor_neg", "cls_none"
                 ]
             elif modality == "splice_usage":
-                # Usage prediction: one track per junction file
-                modality_track_names[modality] = junc_stems
+                # Usage prediction: 2 tracks per junction file (positive and negative strands)
+                modality_track_names[modality] = [f"{stem}_pos" for stem in junc_stems] + \
+                                                 [f"{stem}_neg" for stem in junc_stems]
             elif modality == "splice_junctions":
-                # Junction counting: one track per junction file
-                modality_track_names[modality] = junc_stems
+                # Junction counting: 2 tracks per junction file (positive and negative strands)
+                modality_track_names[modality] = [f"{stem}_pos" for stem in junc_stems] + \
+                                                 [f"{stem}_neg" for stem in junc_stems]
             print_rank0(
                 f"  {modality}: {len(junc_files)} junction files, "
                 f"resolutions={args.modality_resolutions[modality]}, "
@@ -903,9 +905,17 @@ def create_model(
         track_means = modality_track_means.get(modality)
         resolutions = modality_resolutions[modality]
 
+        # For splice_junctions, n_tracks includes both strands (2 per sample)
+        # but the head creation expects number of samples (tissues)
+        n_tracks_for_head = n_tracks
+        n_samples = n_tracks  # For display
+        if modality == 'splice_junctions':
+            n_tracks_for_head = n_tracks // 2  # Number of samples
+            n_samples = n_tracks_for_head
+
         head = create_finetuning_head(
             assay_type=modality,
-            n_tracks=n_tracks,
+            n_tracks=n_tracks_for_head,
             resolutions=resolutions if not is_encoder_only else (128,),
             num_organisms=1,
             track_means=track_means,

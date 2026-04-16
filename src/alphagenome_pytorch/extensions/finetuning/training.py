@@ -112,7 +112,11 @@ def _call_splice_head(head, embeddings_dict, organism_idx, positions, channels_l
     if isinstance(head, SpliceSitesJunctionHead):
         if positions is None:
             return {}
-        out = head(emb, org, channels_last=channels_last, splice_site_positions=positions)
+        # Clamp -1 padding to 0 to avoid PyTorch negative indexing wrapping.
+        # Padded positions use -1, but negative indices wrap to last position in PyTorch.
+        # Clamping to 0 ensures a safe dummy index; output predictions are masked anyway.
+        positions_clamped = positions.clamp(min=0)
+        out = head(emb, org, channels_last=channels_last, splice_site_positions=positions_clamped)
         n_tissues = head._num_tissues
         return {
             "pos_counts": out["pred_counts"][..., :n_tissues],
@@ -178,14 +182,30 @@ def _compute_splice_loss(head, predictions, targets_dict, device):
 
     elif isinstance(head, SpliceSitesJunctionHead):
         import sys
+        import numpy as np
         # DEBUG: Check what's in targets_dict on first call
         if not hasattr(_compute_splice_loss, "_logged"):
-            print(f"DEBUG _compute_splice_loss:", file=sys.stderr)
-            print(f"  targets_dict keys: {list(targets_dict.keys())}", file=sys.stderr)
+            print(f"\n=== DEBUG: SpliceSitesJunctionHead ===", file=sys.stderr)
+            print(f"Head parameter trainability:", file=sys.stderr)
+            for name, param in head.named_parameters():
+                print(f"  {name}: requires_grad={param.requires_grad}, shape={param.shape}, grad={param.grad is not None}", file=sys.stderr)
+
+            print(f"\ntargets_dict keys: {list(targets_dict.keys())}", file=sys.stderr)
             for k, v in targets_dict.items():
                 if hasattr(v, 'shape'):
-                    print(f"    {k}: shape={v.shape}, dtype={v.dtype}, sum={v.sum().item():.2f}", file=sys.stderr)
-            print(f"  predictions keys: {list(predictions.keys())}", file=sys.stderr)
+                    v_np = v.cpu().detach().numpy() if hasattr(v, 'cpu') else v
+                    nz = np.count_nonzero(v_np)
+                    print(f"  {k}:", file=sys.stderr)
+                    print(f"    shape={v.shape}, dtype={v.dtype}, nonzero={nz} ({100*nz/v.numel():.2f}%)", file=sys.stderr)
+                    print(f"    min={v_np.min():.4f}, max={v_np.max():.4f}, mean={v_np.mean():.4f}, sum={v_np.sum():.4f}", file=sys.stderr)
+
+            print(f"\npredictions keys: {list(predictions.keys())}", file=sys.stderr)
+            for k, v in predictions.items():
+                if hasattr(v, 'shape'):
+                    v_np = v.cpu().detach().numpy() if hasattr(v, 'cpu') else v
+                    print(f"  {k}:", file=sys.stderr)
+                    print(f"    shape={v.shape}, dtype={v.dtype}", file=sys.stderr)
+                    print(f"    min={v_np.min():.6f}, max={v_np.max():.6f}, mean={v_np.mean():.6f}, std={v_np.std():.6f}", file=sys.stderr)
             _compute_splice_loss._logged = True
 
         if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
