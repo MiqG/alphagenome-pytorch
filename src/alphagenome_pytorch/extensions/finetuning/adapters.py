@@ -132,7 +132,16 @@ class Locon(nn.Module):
         self.kernel_size = original_layer.kernel_size[0]
         self.stride = original_layer.stride[0]
         self.dilation = original_layer.dilation[0]
-        self.padding = original_layer.padding[0]
+        # StandardizedConv1d stores padding=0 in the base class and pads manually
+        # in forward via self.pad_mode. Detect that here so Locon replicates it.
+        _pad_mode = getattr(original_layer, "pad_mode", None)
+        _padding = original_layer.padding
+        if _pad_mode == "same":
+            self.pad_same = True
+            self.padding = 0
+        else:
+            self.pad_same = False
+            self.padding = _padding if isinstance(_padding, str) else _padding[0]
         
         if rank > self.out_channels:
             raise ValueError(
@@ -174,10 +183,16 @@ class Locon(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Original output (frozen)
         original_output = self.original_layer(x)
-        
+
+        # Replicate 'same' padding used by StandardizedConv1d
+        x_padded = x
+        if self.pad_same:
+            pad_total = self.kernel_size - 1
+            x_padded = torch.nn.functional.pad(x, (pad_total // 2, pad_total - pad_total // 2))
+
         # Locon output
-        lora_output = self.locon_up(self.locon_down(x)) * self.scale
-        
+        lora_output = self.locon_up(self.locon_down(x_padded)) * self.scale
+
         return original_output + lora_output
     
     def merge_weights(self) -> nn.Conv1d:

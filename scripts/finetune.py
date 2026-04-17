@@ -284,6 +284,14 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULTS["lora_targets"],
         help="Comma-separated modules for LoRA",
     )
+    model.add_argument("--locon-rank", type=int, default=4, help="LoCon rank for Conv1d layers (0 to disable)")
+    model.add_argument("--locon-alpha", type=int, default=1, help="LoCon alpha scaling for Conv1d layers")
+    model.add_argument(
+        "--locon-targets",
+        type=str,
+        default="",
+        help="Comma-separated module name substrings for LoCon (Conv1d LoRA). E.g. 'encoder.down_blocks,decoder.up_blocks'",
+    )
     model.add_argument(
         "--dtype",
         type=str,
@@ -450,6 +458,9 @@ def parse_args() -> argparse.Namespace:
         "lora_rank",
         "lora_alpha",
         "lora_targets",
+        "locon_rank",
+        "locon_alpha",
+        "locon_targets",
         "dtype",
         "head_init_scheme",
         "gradient_checkpointing",
@@ -957,12 +968,21 @@ def create_model(
                 lora_alpha=args.lora_alpha,
             )
             model = prepare_for_transfer(model, config)
-            # LoRA adapters + heads (heads already have requires_grad=True)
+
+        if args.locon_targets:
+            from alphagenome_pytorch.extensions.finetuning.adapters import apply_locon
+            locon_targets = [t.strip() for t in args.locon_targets.split(",")]
+            print_rank0(f"Applying LoCon: rank={args.locon_rank}, alpha={args.locon_alpha}", rank)
+            print_rank0(f"  Target modules: {locon_targets}", rank)
+            model = apply_locon(model, locon_targets, rank=args.locon_rank, alpha=args.locon_alpha)
+
+        if args.lora_rank > 0 or args.locon_targets:
+            # LoRA/LoCon adapters + heads
             trainable_params = get_adapter_params(model)
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
         else:
-            # LoRA rank 0 means just train heads
+            # rank=0 and no locon means just train heads
             for head in heads.values():
                 trainable_params.extend(list(head.parameters()))
             print_rank0("Mode: lora (rank=0, heads only)", rank)
@@ -1198,6 +1218,9 @@ def main() -> None:
         "lora_rank": args.lora_rank if args.mode == "lora" else None,
         "lora_alpha": args.lora_alpha if args.mode == "lora" else None,
         "lora_targets": args.lora_targets if args.mode == "lora" else None,
+        "locon_rank": args.locon_rank if args.mode == "lora" else None,
+        "locon_alpha": args.locon_alpha if args.mode == "lora" else None,
+        "locon_targets": args.locon_targets if args.mode == "lora" else None,
         "head_init_scheme": args.head_init_scheme,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
