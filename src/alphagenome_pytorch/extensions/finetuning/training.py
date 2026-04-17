@@ -227,6 +227,63 @@ def _compute_splice_loss(head, predictions, targets_dict, device):
     return torch.tensor(0.0, device=device), {}
 
 
+def _extract_splice_pearson_pairs(
+    head, predictions, targets_dict, device
+):
+    """Extract flat (N,) pred and true tensors over valid positions for Pearson R.
+
+    For SpliceSitesUsageHead: valid positions are where any target > 0; flatten over
+    positions and samples.
+    For SpliceSitesJunctionHead: valid pairs are where donor and acceptor are both >= 0;
+    flatten over (d, a, strand_sample) for pos and neg strands combined.
+
+    Returns (pred_flat, true_flat) or (None, None) if no valid entries.
+    """
+    N_CLASSES = 5
+
+    if isinstance(head, SpliceSitesUsageHead):
+        if 1 not in predictions:
+            return None, None
+        pred = torch.sigmoid(predictions[1])          # (B, S, n_samples)
+        target = targets_dict[1].to(device)[..., N_CLASSES:]  # (B, S, n_samples)
+        mask = (target > 0).any(dim=-1)                # (B, S)
+        if not mask.any():
+            return None, None
+        pred_flat = pred[mask].reshape(-1)
+        true_flat = target[mask].reshape(-1)
+        return pred_flat, true_flat
+
+    elif isinstance(head, SpliceSitesJunctionHead):
+        if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
+            return None, None
+        junc_matrix = targets_dict["junction_matrix"].to(device)
+        positions = targets_dict["junction_positions"].to(device)
+        n_s = head._num_tissues
+
+        preds, trues = [], []
+        for strand_idx, (pred_key, tgt_slice, donor_row, accept_row) in enumerate([
+            ("pos_counts", (slice(None), slice(None), slice(None), slice(None, n_s)),   0, 1),
+            ("neg_counts", (slice(None), slice(None), slice(None), slice(n_s, None)),   2, 3),
+        ]):
+            pred_counts = predictions[pred_key]           # (B, D, A, n_s)
+            tgt_counts = junc_matrix[tgt_slice]           # (B, D, A, n_s)
+            donor_pos  = positions[:, donor_row,  :].long()
+            accept_pos = positions[:, accept_row, :].long()
+            valid_d = (donor_pos >= 0).float()
+            valid_a = (accept_pos >= 0).float()
+            pairs_mask = torch.einsum('bd,ba->bda', valid_d, valid_a).bool()
+            pairs_mask4 = pairs_mask.unsqueeze(-1).expand_as(pred_counts)
+            if pairs_mask4.any():
+                preds.append(pred_counts[pairs_mask4])
+                trues.append(tgt_counts[pairs_mask4])
+
+        if not preds:
+            return None, None
+        return torch.cat(preds), torch.cat(trues)
+
+    return None, None
+
+
 @dataclass
 class ModalityConfig:
     """Configuration for a fine-tuning modality.
@@ -1693,6 +1750,10 @@ def validate_multihead(
     accumulated_pred_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
     accumulated_true_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
 
+    # For splice Pearson R - flat valid-pair predictions vs targets
+    accumulated_splice_pred: dict[str, list[Tensor]] = {m: [] for m in heads}
+    accumulated_splice_true: dict[str, list[Tensor]] = {m: [] for m in heads}
+
     if is_main_process(rank):
         pbar = tqdm(val_loader, desc="Validation")
     else:
@@ -1757,6 +1818,13 @@ def validate_multihead(
                 modality_loss, _ = _compute_splice_loss(
                     head_module, predictions_scaled, targets_dict, device
                 )
+                if compute_pearson:
+                    _splice_pred, _splice_true = _extract_splice_pearson_pairs(
+                        head_module, predictions_scaled, targets_dict, device
+                    )
+                    if _splice_pred is not None:
+                        accumulated_splice_pred[modality].append(_splice_pred.float().cpu())
+                        accumulated_splice_true[modality].append(_splice_true.float().cpu())
             else:
                 for res, weight in res_weights.items():
                     if res not in predictions_scaled or res not in targets_dict:
@@ -1846,6 +1914,20 @@ def validate_multihead(
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = count_r.mean().item()
                     else:
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = float("nan")
+
+    # Compute splice Pearson R
+    if compute_pearson:
+        for modality in heads:
+            if not accumulated_splice_pred[modality]:
+                continue
+            all_pred = torch.cat(accumulated_splice_pred[modality], dim=0)
+            all_true = torch.cat(accumulated_splice_true[modality], dim=0)
+            if world_size > 1:
+                all_pred = gather_tensors(all_pred, world_size, device)
+                all_true = gather_tensors(all_true, world_size, device)
+            if all_pred.shape[0] > 1:
+                r = pearson_r(all_pred.unsqueeze(0), all_true.unsqueeze(0), dim=1)
+                metrics[f"{modality}_pearson_r"] = r.item()
 
     return avg_loss, metrics
 
