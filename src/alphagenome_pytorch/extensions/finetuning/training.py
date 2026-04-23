@@ -26,16 +26,15 @@ from tqdm import tqdm
 
 from alphagenome_pytorch.losses import (
     multinomial_loss,
+    cross_entropy_loss,
     cross_entropy_loss_from_logits,
     binary_crossentropy_from_logits,
+    poisson_loss,
 )
 from alphagenome_pytorch.heads import (
     SpliceSitesClassificationHead,
     SpliceSitesUsageHead,
     SpliceSitesJunctionHead,
-)
-from alphagenome_pytorch.extensions.finetuning.heads import (
-    _compute_junction_strand_loss,
 )
 
 # Number of segments for multinomial loss computation.
@@ -116,7 +115,7 @@ def _call_splice_head(head, embeddings_dict, organism_idx, positions, channels_l
         # Padded positions use -1, but negative indices wrap to last position in PyTorch.
         # Clamping to 0 ensures a safe dummy index; output predictions are masked anyway.
         positions_clamped = positions.clamp(min=0)
-        out = head(emb, org, channels_last=channels_last, splice_site_positions=positions_clamped)
+        out = head(emb, org, splice_site_positions=positions_clamped, channels_last=channels_last)
         n_tissues = head._num_tissues
         return {
             "pos_counts": out["pred_counts"][..., :n_tissues],
@@ -135,15 +134,93 @@ def _call_splice_head(head, embeddings_dict, organism_idx, positions, channels_l
         return {1: logits}
 
 
-def _compute_splice_loss(head, predictions, targets_dict, device):
+def _ce_loss_with_smoothing(pred: torch.Tensor, target: torch.Tensor, label_smoothing: float, n_classes: int) -> torch.Tensor:
+    target_smooth = (1.0 - label_smoothing) * target.float() + label_smoothing / n_classes
+    mask = target.any(dim=-1, keepdim=True).expand_as(pred)
+    return cross_entropy_loss_from_logits(y_pred_logits=pred, y_true=target_smooth, mask=mask, axis=-1)
+
+
+def _partitioned_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    num_partitions: int,
+    loss_fn,
+    mask_fn,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute loss as sum of per-partition losses along the sequence dimension (dim=1).
+
+    Splits pred and target into num_partitions equal chunks along dim=1. Partitions
+    that have no valid positions (mask is all False) are skipped. The final loss is
+    the sum over non-empty partitions, upweighting the signal relative to a global mean.
+    """
+    seq_len = pred.shape[1]
+    chunk_size = seq_len // num_partitions
+    chunk_losses = []
+    for i in range(num_partitions):
+        start = i * chunk_size
+        end = start + chunk_size if i < num_partitions - 1 else seq_len
+        p_chunk = pred[:, start:end, :]
+        t_chunk = target[:, start:end, :]
+        # Skip partitions with no valid positions
+        if not mask_fn(t_chunk).any():
+            continue
+        chunk_losses.append(loss_fn(p_chunk, t_chunk))
+    if not chunk_losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(chunk_losses).sum()
+
+
+def _soft_clip_counts(counts: torch.Tensor, clip: float = 10.0) -> torch.Tensor:
+    return torch.where(counts > clip, 2.0 * torch.sqrt(counts * clip) - clip, counts)
+
+
+def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_pos, device):
+    """Strand-specific junction loss matching JAX SpliceSitesJunctionHead.loss.
+
+    loss = 0.2 * (CE(axis=donor) + CE(axis=acceptor)) + 0.04 * (Poisson(axis=donor) + Poisson(axis=acceptor))
+
+    pairs_mask[b,d,a,s] = (donor_pos[b,d] >= 0) & (accept_pos[b,a] >= 0)
+    """
+    valid_d = (donor_pos >= 0).float()
+    valid_a = (accept_pos >= 0).float()
+    pairs_mask = torch.einsum('bd,ba->bda', valid_d, valid_a).bool()
+    pairs_mask = pairs_mask.unsqueeze(-1).expand_as(pred_counts)
+
+    if not pairs_mask.any():
+        return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
+
+    target = torch.where(pairs_mask, target_counts, torch.zeros_like(target_counts))
+    pred   = torch.where(pairs_mask, pred_counts,   torch.zeros_like(pred_counts))
+
+    donor_ratios_loss    = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
+    acceptor_ratios_loss = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
+
+    sum_pred_d = pred.sum(dim=1)
+    sum_tgt_d  = _soft_clip_counts(target.sum(dim=1))
+    sum_pred_a = pred.sum(dim=2)
+    sum_tgt_a  = _soft_clip_counts(target.sum(dim=2))
+    donor_total_loss  = poisson_loss(y_true=sum_tgt_d, y_pred=sum_pred_d, mask=pairs_mask.any(dim=1))
+    accept_total_loss = poisson_loss(y_true=sum_tgt_a, y_pred=sum_pred_a, mask=pairs_mask.any(dim=2))
+
+    return 0.2 * (donor_ratios_loss + acceptor_ratios_loss) + 0.04 * (donor_total_loss + accept_total_loss)
+
+
+def _compute_splice_loss(head, predictions, targets_dict, device, num_splice_partitions: int = 1):
     """Compute loss for any of the three splice head types.
 
     Args:
         head: SpliceSitesClassificationHead, SpliceSitesUsageHead, or SpliceSitesJunctionHead.
         predictions: Dict returned by _call_splice_head.
-        targets_dict: Dict with integer keys (resolutions) and string keys
-            ('junction_positions', 'junction_matrix').
+        targets_dict: Dict with string keys: 'probs', 'usage',
+            'junction_positions', 'junction_matrix'.
         device: Torch device.
+        num_splice_partitions: Number of equal-length partitions to split the sequence
+            into before computing loss. Each partition's loss is computed independently
+            and the results are averaged. Values > 1 upweight sequence regions with
+            fewer splice sites relative to a global mean, since each partition
+            contributes equally regardless of how many valid positions it contains.
+            Defaults to 1 (standard global mean, unchanged behaviour).
 
     Returns:
         (loss_tensor, components_dict) where components_dict has keys like
@@ -154,60 +231,51 @@ def _compute_splice_loss(head, predictions, targets_dict, device):
 
     if isinstance(head, SpliceSitesClassificationHead):
         pred = predictions[1]
-        all_targets = targets_dict[1].to(device)
-        # Extract only classification targets (first 5 channels)
-        target = all_targets[..., :N_CLASSES]
-        mask = target.any(dim=-1, keepdim=True).expand_as(pred)
-        target_smooth = (1.0 - label_smoothing) * target.float() + label_smoothing / N_CLASSES
-        loss = cross_entropy_loss_from_logits(
-            y_pred_logits=pred,
-            y_true=target_smooth,
-            mask=mask,
-            axis=-1,
-        )
+        target = targets_dict["probs"].to(device)
+        if num_splice_partitions > 1:
+            loss = _partitioned_loss(
+                pred, target,
+                num_partitions=num_splice_partitions,
+                loss_fn=lambda p, t: _ce_loss_with_smoothing(p, t, label_smoothing, N_CLASSES),
+                mask_fn=lambda t: t.any(dim=-1, keepdim=True).expand_as(t),
+                device=device,
+            )
+        else:
+            target_smooth = (1.0 - label_smoothing) * target.float() + label_smoothing / N_CLASSES
+            mask = target.any(dim=-1, keepdim=True).expand_as(pred)
+            loss = cross_entropy_loss_from_logits(
+                y_pred_logits=pred,
+                y_true=target_smooth,
+                mask=mask,
+                axis=-1,
+            )
         return loss, {"cls_loss": loss.item()}
 
     elif isinstance(head, SpliceSitesUsageHead):
         pred = predictions[1]
-        all_targets = targets_dict[1].to(device)
-        # Extract only usage targets (channels after the first 5 classification channels)
-        target = all_targets[..., N_CLASSES:]
-        mask = (target > 0).any(dim=-1, keepdim=True).expand_as(pred)
-        loss = binary_crossentropy_from_logits(
-            y_pred=pred,
-            y_true=target.float(),
-            mask=mask,
-        )
+        target = targets_dict["usage"].to(device)
+        if num_splice_partitions > 1:
+            loss = _partitioned_loss(
+                pred, target,
+                num_partitions=num_splice_partitions,
+                loss_fn=lambda p, t: binary_crossentropy_from_logits(
+                    y_pred=p,
+                    y_true=t.float(),
+                    mask=(t > 0).any(dim=-1, keepdim=True).expand_as(p),
+                ),
+                mask_fn=lambda t: (t > 0).any(dim=-1, keepdim=True).expand_as(t),
+                device=device,
+            )
+        else:
+            mask = (target > 0).any(dim=-1, keepdim=True).expand_as(pred)
+            loss = binary_crossentropy_from_logits(
+                y_pred=pred,
+                y_true=target.float(),
+                mask=mask,
+            )
         return loss, {"usage_loss": loss.item()}
 
     elif isinstance(head, SpliceSitesJunctionHead):
-        import sys
-        import numpy as np
-        # DEBUG: Check what's in targets_dict on first call
-        if not hasattr(_compute_splice_loss, "_logged"):
-            print(f"\n=== DEBUG: SpliceSitesJunctionHead ===", file=sys.stderr)
-            print(f"Head parameter trainability:", file=sys.stderr)
-            for name, param in head.named_parameters():
-                print(f"  {name}: requires_grad={param.requires_grad}, shape={param.shape}, grad={param.grad is not None}", file=sys.stderr)
-
-            print(f"\ntargets_dict keys: {list(targets_dict.keys())}", file=sys.stderr)
-            for k, v in targets_dict.items():
-                if hasattr(v, 'shape'):
-                    v_np = v.cpu().detach().numpy() if hasattr(v, 'cpu') else v
-                    nz = np.count_nonzero(v_np)
-                    print(f"  {k}:", file=sys.stderr)
-                    print(f"    shape={v.shape}, dtype={v.dtype}, nonzero={nz} ({100*nz/v.numel():.2f}%)", file=sys.stderr)
-                    print(f"    min={v_np.min():.4f}, max={v_np.max():.4f}, mean={v_np.mean():.4f}, sum={v_np.sum():.4f}", file=sys.stderr)
-
-            print(f"\npredictions keys: {list(predictions.keys())}", file=sys.stderr)
-            for k, v in predictions.items():
-                if hasattr(v, 'shape'):
-                    v_np = v.cpu().detach().numpy() if hasattr(v, 'cpu') else v
-                    print(f"  {k}:", file=sys.stderr)
-                    print(f"    shape={v.shape}, dtype={v.dtype}", file=sys.stderr)
-                    print(f"    min={v_np.min():.6f}, max={v_np.max():.6f}, mean={v_np.mean():.6f}, std={v_np.std():.6f}", file=sys.stderr)
-            _compute_splice_loss._logged = True
-
         if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
             return torch.tensor(0.0, device=device), {}
         junc_matrix = targets_dict["junction_matrix"].to(device)
@@ -239,13 +307,11 @@ def _extract_splice_pearson_pairs(
 
     Returns (pred_flat, true_flat) or (None, None) if no valid entries.
     """
-    N_CLASSES = 5
-
     if isinstance(head, SpliceSitesUsageHead):
         if 1 not in predictions:
             return None, None
         pred = torch.sigmoid(predictions[1])          # (B, S, n_samples)
-        target = targets_dict[1].to(device)[..., N_CLASSES:]  # (B, S, n_samples)
+        target = targets_dict["usage"].to(device)     # (B, S, n_samples)
         mask = (target > 0).any(dim=-1)                # (B, S)
         if not mask.any():
             return None, None
@@ -950,32 +1016,18 @@ def train_epoch_ddp(
                 predictions = head(
                     embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                 )
-        elif frozen_backbone:
-            with torch.no_grad():
+        else:
+            backbone_ctx = torch.no_grad() if frozen_backbone else nullcontext()
+            with backbone_ctx:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                     outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
-            # Detach embeddings to ensure no gradients flow back to backbone
             embeddings_dict = {}
             for res in resolution_weights:
                 emb_key = f"embeddings_{res}bp"
                 if emb_key in outputs:
-                    embeddings_dict[res] = outputs[emb_key].detach()
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                predictions = head(
-                    embeddings_dict, organism_idx, return_scaled=True, channels_last=True
-                )
-        else:
-            # LoRA enabled: gradients need to flow through backbone
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
-
-                embeddings_dict = {}
-                for res in resolution_weights:
-                    emb_key = f"embeddings_{res}bp"
-                    if emb_key in outputs:
-                        embeddings_dict[res] = outputs[emb_key]
+                    emb = outputs[emb_key]
+                    embeddings_dict[res] = emb.detach() if frozen_backbone else emb
 
                 predictions = head(
                     embeddings_dict, organism_idx, return_scaled=True, channels_last=True
@@ -1357,6 +1409,7 @@ def train_epoch_multihead(
     frozen_backbone: bool = False,
     num_segments: int = NUM_SEGMENTS,
     min_segment_size: int | None = None,
+    loss_partitions: dict[str, int] | None = None,
     train_sampler: DistributedSampler | None = None,
     rank: int = 0,
     world_size: int = 1,
@@ -1369,6 +1422,7 @@ def train_epoch_multihead(
     global_step_offset: int = 0,
     skip_batches: int = 0,
     save_state: dict | None = None,
+    organism_idx: int = 0,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1393,6 +1447,7 @@ def train_epoch_multihead(
         frozen_backbone: If True, use torch.no_grad() for backbone.
         num_segments: Number of segments for multinomial loss.
         min_segment_size: Minimum positions per segment.
+        loss_partitions: Per-modality partition counts for loss, e.g. {"splice_site": 8}. See _compute_splice_loss.
         train_sampler: DistributedSampler for DDP.
         rank: Process rank for DDP.
         world_size: Total number of processes.
@@ -1455,7 +1510,7 @@ def train_epoch_multihead(
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx_tensor = torch.full((sequences.shape[0],), organism_idx, dtype=torch.long, device=device)
 
         if is_profiling:
             _cuda_sync(device)
@@ -1476,27 +1531,20 @@ def train_epoch_multihead(
             # Run only the CNN encoder; backbone is always frozen in encoder-only mode.
             with torch.no_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                    outputs = model(sequences, organism_idx, encoder_only=True)
+                    outputs = model(sequences, organism_idx_tensor, encoder_only=True)
             embeddings_dict = {128: outputs["encoder_output"].detach()}
-        elif frozen_backbone:
-            with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                    outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
-
-            embeddings_dict = {}
-            for res in resolutions:
-                emb_key = f"embeddings_{res}bp"
-                if emb_key in outputs:
-                    embeddings_dict[res] = outputs[emb_key].detach()
         else:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
+            backbone_ctx = torch.no_grad() if frozen_backbone else nullcontext()
+            with backbone_ctx:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    outputs = model(sequences, organism_idx_tensor, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
             embeddings_dict = {}
             for res in resolutions:
                 emb_key = f"embeddings_{res}bp"
                 if emb_key in outputs:
-                    embeddings_dict[res] = outputs[emb_key]
+                    emb = outputs[emb_key]
+                    embeddings_dict[res] = emb.detach() if frozen_backbone else emb
 
         if is_profiling:
             _cuda_sync(device)
@@ -1527,19 +1575,20 @@ def train_epoch_multihead(
                     if _positions is not None:
                         _positions = _positions.to(device)
                     predictions = _call_splice_head(
-                        head_module, embeddings_dict, organism_idx,
+                        head_module, embeddings_dict, organism_idx_tensor,
                         _positions, channels_last=False,
                     )
                 else:
                     predictions = head(
-                        embeddings_dict, organism_idx, return_scaled=True, channels_last=True
+                        embeddings_dict, organism_idx_tensor, return_scaled=True, channels_last=True
                     )
 
             modality_loss = torch.tensor(0.0, device=device)
 
             if isinstance(head_module, SPLICE_HEAD_TYPES):
                 modality_loss, splice_components = _compute_splice_loss(
-                    head_module, predictions, targets_dict, device
+                    head_module, predictions, targets_dict, device,
+                    num_splice_partitions=(loss_partitions or {}).get(modality, 1),
                 )
                 for k, v in splice_components.items():
                     loss_components[f"{modality}_{k}"] = v
@@ -1552,7 +1601,7 @@ def train_epoch_multihead(
                     targets = targets_dict[res].to(device)
 
                     targets = head_module.scale(
-                        targets, organism_idx, resolution=res, channels_last=True
+                        targets, organism_idx_tensor, resolution=res, channels_last=True
                     )
                     mask = torch.ones(pred.shape[0], 1, pred.shape[-1], dtype=torch.bool, device=device)
 
@@ -1702,10 +1751,12 @@ def validate_multihead(
     use_amp: bool = True,
     num_segments: int = NUM_SEGMENTS,
     min_segment_size: int | None = None,
+    loss_partitions: dict[str, int] | None = None,
     compute_pearson: bool = True,
     rank: int = 0,
     world_size: int = 1,
     encoder_only: bool = False,
+    organism_idx: int = 0,
 ) -> tuple[float, dict[str, Any]]:
     """Validate model with multiple modality heads.
 
@@ -1761,7 +1812,7 @@ def validate_multihead(
 
     for sequences, modality_targets in pbar:
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx_tensor = torch.full((sequences.shape[0],), organism_idx, dtype=torch.long, device=device)
 
         # Collect all resolutions
         all_resolutions = set()
@@ -1770,11 +1821,11 @@ def validate_multihead(
         resolutions = tuple(all_resolutions)
 
         if encoder_only:
-            outputs = model(sequences, organism_idx, encoder_only=True)
+            outputs = model(sequences, organism_idx_tensor, encoder_only=True)
             embeddings_dict = {128: outputs["encoder_output"]}
         else:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
+                outputs = model(sequences, organism_idx_tensor, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
             embeddings_dict = {}
             for res in resolutions:
@@ -1800,23 +1851,24 @@ def validate_multihead(
                     if _positions is not None:
                         _positions = _positions.to(device)
                     predictions_scaled = _call_splice_head(
-                        head_module, embeddings_dict, organism_idx,
-                        _positions, channels_last=True,
+                        head_module, embeddings_dict, organism_idx_tensor,
+                        _positions, channels_last=False,
                     )
                 else:
                     predictions_scaled = head(
-                        embeddings_dict, organism_idx, return_scaled=True, channels_last=True
+                        embeddings_dict, organism_idx_tensor, return_scaled=True, channels_last=True
                     )
                 if compute_pearson and not isinstance(head_module, SPLICE_HEAD_TYPES):
                     predictions_unscaled = head(
-                        embeddings_dict, organism_idx, return_scaled=False, channels_last=True
+                        embeddings_dict, organism_idx_tensor, return_scaled=False, channels_last=True
                     )
 
             modality_loss = torch.tensor(0.0, device=device)
 
             if isinstance(head_module, SPLICE_HEAD_TYPES):
                 modality_loss, _ = _compute_splice_loss(
-                    head_module, predictions_scaled, targets_dict, device
+                    head_module, predictions_scaled, targets_dict, device,
+                    num_splice_partitions=(loss_partitions or {}).get(modality, 1),
                 )
                 if compute_pearson:
                     _splice_pred, _splice_true = _extract_splice_pearson_pairs(
@@ -1833,7 +1885,7 @@ def validate_multihead(
                     pred_scaled = predictions_scaled[res]
                     targets = targets_dict[res].to(device)
                     targets_scaled = head_module.scale(
-                        targets, organism_idx, resolution=res, channels_last=True
+                        targets, organism_idx_tensor, resolution=res, channels_last=True
                     )
                     mask = torch.ones(
                         pred_scaled.shape[0], 1, pred_scaled.shape[-1], dtype=torch.bool, device=device
@@ -1951,6 +2003,7 @@ def train_epoch_sequence_parallel(
     frozen_backbone: bool = False,
     num_segments: int = NUM_SEGMENTS,
     min_segment_size: int | None = None,
+    loss_partitions: dict[str, int] | None = None,
     train_sampler: DistributedSampler | None = None,
     rank: int = 0,
     world_size: int = 1,
@@ -2150,7 +2203,8 @@ def train_epoch_sequence_parallel(
                         tgt = tgt[:, t_start:t_start + local_len, :]
                     splice_targets_dict[res] = tgt
                 modality_loss, splice_components = _compute_splice_loss(
-                    head_module, predictions, splice_targets_dict, device
+                    head_module, predictions, splice_targets_dict, device,
+                    num_splice_partitions=(loss_partitions or {}).get(modality, 1),
                 )
                 for k, v in splice_components.items():
                     loss_components[f"{modality}_{k}"] = v

@@ -120,6 +120,7 @@ from alphagenome_pytorch.extensions.finetuning.heads import (
 )
 from alphagenome_pytorch.extensions.finetuning.transfer import (
     load_trunk,
+    load_pretrained_head_weights,
     remove_all_heads,
     add_head,
     prepare_for_transfer,
@@ -258,6 +259,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    data.add_argument(
+        "--gtf",
+        type=str,
+        default=None,
+        dest="gtf",
+        help="GTF or parquet file for canonical splice sites (annotation-only, zero usage).",
+    )
+
     # Model arguments
     model = parser.add_argument_group("Model")
     model.add_argument("--pretrained-weights", type=str, required=False, help="Pretrained weights .pth")
@@ -275,6 +284,33 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional per-modality loss weights, e.g. 'atac:1.0,rna_seq:0.5'",
+    )
+    model.add_argument(
+        "--pretrained-head-samples",
+        type=str,
+        default=None,
+        help=(
+            "Initialize head conv weights from specific pretrained output tracks. "
+            "Format: 'modality:idx,...' where idx is either a single integer (broadcast "
+            "that pretrained track to all output tracks of the new head) or a "
+            "'|'-separated list of integers/NAs with one entry per output track "
+            "(e.g. 'rna_seq:119,splice_usage:NA|139|NA,splice_junctions:139'). "
+            "Use 'NA' to keep random initialization for a specific output track. "
+            "For genome-track modalities, append '@resolution' to restrict to a single "
+            "resolution head (e.g. 'rna_seq@128:119' loads only the 128bp head, "
+            "'rna_seq:119' loads both). "
+            "Modalities not listed keep random initialization. "
+            "The organism is taken from --organism. For splice_site the index is ignored."
+        ),
+    )
+    model.add_argument(
+        "--organism",
+        type=str,
+        default="human",
+        help=(
+            "Organism to use for training and pretrained-head initialization. "
+            "Accepted values: 'human' (index 0) or 'mouse' (index 1), or an integer."
+        ),
     )
     model.add_argument("--lora-rank", type=int, default=DEFAULTS["lora_rank"], help="LoRA rank (0 to disable)")
     model.add_argument("--lora-alpha", type=int, default=DEFAULTS["lora_alpha"], help="LoRA alpha scaling")
@@ -332,6 +368,18 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--max-grad-norm", type=float, default=DEFAULTS["max_grad_norm"])
     train.add_argument("--num-segments", type=int, default=DEFAULTS["num_segments"])
     train.add_argument("--min-segment-size", type=int, default=DEFAULTS["min_segment_size"])
+    train.add_argument(
+        "--loss-partitions",
+        type=str,
+        default=None,
+        help=(
+            "Per-modality number of sequence partitions for loss computation, e.g. "
+            "'splice_site:8,splice_usage:8'. Each partition's loss is computed "
+            "independently and averaged, upweighting gene-sparse regions. "
+            "Default (omitted) = 1 for all modalities (standard global mean). "
+            "Not applicable to splice_junctions (matrix-based loss)."
+        ),
+    )
     train.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])
     train.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision")
     train.add_argument("--track-means-samples", type=int, default=None, help="Samples for track means (default: all)")
@@ -476,6 +524,7 @@ def parse_args() -> argparse.Namespace:
         "max_grad_norm",
         "num_segments",
         "min_segment_size",
+        "loss_partitions",
         "num_workers",
         "track_means_samples",
         "profile_batches",
@@ -666,6 +715,61 @@ def parse_args() -> argparse.Namespace:
                 parser.error(f"Unknown modality in --modality-weights: {mod}")
             args.modality_weight_dict[mod] = float(weight.strip())
 
+    args.loss_partitions_dict: dict[str, int] = {}
+    if args.loss_partitions:
+        for item in args.loss_partitions.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" not in item:
+                parser.error("Each --loss-partitions item must be 'modality:N'")
+            mod, n = item.split(":", 1)
+            mod = mod.strip()
+            try:
+                args.loss_partitions_dict[mod] = int(n.strip())
+            except ValueError:
+                parser.error(f"Partition count must be an integer, got '{n.strip()}'")
+
+    # Parse --organism into an integer index
+    _ORGANISM_NAMES = {"human": 0, "mouse": 1}
+    _org_val = args.organism.strip().lower()
+    if _org_val in _ORGANISM_NAMES:
+        args.organism_idx: int = _ORGANISM_NAMES[_org_val]
+    else:
+        try:
+            args.organism_idx = int(_org_val)
+        except ValueError:
+            parser.error(
+                f"--organism must be 'human', 'mouse', or an integer index, got '{args.organism}'"
+            )
+
+    # Parse --pretrained-head-samples: comma-separated 'modality:idx' pairs.
+    # idx is either a single int (broadcast) or '|'-separated ints (per-track).
+    args.pretrained_head_sample_dict: dict[str, int | list[int]] = {}
+    if args.pretrained_head_samples:
+        for item in args.pretrained_head_samples.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" in item:
+                modality, idx_str = item.rsplit(":", 1)
+            else:
+                modality, idx_str = item, "0"
+            modality = modality.strip()
+            try:
+                if "|" in idx_str:
+                    def _parse_idx(x):
+                        x = x.strip()
+                        return None if x.upper() == "NA" else int(x)
+                    args.pretrained_head_sample_dict[modality] = [_parse_idx(x) for x in idx_str.split("|")]
+                else:
+                    args.pretrained_head_sample_dict[modality] = None if idx_str.strip().upper() == "NA" else int(idx_str)
+            except ValueError:
+                parser.error(
+                    f"--pretrained-head-samples: invalid index '{idx_str}' in '{item}', "
+                    f"expected integer, 'NA', or '|'-separated integers/NAs."
+                )
+
     args.is_multimodal = len(args.modalities) > 1
 
     return args
@@ -759,6 +863,7 @@ def create_datasets(
                         star_junction_files=junc_files,
                         sequence_length=args.sequence_length,
                         filter_to_junctions=False,
+                        gtf_file=args.gtf,
                     ),
                     SpliceJunctionDataset(
                         genome_fasta=genome,
@@ -766,6 +871,7 @@ def create_datasets(
                         star_junction_files=junc_files,
                         sequence_length=args.sequence_length,
                         filter_to_junctions=False,
+                        gtf_file=args.gtf,
                     ),
                 )
             train_datasets[modality], val_datasets[modality] = _splice_dataset_cache[junc_key]
@@ -937,6 +1043,16 @@ def create_model(
         heads[modality] = head
         head_resolutions = (128,) if is_encoder_only else resolutions
         print_rank0(f"Created {modality} head with {n_tracks} tracks at resolutions {head_resolutions}", rank)
+
+    # Optionally initialize head conv weights from pretrained organism slice
+    if args.pretrained_head_sample_dict and rank == 0:
+        print_rank0("Loading pretrained head weights:", rank)
+        loaded = load_pretrained_head_weights(
+            model, args.pretrained_weights, args.pretrained_head_sample_dict,
+            organism_idx=args.organism_idx,
+        )
+        if not loaded:
+            print_rank0("  Warning: no pretrained head weights were loaded.", rank)
 
     # Configure trainable params based on mode
     trainable_params: list[torch.nn.Parameter] = []
@@ -1208,6 +1324,9 @@ def main() -> None:
         "modalities": args.modalities,
         "modality_to_bigwigs": {k: list(v) for k, v in args.modality_to_bigwigs.items()},
         "modality_weights": args.modality_weight_dict,
+        "organism": args.organism,
+        "organism_idx": args.organism_idx,
+        "pretrained_head_samples": args.pretrained_head_sample_dict,
         "train_bed": args.train_bed,
         "val_bed": args.val_bed,
         "sequence_length": args.sequence_length,
@@ -1341,6 +1460,7 @@ def main() -> None:
                     frozen_backbone=frozen_backbone,
                     num_segments=args.num_segments,
                     min_segment_size=args.min_segment_size,
+                    loss_partitions=args.loss_partitions_dict,
                     train_sampler=train_sampler,
                     rank=rank,
                     world_size=world_size,
@@ -1378,6 +1498,7 @@ def main() -> None:
                     max_grad_norm=args.max_grad_norm,
                     num_segments=args.num_segments,
                     min_segment_size=args.min_segment_size,
+                    loss_partitions=args.loss_partitions_dict,
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
@@ -1386,6 +1507,7 @@ def main() -> None:
                     global_step_offset=global_step_offset,
                     skip_batches=epoch_skip,
                     save_state=_save_state,
+                    organism_idx=args.organism_idx,
                 )
 
             skip_batches = 0  # Only skip on first resumed epoch
@@ -1409,10 +1531,12 @@ def main() -> None:
                 use_amp=use_amp,
                 num_segments=args.num_segments,
                 min_segment_size=args.min_segment_size,
+                loss_partitions=args.loss_partitions_dict,
                 compute_pearson=True,
                 rank=rank,
                 world_size=world_size,
                 encoder_only=encoder_only,
+                organism_idx=args.organism_idx,
             )
 
             # Synchronize CUDA to ensure all validation ops complete before next epoch

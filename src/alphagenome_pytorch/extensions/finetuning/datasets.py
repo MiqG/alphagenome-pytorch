@@ -998,8 +998,10 @@ class SpliceJunctionDataset(Dataset):
        Each splice-site position receives the fraction of total junction reads
        within the window that pass through that site.
 
-    Returns ``(sequence, targets_dict)`` where ``targets_dict[1]`` has shape
-    ``(seq_len, 5 + n_junc_files)``.  Only 1 bp resolution is supported.
+    Returns ``(sequence, targets_dict)`` with string keys:
+    ``"probs"`` (seq_len, 5), ``"usage"`` (seq_len, 2*n_junc_files),
+    ``"junction_positions"`` (4, max_splice_sites),
+    ``"junction_matrix"`` (max_splice_sites, max_splice_sites, 2*n_samples).
 
     Args:
         genome_fasta: Path to reference genome FASTA or a :class:`CachedGenome`.
@@ -1023,6 +1025,7 @@ class SpliceJunctionDataset(Dataset):
         sequence_length: int = 131_072,
         min_unique_reads: int = 1,
         filter_to_junctions: bool = True,
+        gtf_file: "str | None" = None,
     ):
         super().__init__()
         _ensure_genomic_deps()
@@ -1034,6 +1037,7 @@ class SpliceJunctionDataset(Dataset):
             junctions_to_usage_arrays_by_strand,
             junctions_to_junction_matrix,
             normalize_junctions_per_sample,
+            gtf_splice_sites_to_junctions,
         )
         self._filter_intervals_with_junctions = filter_intervals_with_junctions
         self._junctions_to_classification_array = junctions_to_classification_array
@@ -1065,6 +1069,9 @@ class SpliceJunctionDataset(Dataset):
             # Normalize: CPM + clip at 99.99th percentile + scale by mean
             junc = normalize_junctions_per_sample(junc)
             self._all_juncs.append(junc)
+
+        # Optional GTF annotation junctions (classification only, count=0)
+        self._gtf_juncs = gtf_splice_sites_to_junctions(gtf_file) if gtf_file is not None else None
 
         # Union of all junctions (for interval filtering)
         if self._all_juncs:
@@ -1130,11 +1137,12 @@ class SpliceJunctionDataset(Dataset):
         Returns:
             Tuple of (sequence, targets_dict):
                 - sequence: One-hot encoded DNA (seq_len, 4)
-                - targets_dict: dict with the following keys:
-                    - 1: tensor of shape (seq_len, 5 + n_junc_files) —
-                      first 5 channels: 5-class one-hot classification
-                      (Donor+, Acceptor+, Donor-, Acceptor-, None);
-                      remaining channels: per-sample fractional usage in [0, 1].
+                - targets_dict: dict with string keys:
+                    - "probs": float32 tensor of shape (seq_len, 5) —
+                      5-class one-hot classification
+                      (Donor+, Acceptor+, Donor-, Acceptor-, None).
+                    - "usage": float32 tensor of shape (seq_len, 2*n_samples) —
+                      per-sample fractional usage in [0, 1].
                     - "junction_positions": int32 tensor of shape (4, max_splice_sites)
                       — relative 0-based positions for [pos_donors, pos_acceptors,
                       neg_donors, neg_acceptors], padded with -1.
@@ -1149,10 +1157,9 @@ class SpliceJunctionDataset(Dataset):
 
         sequence = torch.from_numpy(self._get_sequence(chrom, start, end)).float()
 
-        # Classification targets: (seq_len, 5) — union across all samples
-        cls_arr = self._junctions_to_classification_array(
-            self._all_juncs, chrom, start, seq_len
-        )
+        # Classification targets: (seq_len, 5) — union across all samples + optional GTF sites
+        cls_juncs = self._all_juncs + ([self._gtf_juncs] if self._gtf_juncs is not None else [])
+        cls_arr = self._junctions_to_classification_array(cls_juncs, chrom, start, seq_len)
 
         # Usage targets: (seq_len, 2*n_junc_files) — two channels per sample (pos/neg strand)
         usage_tracks = []
@@ -1162,24 +1169,28 @@ class SpliceJunctionDataset(Dataset):
             usage_tracks.append(neg_arr)
         usage_arr = np.stack(usage_tracks, axis=-1)  # (seq_len, 2*n_samples)
 
-        targets_1bp = np.concatenate([cls_arr, usage_arr], axis=-1)  # (seq_len, 5+n_samples)
-
         # Junction matrix targets
         junc_positions, junc_matrix = self._junctions_to_junction_matrix(
             self._all_juncs, cls_arr, chrom, start, seq_len
         )
 
         targets_dict = {
-            1: torch.from_numpy(targets_1bp).float(),
+            "probs": torch.from_numpy(cls_arr).float(),
+            "usage": torch.from_numpy(usage_arr).float(),
             "junction_positions": torch.from_numpy(junc_positions),
             "junction_matrix": torch.from_numpy(junc_matrix),
         }
         return sequence, targets_dict
 
     @property
-    def n_tracks(self) -> int:
-        """Total number of output channels (5 classification + 2*n_samples for strand-specific usage)."""
-        return self.N_CLASSIFICATION_CLASSES + 2 * len(self.star_junction_files)
+    def n_classification_tracks(self) -> int:
+        """Number of classification channels (always 5)."""
+        return self.N_CLASSIFICATION_CLASSES
+
+    @property
+    def n_usage_tracks(self) -> int:
+        """Number of usage channels (2 per junction file: positive and negative strand)."""
+        return 2 * len(self.star_junction_files)
 
 
 # Backward-compatible aliases

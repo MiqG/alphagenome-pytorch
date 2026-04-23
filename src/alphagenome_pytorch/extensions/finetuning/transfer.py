@@ -468,9 +468,202 @@ def count_trainable_params(model: nn.Module) -> dict[str, int]:
     }
 
 
+def load_pretrained_head_weights(
+    model: nn.Module,
+    weights_path: str,
+    head_track_indices: dict[str, int | list[int | None]],
+    organism_idx: int = 0,
+) -> list[str]:
+    """Initialize finetuning head conv weights from specific pretrained output tracks.
+
+    For each modality, loads the pretrained head's conv weight and bias by:
+      1. Slicing the organism dimension: pretrained[organism_idx:organism_idx+1, ...]
+      2a. Single index k: broadcast pretrained track k to ALL output tracks of the
+          new head (repeat the same row n_head_tracks times).
+      2b. List of indices [k0, k1, ...]: gather those specific rows from the pretrained
+          track dimension — list length must equal the new head's n_head_tracks.
+
+    Transferable:
+        splice_site      — full head (5-class output is fixed; indices are ignored)
+        splice_junctions — conv only (rope_params have tissue-count mismatch)
+        splice_usage     — conv, broadcast or per-track gather
+        rna_seq / atac / dnase / procap / cage — conv at each resolution
+
+    rope_params in splice_junctions are left at default init (scale=1, offset=0)
+    because they are tissue-specific and cannot be meaningfully transferred.
+
+    Args:
+        model: AlphaGenome model with finetuning heads already attached.
+        weights_path: Path to the pretrained .safetensors or .pt checkpoint.
+        head_track_indices: Mapping of modality name to either:
+            - int: a single pretrained track index, broadcast to all output tracks.
+            - list[int]: one pretrained track index per output track of the new head.
+        organism_idx: Organism index in the pretrained weights (0=human, 1=mouse).
+
+    Returns:
+        List of parameter names that were successfully loaded.
+    """
+    from pathlib import Path as _Path
+
+    if _Path(weights_path).suffix == ".safetensors":
+        from safetensors.torch import load_file
+        sd = load_file(weights_path, device="cpu")
+    else:
+        sd = torch.load(weights_path, map_location="cpu", weights_only=True)
+
+    _SPLICE_PREFIX = {
+        "splice_site": "splice_sites_classification_head",
+        "splice_junctions": "splice_sites_junction_head",
+        "splice_usage": "splice_sites_usage_head",
+    }
+    _GENOME_TRACKS = {"rna_seq", "atac", "dnase", "procap", "cage", "chip_tf", "chip_histone"}
+
+    loaded: list[str] = []
+
+    def _try_copy(param, pt_tensor, indices: int | list[int | None], label: str) -> bool:
+        """Copy selected pretrained tracks into param. Returns True on success.
+
+        pt_tensor: (1, N_pretrained, ...) — organism already sliced.
+        indices:
+          int              → broadcast that single track to ALL output tracks.
+          list[int | None] → one entry per output track; None (from 'NA') keeps
+                             that output track at its random initialization.
+        """
+        if pt_tensor.shape[0] != 1:
+            print(f"  [pretrained-head] Unexpected organism dim for {label}, skipping.")
+            return False
+
+        n_pt = pt_tensor.shape[1] if pt_tensor.ndim >= 2 else None
+
+        with torch.no_grad():
+            if isinstance(indices, int):
+                if n_pt is not None and indices >= n_pt:
+                    print(
+                        f"  [pretrained-head] Track index {indices} out of range "
+                        f"(pretrained has {n_pt} tracks) for {label}, skipping."
+                    )
+                    return False
+                if pt_tensor.ndim >= 2:
+                    row = pt_tensor[:, indices : indices + 1]
+                    param.copy_(row.expand_as(param).to(param.device))
+                else:
+                    param.copy_(pt_tensor.to(param.device))
+            else:
+                n_head = param.shape[1] if param.ndim >= 2 else None
+                if n_head is not None and len(indices) != n_head:
+                    print(
+                        f"  [pretrained-head] {len(indices)} indices given but head has "
+                        f"{n_head} tracks for {label}, skipping."
+                    )
+                    return False
+                bad = [i for i in indices if i is not None and n_pt is not None and i >= n_pt]
+                if bad:
+                    print(
+                        f"  [pretrained-head] Indices {bad} out of range "
+                        f"(pretrained has {n_pt} tracks) for {label}, skipping."
+                    )
+                    return False
+                for out_i, src_i in enumerate(indices):
+                    if src_i is not None:
+                        param[:, out_i] = pt_tensor[0, src_i].to(param.device)
+                    # src_i is None (NA) → leave param[:, out_i] at random init
+
+        return True
+
+    _SPLICE_ATTR_MAP = {
+        "splice_site": "splice_sites_classification_head",
+        "splice_usage": "splice_sites_usage_head",
+        "splice_junctions": "splice_sites_junction_head",
+    }
+
+    for modality, indices in head_track_indices.items():
+        if indices is None:
+            print(f"  [pretrained-head] {modality}: NA — keeping random initialization.")
+            continue
+        # Splice heads are stored as direct model attributes, not in model.heads
+        if modality in _SPLICE_ATTR_MAP:
+            head = getattr(model, _SPLICE_ATTR_MAP[modality], None)
+        else:
+            heads_dict = getattr(model, "heads", None)
+            head = heads_dict[modality] if (heads_dict is not None and modality in heads_dict) else None
+        if head is None:
+            raise ValueError(
+                f"--pretrained-head-samples: no head found for modality '{modality}'. "
+                f"Remove it from --pretrained-head-samples or ensure the head is created."
+            )
+
+        params = dict(head.named_parameters())
+
+        def _fmt(idx):
+            return f"[{idx}]" if isinstance(idx, int) else f"{idx}"
+
+        if modality in _SPLICE_PREFIX:
+            pt_prefix = _SPLICE_PREFIX[modality]
+            for param_suffix in ("conv.weight", "conv.bias"):
+                pt_key = f"{pt_prefix}.{param_suffix}"
+                if pt_key not in sd:
+                    raise ValueError(
+                        f"--pretrained-head-samples: modality '{modality}' not found in pretrained weights "
+                        f"(expected key '{pt_key}'). Remove it from --pretrained-head-samples."
+                    )
+                if param_suffix not in params:
+                    continue
+                pt_slice = sd[pt_key][organism_idx : organism_idx + 1]
+                label = f"{modality}.{param_suffix}"
+                if modality == "splice_site":
+                    # Fixed 5-class output: copy full pretrained weight matrix directly
+                    if pt_slice.shape != params[param_suffix].shape:
+                        print(
+                            f"  [pretrained-head] Shape mismatch for {label}: "
+                            f"head={tuple(params[param_suffix].shape)}, pretrained={tuple(pt_slice.shape)}, skipping."
+                        )
+                        continue
+                    with torch.no_grad():
+                        params[param_suffix].copy_(pt_slice.to(params[param_suffix].device))
+                    loaded.append(label)
+                    print(f"  [pretrained-head] Loaded {pt_key}[org={organism_idx}] (full 5-class) → {label}")
+                else:
+                    if _try_copy(params[param_suffix], pt_slice, indices, label):
+                        loaded.append(label)
+                        print(f"  [pretrained-head] Loaded {pt_key}[org={organism_idx}] track={_fmt(indices)} → {label}")
+
+        elif modality in _GENOME_TRACKS or any(modality.startswith(f"{m}@") for m in _GENOME_TRACKS):
+            # Support 'modality@resolution' to restrict to a single resolution head
+            if "@" in modality:
+                base_modality, res_filter = modality.split("@", 1)
+                res_strs = (res_filter,)
+            else:
+                base_modality, res_strs = modality, ("1", "128")
+            pt_prefix = f"heads.{base_modality}"
+            for res_str in res_strs:
+                for param_suffix in (f"convs.{res_str}.weight", f"convs.{res_str}.bias"):
+                    pt_key = f"{pt_prefix}.{param_suffix}"
+                    if pt_key not in sd:
+                        raise ValueError(
+                            f"--pretrained-head-samples: modality '{modality}' not found in pretrained weights "
+                            f"(expected key '{pt_key}'). Remove it from --pretrained-head-samples."
+                        )
+                    if param_suffix not in params:
+                        continue
+                    pt_slice = sd[pt_key][organism_idx : organism_idx + 1]
+                    label = f"{modality}.{param_suffix}"
+                    if _try_copy(params[param_suffix], pt_slice, indices, label):
+                        loaded.append(label)
+                        print(f"  [pretrained-head] Loaded {pt_key}[org={organism_idx}] track={_fmt(indices)} → {label}")
+
+        else:
+            raise ValueError(
+                f"--pretrained-head-samples: modality '{modality}' is not a recognized modality type. "
+                f"Remove it from --pretrained-head-samples."
+            )
+
+    return loaded
+
+
 __all__ = [
     'TransferConfig',
     'load_trunk',
+    'load_pretrained_head_weights',
     'add_head',
     'remove_all_heads',
     'prepare_for_transfer',

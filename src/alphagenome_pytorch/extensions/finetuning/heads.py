@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from torch import Tensor
 from typing import Literal
 
 from alphagenome_pytorch.heads import (
@@ -17,44 +16,6 @@ from alphagenome_pytorch.heads import (
     SpliceSitesUsageHead,
     SpliceSitesJunctionHead,
 )
-from alphagenome_pytorch.losses import cross_entropy_loss, poisson_loss
-
-
-def _soft_clip_counts(counts: Tensor, clip: float = 10.0) -> Tensor:
-    return torch.where(counts > clip, 2.0 * torch.sqrt(counts * clip) - clip, counts)
-
-
-def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_pos, device):
-    """Strand-specific junction loss matching JAX SpliceSitesJunctionHead.loss.
-
-    loss = 0.2 * (CE(axis=donor) + CE(axis=acceptor)) + 0.04 * (Poisson(axis=donor) + Poisson(axis=acceptor))
-
-    pairs_mask[b,d,a,s] = (donor_pos[b,d] >= 0) & (accept_pos[b,a] >= 0)
-    """
-    valid_d = (donor_pos >= 0).float()
-    valid_a = (accept_pos >= 0).float()
-    pairs_mask = torch.einsum('bd,ba->bda', valid_d, valid_a).bool()
-    pairs_mask = pairs_mask.unsqueeze(-1).expand_as(pred_counts)
-
-    if not pairs_mask.any():
-        return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
-
-    target = torch.where(pairs_mask, target_counts, torch.zeros_like(target_counts))
-    pred   = torch.where(pairs_mask, pred_counts,   torch.zeros_like(pred_counts))
-
-    donor_ratios_loss    = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
-    acceptor_ratios_loss = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
-
-    sum_pred_d = pred.sum(dim=1)
-    sum_tgt_d  = _soft_clip_counts(target.sum(dim=1))
-    sum_pred_a = pred.sum(dim=2)
-    sum_tgt_a  = _soft_clip_counts(target.sum(dim=2))
-    donor_total_loss  = poisson_loss(y_true=sum_tgt_d, y_pred=sum_pred_d, mask=pairs_mask.any(dim=1))
-    accept_total_loss = poisson_loss(y_true=sum_tgt_a, y_pred=sum_pred_a, mask=pairs_mask.any(dim=2))
-
-    return 0.2 * (donor_ratios_loss + acceptor_ratios_loss) + 0.04 * (donor_total_loss + accept_total_loss)
-
-
 # All supported assay types and their squashing behavior
 # Only RNA-seq uses squashing (power law expansion)
 ASSAY_TYPES = {
@@ -171,5 +132,4 @@ __all__ = [
     'ASSAY_TYPES',
     'ENCODER_EMBEDDING_DIM',
     'create_finetuning_head',
-    '_compute_junction_strand_loss',
 ]

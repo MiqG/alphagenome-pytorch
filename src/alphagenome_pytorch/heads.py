@@ -568,90 +568,80 @@ class SpliceSitesJunctionHead(nn.Module):
             "neg_acceptor": make_rope_params(),
         })
 
-    def forward(self, embeddings_1bp, organism_index, channels_last=True, **kwargs):
-        """
+    def _predict(self, embeddings_1bp, splice_site_positions, organism_index):
+        """Core junction prediction. embeddings_1bp: (B, C, S) NCL format.
+
         Args:
-            embeddings_1bp: (B, C, S) - NCL format
+            embeddings_1bp: (B, C, S)
+            splice_site_positions: (B, 4, P) — [pos_donors, pos_acceptors, neg_donors, neg_acceptors]
             organism_index: (B,)
-            splice_site_positions: (B, 4, P) - required kwarg
 
         Returns:
-            Dict with pred_counts (B, P, P, 2*T), positions, mask
+            pred_counts: (B, D, A, 2*T)
+            splice_junction_mask: (B, D, A, 2*T) bool
         """
-        splice_site_positions = kwargs.get("splice_site_positions", None)
+        assert splice_site_positions.shape[1] == 4
+        pos_donor_idx    = splice_site_positions[:, 0, :]
+        pos_acceptor_idx = splice_site_positions[:, 1, :]
+        neg_donor_idx    = splice_site_positions[:, 2, :]
+        neg_acceptor_idx = splice_site_positions[:, 3, :]
+
+        # Project: (B, C, S) → (B, H, S)
+        splice_site_logits = self.conv(embeddings_1bp, organism_index)
+
+        def _index_embeddings(embedding, indices):
+            """embedding: (B, H, S), indices: (B, P) → (B, P, H)"""
+            B = embedding.shape[0]
+            batch_idx = torch.arange(B, device=embedding.device).unsqueeze(1)
+            return embedding[batch_idx, :, indices]
+
+        def _apply_rope(embedding, indices, params):
+            x = _index_embeddings(embedding, indices)   # (B, P, H)
+            batch_params = params[organism_index]       # (B, 2, T, H)
+            scale  = batch_params[:, [0], :, :]
+            offset = batch_params[:, [1], :, :]
+            x = scale * x[:, :, None, :] + offset      # (B, P, T, H)
+            return apply_rope(x, indices, max_position=self._max_position_encoding_distance, inplace=True)
+
+        pos_donor_logits    = _apply_rope(splice_site_logits, pos_donor_idx,    self.rope_params["pos_donor"])
+        pos_acceptor_logits = _apply_rope(splice_site_logits, pos_acceptor_idx, self.rope_params["pos_acceptor"])
+        neg_donor_logits    = _apply_rope(splice_site_logits, neg_donor_idx,    self.rope_params["neg_donor"])
+        neg_acceptor_logits = _apply_rope(splice_site_logits, neg_acceptor_idx, self.rope_params["neg_acceptor"])
+
+        pos_counts = F.softplus(torch.einsum("bdth,bath->bdat", pos_donor_logits, pos_acceptor_logits))
+        neg_counts = F.softplus(torch.einsum("bdth,bath->bdat", neg_donor_logits, neg_acceptor_logits))
+
+        pos_mask = torch.einsum("bd,ba->bda", pos_donor_idx >= 0, pos_acceptor_idx >= 0)
+        neg_mask = torch.einsum("bd,ba->bda", neg_donor_idx >= 0, neg_acceptor_idx >= 0)
+
+        tissue_mask = self.tissue_mask[organism_index]
+        pos_mask = pos_mask[:, :, :, None] * tissue_mask[:, None, None, :]
+        neg_mask = neg_mask[:, :, :, None] * tissue_mask[:, None, None, :]
+
+        splice_junction_mask = torch.cat([pos_mask, neg_mask], dim=-1)
+        pred_counts = torch.cat([pos_counts, neg_counts], dim=-1)
+        pred_counts = torch.where(splice_junction_mask, pred_counts, 0.0)
+
+        return pred_counts, splice_junction_mask
+
+    def forward(self, embeddings_1bp, organism_index, splice_site_positions=None, channels_last=True):
+        """
+        Args:
+            embeddings_1bp: (B, S, C) if channels_last=True (NLC), or (B, C, S) if channels_last=False (NCL)
+            organism_index: (B,)
+            splice_site_positions: (B, 4, P) — required
+            channels_last: whether embeddings_1bp is in NLC format (default True)
+
+        Returns:
+            Dict with pred_counts (B, D, A, 2*T), splice_site_positions, splice_junction_mask.
+        """
         if splice_site_positions is None:
             raise ValueError("splice_site_positions is required")
 
-        def _predict(embeddings_1bp, splice_site_positions, organism_index):
-            # embeddings_1bp: (B, C, S), splice_site_positions: (B, 4, P)
-            assert splice_site_positions.shape[1] == 4
-            pos_donor_idx = splice_site_positions[:, 0, :]
-            pos_acceptor_idx = splice_site_positions[:, 1, :]
-            neg_donor_idx = splice_site_positions[:, 2, :]
-            neg_acceptor_idx = splice_site_positions[:, 3, :]
+        if channels_last:
+            embeddings_1bp = embeddings_1bp.transpose(1, 2)  # (B, S, C) → (B, C, S)
 
-            # Project: (B, C, S) → (B, H, S)
-            splice_site_logits = self.conv(embeddings_1bp, organism_index)
-
-            def _index_embeddings(embedding, indices):
-                """Select embeddings at positions. embedding: (B, H, S), indices: (B, P)"""
-                B, H, S = embedding.shape
-                batch_idx = torch.arange(B, device=embedding.device).unsqueeze(1)
-                # Index along S dimension: embedding[b, :, indices[b, p]] → (B, P, H)
-                # PyTorch advanced indexing: broadcast indices give leading dims, : gives trailing
-                return embedding[batch_idx, :, indices]  # (B, P, H)
-
-            def _apply_rope(embedding, indices, params, organism_index):
-                x = _index_embeddings(embedding, indices)  # (B, P, H)
-                batch_params = params[organism_index]  # (B, 2, T, H)
-                scale = batch_params[:, [0], :, :]
-                offset = batch_params[:, [1], :, :]
-                x = scale * x[:, :, None, :] + offset  # (B, P, T, H)
-                return apply_rope(
-                    x, indices,
-                    max_position=self._max_position_encoding_distance,
-                    inplace=True,
-                )
-
-            pos_donor_logits = _apply_rope(
-                splice_site_logits, pos_donor_idx,
-                self.rope_params["pos_donor"], organism_index
-            )
-            pos_acceptor_logits = _apply_rope(
-                splice_site_logits, pos_acceptor_idx,
-                self.rope_params["pos_acceptor"], organism_index
-            )
-            neg_donor_logits = _apply_rope(
-                splice_site_logits, neg_donor_idx,
-                self.rope_params["neg_donor"], organism_index
-            )
-            neg_acceptor_logits = _apply_rope(
-                splice_site_logits, neg_acceptor_idx,
-                self.rope_params["neg_acceptor"], organism_index
-            )
-
-            pos_counts = F.softplus(torch.einsum(
-                "bdth,bath->bdat", pos_donor_logits, pos_acceptor_logits
-            ))
-            neg_counts = F.softplus(torch.einsum(
-                "bdth,bath->bdat", neg_donor_logits, neg_acceptor_logits
-            ))
-
-            pos_mask = torch.einsum("bd,ba->bda", pos_donor_idx >= 0, pos_acceptor_idx >= 0)
-            neg_mask = torch.einsum("bd,ba->bda", neg_donor_idx >= 0, neg_acceptor_idx >= 0)
-
-            tissue_mask = self.tissue_mask[organism_index]
-
-            pos_mask = pos_mask[:, :, :, None] * tissue_mask[:, None, None, :]
-            neg_mask = neg_mask[:, :, :, None] * tissue_mask[:, None, None, :]
-
-            splice_junction_mask = torch.cat([pos_mask, neg_mask], dim=-1)
-            pred_counts = torch.cat([pos_counts, neg_counts], dim=-1)
-            pred_counts = torch.where(splice_junction_mask, pred_counts, 0.0)
-
-            return pred_counts, splice_junction_mask
-
-        pred_counts, splice_junction_mask = _predict(
+        pred_counts, splice_junction_mask = self._predict(
             embeddings_1bp, splice_site_positions, organism_index
         )
         return {

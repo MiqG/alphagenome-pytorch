@@ -68,6 +68,64 @@ def read_star_junctions(path: str) -> pd.DataFrame:
     return df
 
 
+def gtf_splice_sites_to_junctions(gtf_file: str) -> pd.DataFrame:
+    """Extract canonical splice junctions from a GENCODE GTF or parquet file.
+
+    Junctions are derived from consecutive exon pairs within each transcript.
+    Coordinate convention matches STAR output used by this module:
+        exon_start (1-based) = last base of upstream exon
+        exon_end   (1-based) = first base of downstream exon
+
+    Returned rows have count=0 (annotation-only, no RNA-seq evidence).
+
+    Args:
+        gtf_file: Path to a GTF (.gtf / .gtf.gz) or parquet file.
+
+    Returns:
+        DataFrame with columns: chrom, exon_start, exon_end, strand, count.
+    """
+    if gtf_file.endswith(".parquet"):
+        df = pd.read_parquet(gtf_file)
+        # Normalise column names from pyranges-style parquet
+        df = df.rename(columns={"Chromosome": "chrom", "Start": "start", "End": "end",
+                                 "Strand": "strand", "Feature": "feature",
+                                 "transcript_id": "transcript_id"})
+        exons = df.loc[
+            df["feature"].str.lower() == "exon",
+            ["chrom", "start", "end", "strand", "transcript_id"],
+        ].copy()
+    else:
+        import pyranges as pr  # type: ignore
+        gr = pr.read_gtf(gtf_file)
+        exons = gr.df.rename(columns={"Chromosome": "chrom", "Start": "start",
+                                       "End": "end", "Strand": "strand",
+                                       "Feature": "feature",
+                                       "transcript_id": "transcript_id"})
+        exons = exons.loc[
+            exons["feature"].str.lower() == "exon",
+            ["chrom", "start", "end", "strand", "transcript_id"],
+        ].copy()
+
+    exons = exons.loc[exons["strand"].isin(["+", "-"])].copy()
+    exons["start"] = exons["start"].astype(int)
+    exons["end"] = exons["end"].astype(int)
+
+    # Vectorized junction extraction: sort by transcript+start, then pair consecutive
+    # exons within the same transcript using shift(-1).
+    exons = exons.sort_values(["transcript_id", "start"]).reset_index(drop=True)
+    nxt = exons.shift(-1)
+    same_tx = exons["transcript_id"].to_numpy() == nxt["transcript_id"].to_numpy()
+
+    pairs = exons[same_tx][["chrom", "end", "strand"]].copy()
+    pairs["exon_start"] = pairs["end"].astype(int)
+    pairs["exon_end"] = nxt.loc[same_tx, "start"].astype(int) + 1
+    pairs = pairs.drop(columns="end")
+
+    result = pairs.drop_duplicates(subset=["chrom", "exon_start", "exon_end", "strand"])
+    result["count"] = 0
+    return result.reset_index(drop=True)
+
+
 def junctions_to_splice_sites(junctions: pd.DataFrame) -> pd.DataFrame:
     """Extract unique splice site positions from a junctions DataFrame.
 
