@@ -135,7 +135,6 @@ DEFAULTS = {
     "sequence_length": 131072,
     "resolutions": "1",
     # Model
-    "modality": "atac",
     "lora_rank": 8,
     "lora_alpha": 16,
     "lora_targets": "q_proj,v_proj",
@@ -186,7 +185,7 @@ def unwrap_training_model(model: nn.Module) -> nn.Module:
 # =============================================================================
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Unified AlphaGenome training script",
@@ -382,7 +381,8 @@ def parse_args() -> argparse.Namespace:
              "Useful for loading full checkpoints in predict scripts.",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    tokens = argv if argv is not None else sys.argv[1:]
     if args.no_full_checkpoint and not args.save_delta:
         parser.error(
             "--no-full-checkpoint requires --save-delta (otherwise the run "
@@ -396,7 +396,7 @@ def parse_args() -> argparse.Namespace:
         )
     cli_flags = {
         token.split("=", 1)[0]
-        for token in sys.argv[1:]
+        for token in tokens
         if token.startswith("--")
     }
 
@@ -550,7 +550,10 @@ def parse_args() -> argparse.Namespace:
     cli_modality_to_bigwigs: dict[str, list[str]] = {}
     if args.bigwigs is not None:
         if args.modalities is None:
-            args.modalities = [DEFAULTS["modality"]]
+            parser.error(
+                "--modality is required when --bigwig is provided. "
+                f"Pass one of: {sorted(MODALITY_CONFIGS.keys())}."
+            )
         if len(args.modalities) != len(args.bigwigs):
             parser.error(
                 f"Number of --modality ({len(args.modalities)}) must match number of --bigwig groups ({len(args.bigwigs)}). "
@@ -941,9 +944,10 @@ def create_model(
 # =============================================================================
 
 
-def main() -> None:
+def main(args: argparse.Namespace | None = None) -> None:
     """Main training function."""
-    args = parse_args()
+    if args is None:
+        args = parse_args()
 
     # Setup distributed
     rank, world_size, local_rank, device = setup_distributed()
