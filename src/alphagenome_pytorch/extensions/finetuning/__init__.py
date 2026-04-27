@@ -35,12 +35,13 @@ if TYPE_CHECKING:
     from alphagenome_pytorch.extensions.finetuning.datasets import (
         ATACDataset,
         CachedGenome,
+        DistillationDataset,
         GenomicDataset,
         MultimodalDataset,
         RNASeqDataset,
         collate_multimodal,
         compute_track_means,
-        SpliceJunctionDataset,
+        SplicingDataset,
     )
 
 
@@ -48,7 +49,7 @@ def __getattr__(name):
     """Lazy import for datasets to avoid pyfaidx/pyBigWig dependency at import time."""
     if name in ("ATACDataset", "RNASeqDataset", "GenomicDataset", "CachedGenome",
                 "compute_track_means", "MultimodalDataset", "collate_multimodal",
-                "SpliceJunctionDataset"):
+                "SplicingDataset", "DistillationDataset"):
         from alphagenome_pytorch.extensions.finetuning import datasets
         return getattr(datasets, name)
     if name in (
@@ -76,7 +77,8 @@ __all__ = [
     "RNASeqDataset",
     "GenomicDataset",
     "MultimodalDataset",
-    "SpliceJunctionDataset",
+    "SplicingDataset",
+    "DistillationDataset",
     "collate_multimodal",
     "CachedGenome",
     "compute_track_means",

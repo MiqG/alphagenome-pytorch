@@ -257,10 +257,43 @@ def cross_entropy_loss(
     
     y_true = torch.where(mask, y_true.float(), torch.zeros_like(y_true.float()))
     p_true = y_true / torch.clamp(y_true.sum(dim=axis, keepdim=True), min=eps)
-    
+
+    y_pred = y_pred.float()
     masked_pred = torch.where(mask, y_pred, torch.zeros_like(y_pred))
     log_normalizer = torch.log((masked_pred + eps).sum(dim=axis))
     log_likelihood = (p_true * torch.log(y_pred + eps)).sum(dim=axis)
     
     log_loss = log_normalizer - log_likelihood
     return _safe_masked_mean(log_loss, mask.any(dim=axis))
+
+def cross_entropy_loss_pseudocode(                                           
+      *,                                                                       
+      y_true: Tensor,                                                          
+      y_pred: Tensor,                                                          
+      mask: Tensor,                                                            
+      axis: int,
+      eps: float = 1e-7,                                                       
+  ) -> Tensor:                                
+      """Multinomial cross-entropy loss on counts (paper pseudocode 
+  formulation).                               
+                                                                               
+      Args:
+          y_true: Target counts.                                               
+          y_pred: Predicted counts.
+          mask: Boolean mask.                                                  
+          axis: Axis for normalization.
+          eps: Small epsilon for numerical stability.
+
+      Returns:
+          Scalar loss.
+      """                                     
+      mask = mask.expand_as(y_true)       
+      assert y_true.shape == y_pred.shape == mask.shape
+                                                                               
+      y_pred_m = torch.where(mask, y_pred.float(), torch.zeros_like(y_pred.float()))
+      y_true_m = torch.where(mask, y_true.float(), torch.zeros_like(y_true.float()))           
+                                          
+      pred_ratios = (y_pred_m + eps) / (y_pred_m + eps).sum(dim=axis, keepdim=True)
+      n_valid = mask.float().sum().clamp(min=1.0)
+      return -(y_true_m * torch.log(pred_ratios)).sum() / n_valid
+

@@ -86,9 +86,10 @@ from alphagenome_pytorch.sequence_parallel import SequenceParallelism
 from alphagenome_pytorch.extensions.finetuning import (
     # Data
     CachedGenome,
+    DistillationDataset,
     GenomicDataset,
     MultimodalDataset,
-    SpliceJunctionDataset,
+    SplicingDataset,
     compute_track_means,
     collate_genomic,
     collate_multimodal,
@@ -260,11 +261,36 @@ def parse_args() -> argparse.Namespace:
     )
 
     data.add_argument(
+        "--ssu",
+        type=str,
+        nargs="+",
+        action="append",
+        dest="ssu",
+        help=(
+            "SSU parquet file(s) for splice site usage targets. "
+            "Repeat --ssu for each --modality splice group. "
+            "Must match the order of --star-junctions groups."
+        ),
+    )
+
+    data.add_argument(
         "--gtf",
         type=str,
         default=None,
         dest="gtf",
         help="GTF or parquet file for canonical splice sites (annotation-only, zero usage).",
+    )
+    data.add_argument(
+        "--distillation-targets",
+        type=str,
+        default=None,
+        dest="distillation_targets",
+        help=(
+            "Path to distillation_manifest.parquet produced by generate_oracle_targets.py. "
+            "When set, replaces BigWig/STAR datasets with DistillationDataset (raw pretrained "
+            "model outputs as targets). --bigwig and --star-junctions are still used to infer "
+            "modalities and track names but are not read for training targets."
+        ),
     )
 
     # Model arguments
@@ -380,6 +406,28 @@ def parse_args() -> argparse.Namespace:
             "Not applicable to splice_junctions (matrix-based loss)."
         ),
     )
+    train.add_argument(
+        "--junction-position-source",
+        type=str,
+        choices=["annotated", "predicted"],
+        default="annotated",
+        help=(
+            "Source of splice-site positions passed to the junction head. "
+            "'annotated' (default): use positions derived from STAR junction files. "
+            "'predicted': derive positions from the top-k sites scored by the "
+            "splice_site classification head (requires splice_site modality). "
+            "See --junction-top-k to control the number of sites selected."
+        ),
+    )
+    train.add_argument(
+        "--junction-top-k",
+        type=int,
+        default=512,
+        help=(
+            "Number of top-scoring splice sites per role (Donor+/-, Acceptor+/-) "
+            "to select when --junction-position-source=predicted. Default: 512."
+        ),
+    )
     train.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])
     train.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision")
     train.add_argument("--track-means-samples", type=int, default=None, help="Samples for track means (default: all)")
@@ -415,6 +463,21 @@ def parse_args() -> argparse.Namespace:
     out.add_argument("--save-every", type=int, default=DEFAULTS["save_every"])
     out.add_argument("--save-every-steps", type=int, default=None, help="Save preemption checkpoint every N optimizer steps (None = disabled)")
     out.add_argument("--no-save-checkpoints", action="store_true", help="Skip saving model checkpoints (keeps logs/config)")
+
+    # Early stopping arguments
+    es = parser.add_argument_group("Early Stopping")
+    es.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=None,
+        help="Stop training if val_loss does not improve for this many epochs (None = disabled)",
+    )
+    es.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum improvement in val_loss to reset the patience counter (default: 0.0)",
+    )
 
     # Resume arguments
     resume = parser.add_argument_group("Resume / Checkpointing")
@@ -540,6 +603,9 @@ def parse_args() -> argparse.Namespace:
         "resume",
         "modality_weights",
         "star_junctions",
+        "ssu",
+        "early_stopping_patience",
+        "early_stopping_min_delta",
     ):
         _apply_config_scalar(attr, config_data)
 
@@ -656,9 +722,10 @@ def parse_args() -> argparse.Namespace:
     args.modality_resolutions = {}
     args.modality_weight_dict = {}
     args.modality_to_star_junctions: dict[str, list[str]] = {}
+    args.modality_to_ssu_files: dict[str, list[str]] = {}
 
     # Expand comma-separated modalities: "splice_site,splice_junctions" → ["splice_site", "splice_junctions"]
-    # All sub-modalities share the same --star-junctions group from the same entry.
+    # All sub-modalities share the same --star-junctions / --ssu group from the same entry.
     flat_modalities = []
     flat_modality_specs = {}
     junc_group_idx = 0
@@ -667,25 +734,31 @@ def parse_args() -> argparse.Namespace:
         sub_mods = [m.strip() for m in mod_entry.split(",")]
         spec = modality_specs.get(mod_entry, {})
         junc_group = None
+        ssu_group = None
         if any(m in SPLICE_MODALITIES for m in sub_mods):
             star_junction_groups = args.star_junctions or []
+            ssu_groups = args.ssu or []
             if junc_group_idx < len(star_junction_groups):
                 junc_group = star_junction_groups[junc_group_idx]
+            if junc_group_idx < len(ssu_groups):
+                ssu_group = ssu_groups[junc_group_idx]
             junc_group_idx += 1
         for sub_mod in sub_mods:
             flat_modalities.append(sub_mod)
-            flat_modality_specs[sub_mod] = {**spec, "junc_group": junc_group}
+            flat_modality_specs[sub_mod] = {**spec, "junc_group": junc_group, "ssu_group": ssu_group}
 
     args.modalities = flat_modalities
 
     for modality in args.modalities:
         spec = flat_modality_specs.get(modality, modality_specs.get(modality, {}))
         junc_group = spec.get("junc_group")
+        ssu_group = spec.get("ssu_group")
         if modality in SPLICE_MODALITIES:
             # Splice modalities require junction files (no BigWig required)
             if junc_group is None:
                 parser.error(f"Modality '{modality}' requires --star-junctions files.")
             args.modality_to_star_junctions[modality] = junc_group
+            args.modality_to_ssu_files[modality] = ssu_group  # None if not provided
             args.modality_to_bigwigs[modality] = []
         else:
             if "bigwig" not in spec or not spec["bigwig"]:
@@ -772,6 +845,15 @@ def parse_args() -> argparse.Namespace:
 
     args.is_multimodal = len(args.modalities) > 1
 
+    # we need splice site head to predict junctions
+    if args.junction_position_source == "predicted":
+        all_modalities = {m for group in args.modalities for m in group.split(",")}
+        if "splice_site" not in all_modalities:
+            parser.error(
+                "--junction-position-source=predicted requires the 'splice_site' modality "
+                "so the classification head is available to score positions."
+            )
+
     return args
 
 
@@ -801,6 +883,55 @@ def create_datasets(
     print_rank0(f"Caching: genome={cache_genome}, signals={cache_signals}", rank)
     print_rank0(f"Parallel I/O workers: {max_io_workers}", rank)
 
+    # ------------------------------------------------------------------ #
+    # Distillation mode: bypass BigWig/STAR readers entirely
+    # ------------------------------------------------------------------ #
+    if getattr(args, "distillation_targets", None):
+        print_rank0(f"Distillation mode: loading targets from {args.distillation_targets}", rank)
+        genome = CachedGenome(args.genome) if cache_genome else args.genome
+
+        # Build modality_track_names the same way as the standard path so that
+        # head construction is identical regardless of target type.
+        modality_track_names: dict[str, list[str]] = {}
+        SPLICE_MODALITIES = {"splice_site", "splice_usage", "splice_junctions"}
+        for modality in args.modalities:
+            if modality in SPLICE_MODALITIES:
+                junc_files = args.modality_to_star_junctions.get(modality, [])
+                ssu_files = args.modality_to_ssu_files.get(modality) or []
+                junc_stems = [Path(p).stem for p in junc_files]
+                ssu_stems = [Path(p).stem for p in ssu_files]
+                usage_stems = ssu_stems if ssu_stems else junc_stems
+                if modality == "splice_site":
+                    modality_track_names[modality] = [
+                        "cls_donor_pos", "cls_acceptor_pos", "cls_donor_neg", "cls_acceptor_neg", "cls_none"
+                    ]
+                elif modality == "splice_usage":
+                    modality_track_names[modality] = (
+                        [f"{s}_pos" for s in usage_stems] + [f"{s}_neg" for s in usage_stems]
+                    )
+                elif modality == "splice_junctions":
+                    modality_track_names[modality] = (
+                        [f"{s}_pos" for s in junc_stems] + [f"{s}_neg" for s in junc_stems]
+                    )
+            else:
+                bigwigs = args.modality_to_bigwigs.get(modality, [])
+                modality_track_names[modality] = [Path(bw).stem for bw in bigwigs]
+
+        train_dataset = DistillationDataset(
+            manifest_path=args.distillation_targets,
+            genome_fasta=genome,
+            sequence_length=args.sequence_length,
+            modalities=args.modalities,
+        )
+        val_dataset = DistillationDataset(
+            manifest_path=args.distillation_targets,
+            genome_fasta=genome,
+            sequence_length=args.sequence_length,
+            modalities=args.modalities,
+        )
+        print_rank0(f"Distillation dataset: {len(train_dataset):,} intervals (train=val=same)", rank)
+        return train_dataset, val_dataset, modality_track_names, args.modality_resolutions
+
     # Shared genome cache for train + val
     genome = CachedGenome(args.genome) if cache_genome else args.genome
 
@@ -811,22 +942,22 @@ def create_datasets(
     for modality in args.modalities:
         if modality in SPLICE_MODALITIES:
             junc_files = args.modality_to_star_junctions.get(modality, [])
+            ssu_files = args.modality_to_ssu_files.get(modality) or []
             junc_stems = [Path(p).stem for p in junc_files]
+            ssu_stems = [Path(p).stem for p in ssu_files]
+            usage_stems = ssu_stems if ssu_stems else junc_stems  # fallback to junction stems
             if modality == "splice_site":
-                # Classification only: always 5 classes
                 modality_track_names[modality] = [
                     "cls_donor_pos", "cls_acceptor_pos", "cls_donor_neg", "cls_acceptor_neg", "cls_none"
                 ]
             elif modality == "splice_usage":
-                # Usage prediction: 2 tracks per junction file (positive and negative strands)
-                modality_track_names[modality] = [f"{stem}_pos" for stem in junc_stems] + \
-                                                 [f"{stem}_neg" for stem in junc_stems]
+                modality_track_names[modality] = [f"{stem}_pos" for stem in usage_stems] + \
+                                                 [f"{stem}_neg" for stem in usage_stems]
             elif modality == "splice_junctions":
-                # Junction counting: 2 tracks per junction file (positive and negative strands)
                 modality_track_names[modality] = [f"{stem}_pos" for stem in junc_stems] + \
                                                  [f"{stem}_neg" for stem in junc_stems]
             print_rank0(
-                f"  {modality}: {len(junc_files)} junction files, "
+                f"  {modality}: {len(junc_files)} junction files, {len(ssu_files)} SSU files, "
                 f"resolutions={args.modality_resolutions[modality]}, "
                 f"tracks={len(modality_track_names[modality])}",
                 rank,
@@ -853,25 +984,30 @@ def create_datasets(
         resolutions = args.modality_resolutions[modality]
         if modality in SPLICE_MODALITIES:
             junc_files = args.modality_to_star_junctions.get(modality, [])
-            # Cache by junction files tuple to share datasets for co-expanded modalities
-            junc_key = tuple(sorted(junc_files))
+            ssu_files = args.modality_to_ssu_files.get(modality, [])
+            # Cache by (junction files, ssu files) tuple to share datasets for co-expanded modalities
+            junc_key = (tuple(sorted(junc_files)), tuple(sorted(ssu_files)))
             if junc_key not in _splice_dataset_cache:
                 _splice_dataset_cache[junc_key] = (
-                    SpliceJunctionDataset(
+                    SplicingDataset(
                         genome_fasta=genome,
                         bed_file=args.train_bed,
                         star_junction_files=junc_files,
+                        ssu_files=ssu_files,
                         sequence_length=args.sequence_length,
                         filter_to_junctions=False,
                         gtf_file=args.gtf,
+                        max_splice_sites=args.junction_top_k,
                     ),
-                    SpliceJunctionDataset(
+                    SplicingDataset(
                         genome_fasta=genome,
                         bed_file=args.val_bed,
                         star_junction_files=junc_files,
+                        ssu_files=ssu_files,
                         sequence_length=args.sequence_length,
                         filter_to_junctions=False,
                         gtf_file=args.gtf,
+                        max_splice_sites=args.junction_top_k,
                     ),
                 )
             train_datasets[modality], val_datasets[modality] = _splice_dataset_cache[junc_key]
@@ -1407,9 +1543,16 @@ def main() -> None:
 
     handler = setup_preemption_handler(_save_preempt, rank, world_size)
 
+    # Early stopping state
+    es_patience = args.early_stopping_patience
+    es_min_delta = args.early_stopping_min_delta
+    es_epochs_without_improvement = 0
+
     # Training loop
     print_rank0("\n" + "=" * 60, rank)
     print_rank0(f"Starting training (epoch {start_epoch} to {args.epochs})", rank)
+    if es_patience is not None:
+        print_rank0(f"Early stopping: patience={es_patience}, min_delta={es_min_delta}", rank)
     print_rank0("=" * 60, rank)
 
     # Freeze backbone (use torch.no_grad) when no backbone params need gradients.
@@ -1473,6 +1616,7 @@ def main() -> None:
                     global_step_offset=global_step_offset,
                     skip_batches=epoch_skip,
                     save_state=_save_state,
+                    junction_top_k=args.junction_top_k,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
@@ -1508,6 +1652,7 @@ def main() -> None:
                     skip_batches=epoch_skip,
                     save_state=_save_state,
                     organism_idx=args.organism_idx,
+                    junction_top_k=args.junction_top_k,
                 )
 
             skip_batches = 0  # Only skip on first resumed epoch
@@ -1536,6 +1681,7 @@ def main() -> None:
                 rank=rank,
                 world_size=world_size,
                 encoder_only=encoder_only,
+                junction_top_k=args.junction_top_k,
                 organism_idx=args.organism_idx,
             )
 
@@ -1544,6 +1690,7 @@ def main() -> None:
                 torch.cuda.synchronize()
 
             current_lr = scheduler.get_last_lr()[0]
+            prev_best_val_loss = best_val_loss
             is_best = val_loss < best_val_loss
 
             # Print epoch summary
@@ -1605,6 +1752,23 @@ def main() -> None:
                         best_val_loss=best_val_loss,
                         wandb_run_id=logger.wandb_run_id,
                     )
+
+            # Early stopping
+            if es_patience is not None:
+                if is_best and (prev_best_val_loss - val_loss) >= es_min_delta:
+                    es_epochs_without_improvement = 0
+                else:
+                    es_epochs_without_improvement += 1
+                stop_signal = [es_epochs_without_improvement >= es_patience]
+                if world_size > 1:
+                    stop_signal = broadcast_object(stop_signal, src=0)
+                if stop_signal[0]:
+                    print_rank0(
+                        f"Early stopping triggered: no improvement for {es_patience} epoch(s).",
+                        rank,
+                    )
+                    barrier()
+                    break
 
             barrier()
 

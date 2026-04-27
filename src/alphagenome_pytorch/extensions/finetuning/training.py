@@ -27,6 +27,7 @@ from tqdm import tqdm
 from alphagenome_pytorch.losses import (
     multinomial_loss,
     cross_entropy_loss,
+    cross_entropy_loss_pseudocode,
     cross_entropy_loss_from_logits,
     binary_crossentropy_from_logits,
     poisson_loss,
@@ -77,7 +78,41 @@ def collate_genomic(
     return sequences, targets_dict
 
 
-def _call_splice_head(head, embeddings_dict, organism_idx, positions, channels_last):
+def _top_k_positions_from_logits(logits_ncl: torch.Tensor, top_k: int) -> torch.Tensor:
+    """Derive splice-site positions from classification head logits via top-k selection.
+
+    Args:
+        logits_ncl: (B, 5, S) — NCL logits from SpliceSitesClassificationHead
+                    (channels: 0=Donor+, 1=Acceptor+, 2=Donor-, 3=Acceptor-).
+        top_k: Maximum number of positions to select per role per batch item.
+
+    Returns:
+        positions: (B, 4, top_k) int32 tensor — [pos_donors, pos_acceptors,
+                   neg_donors, neg_acceptors], padded with -1 where fewer than
+                   top_k sites exist.
+    """
+    B, C, S = logits_ncl.shape
+    device = logits_ncl.device
+    positions = torch.full((B, 4, top_k), -1, dtype=torch.int32, device=device)
+    k = min(top_k, S)
+    for role_idx in range(4):  # Donor+, Acceptor+, Donor-, Acceptor-
+        scores = logits_ncl[:, role_idx, :]  # (B, S)
+        topk_idx = torch.topk(scores, k, dim=-1, sorted=True).indices
+        # Sort positions in ascending genomic order so RoPE distances are stable.
+        sorted_idx, _ = topk_idx.sort(dim=-1)
+        positions[:, role_idx, :k] = sorted_idx.to(torch.int32)
+    return positions
+
+
+def _call_splice_head(
+    head,
+    embeddings_dict,
+    organism_idx,
+    positions,
+    channels_last,
+    cls_head=None,
+    junction_top_k: int | None = None,
+):
     """Call a splice head with the training-loop's embeddings_dict interface.
 
     Unwraps embeddings_dict[1] and calls the correct forward signature per head type.
@@ -86,14 +121,20 @@ def _call_splice_head(head, embeddings_dict, organism_idx, positions, channels_l
         head: SpliceSitesClassificationHead, SpliceSitesUsageHead, or SpliceSitesJunctionHead.
         embeddings_dict: Dict with key 1 → embeddings tensor (B, C, S) or (B, S, C).
         organism_idx: Organism indices, shape (B,) or (B, 1).
-        positions: Optional splice-site positions (B, 4, K); required for junction head.
+        positions: Annotated splice-site positions (B, 4, K) or None.
+            Ignored for SpliceSitesJunctionHead when junction_top_k is set.
         channels_last: If True, embeddings are (B, S, C); if False, (B, C, S).
+        cls_head: SpliceSitesClassificationHead used to derive positions when
+            junction_top_k is not None. Required when junction_top_k is set.
+        junction_top_k: If set, positions for SpliceSitesJunctionHead are derived
+            from the top-k scoring sites predicted by cls_head rather than from
+            the annotated positions tensor.
 
     Returns:
         Dict compatible with _compute_splice_loss():
         - {1: logits} for classification/usage heads
         - {pos_counts: ..., neg_counts: ...} for junction head
-        - {} if junction head and positions is None
+        - {} if junction head and no positions available
     """
     if 1 not in embeddings_dict:
         available_keys = list(embeddings_dict.keys())
@@ -109,6 +150,16 @@ def _call_splice_head(head, embeddings_dict, organism_idx, positions, channels_l
     assert emb.ndim == 3, f"Expected 3D embeddings, got shape {emb.shape}"
 
     if isinstance(head, SpliceSitesJunctionHead):
+        if junction_top_k is not None:
+            if cls_head is None:
+                raise ValueError(
+                    "junction_top_k requires cls_head (SpliceSitesClassificationHead) "
+                    "to be passed to _call_splice_head."
+                )
+            # Run classification head to get per-position scores; always NCL internally.
+            emb_for_cls = emb if not channels_last else emb.transpose(1, 2)
+            cls_out = cls_head(emb_for_cls, org, channels_last=False)
+            positions = _top_k_positions_from_logits(cls_out["logits"], junction_top_k)
         if positions is None:
             return {}
         # Clamp -1 padding to 0 to avoid PyTorch negative indexing wrapping.
@@ -193,8 +244,8 @@ def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_
     target = torch.where(pairs_mask, target_counts, torch.zeros_like(target_counts))
     pred   = torch.where(pairs_mask, pred_counts,   torch.zeros_like(pred_counts))
 
-    donor_ratios_loss    = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
-    acceptor_ratios_loss = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
+    donor_ratios_loss    = cross_entropy_loss_pseudocode(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
+    acceptor_ratios_loss = cross_entropy_loss_pseudocode(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
 
     sum_pred_d = pred.sum(dim=1)
     sum_tgt_d  = _soft_clip_counts(target.sum(dim=1))
@@ -1423,6 +1474,7 @@ def train_epoch_multihead(
     skip_batches: int = 0,
     save_state: dict | None = None,
     organism_idx: int = 0,
+    junction_top_k: int | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1574,9 +1626,13 @@ def train_epoch_multihead(
                     _positions = targets_dict.get("junction_positions")
                     if _positions is not None:
                         _positions = _positions.to(device)
+                    _cls_head = heads.get("splice_site") if junction_top_k is not None else None
+                    if _cls_head is not None:
+                        _cls_head = _cls_head.module if hasattr(_cls_head, "module") else _cls_head
                     predictions = _call_splice_head(
                         head_module, embeddings_dict, organism_idx_tensor,
                         _positions, channels_last=False,
+                        cls_head=_cls_head, junction_top_k=junction_top_k,
                     )
                 else:
                     predictions = head(
@@ -1757,6 +1813,7 @@ def validate_multihead(
     world_size: int = 1,
     encoder_only: bool = False,
     organism_idx: int = 0,
+    junction_top_k: int | None = None,
 ) -> tuple[float, dict[str, Any]]:
     """Validate model with multiple modality heads.
 
@@ -1850,9 +1907,13 @@ def validate_multihead(
                     _positions = targets_dict.get("junction_positions")
                     if _positions is not None:
                         _positions = _positions.to(device)
+                    _cls_head = heads.get("splice_site") if junction_top_k is not None else None
+                    if _cls_head is not None:
+                        _cls_head = _cls_head.module if hasattr(_cls_head, "module") else _cls_head
                     predictions_scaled = _call_splice_head(
                         head_module, embeddings_dict, organism_idx_tensor,
                         _positions, channels_last=False,
+                        cls_head=_cls_head, junction_top_k=junction_top_k,
                     )
                 else:
                     predictions_scaled = head(
@@ -2016,6 +2077,7 @@ def train_epoch_sequence_parallel(
     global_step_offset: int = 0,
     skip_batches: int = 0,
     save_state: dict | None = None,
+    junction_top_k: int | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with sequence parallelism.
 
@@ -2178,9 +2240,13 @@ def train_epoch_sequence_parallel(
                     _positions = targets_dict.get("junction_positions")
                     if _positions is not None:
                         _positions = _positions.to(device)
+                    _cls_head = heads.get("splice_site") if junction_top_k is not None else None
+                    if _cls_head is not None:
+                        _cls_head = _cls_head.module if hasattr(_cls_head, "module") else _cls_head
                     predictions = _call_splice_head(
                         head_module, embeddings_dict, organism_idx,
                         _positions, channels_last=False,
+                        cls_head=_cls_head, junction_top_k=junction_top_k,
                     )
                 else:
                     predictions = head(

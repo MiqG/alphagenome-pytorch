@@ -277,6 +277,224 @@ _CLASS_MAP = {
 _CLASS_NONE = 4
 
 
+def compute_alpha_beta2(
+    junctions: pd.DataFrame,
+) -> "tuple[pd.Series, pd.Series, pd.Series, pd.Series]":
+    """Compute per-site α and β2 from junction counts.
+
+    β2(D) = Σ_{A: D→A} acceptor_total(A) − α(D)
+    β2(A) = Σ_{D: D→A} donor_total(D) − α(A)
+
+    Args:
+        junctions: DataFrame with columns: chrom, exon_start (1-based),
+            exon_end (1-based), strand, count.
+
+    Returns:
+        (donor_alpha, acceptor_alpha, donor_beta2, acceptor_beta2) as Series
+        indexed by (chrom, position, strand).
+    """
+    donor_alpha = (
+        junctions.groupby(["chrom", "exon_start", "strand"])["count"].sum()
+        .rename("donor_total")
+    )
+    acceptor_alpha = (
+        junctions.groupby(["chrom", "exon_end", "strand"])["count"].sum()
+        .rename("acceptor_total")
+    )
+
+    j = junctions.join(acceptor_alpha, on=["chrom", "exon_end", "strand"])
+    j = j.join(donor_alpha, on=["chrom", "exon_start", "strand"])
+
+    donor_beta2 = (
+        j.groupby(["chrom", "exon_start", "strand"])["acceptor_total"].sum()
+        - donor_alpha
+    ).rename("donor_beta2")
+    acceptor_beta2 = (
+        j.groupby(["chrom", "exon_end", "strand"])["donor_total"].sum()
+        - acceptor_alpha
+    ).rename("acceptor_beta2")
+
+    return donor_alpha, acceptor_alpha, donor_beta2, acceptor_beta2
+
+
+def junctions_to_ssu_approx_arrays_by_strand(
+    junc_df: pd.DataFrame,
+    chrom: str,
+    start: int,
+    seq_len: int,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Build per-strand SSU approximation arrays from junction data.
+
+    Computes SSU approx = α / (α + β2) for each splice site within the window
+    and places the value at the site's 0-based relative position.
+
+    Args:
+        junc_df: Junction DataFrame with columns: chrom, exon_start (1-based),
+            exon_end (1-based), strand, count.
+        chrom: Chromosome name of the window.
+        start: 0-based genomic start of the window.
+        seq_len: Length of the window in base pairs.
+
+    Returns:
+        Tuple (pos_arr, neg_arr), each float32 of shape (seq_len,).
+    """
+    pos_arr = np.zeros(seq_len, dtype=np.float32)
+    neg_arr = np.zeros(seq_len, dtype=np.float32)
+
+    local = junc_df.loc[junc_df["chrom"] == chrom]
+    if local.empty:
+        return pos_arr, neg_arr
+
+    donor_alpha, acceptor_alpha, donor_beta2, acceptor_beta2 = compute_alpha_beta2(local)
+
+    end = start + seq_len  # 0-based exclusive
+
+    def _place(alpha_series: pd.Series, beta2_series: pd.Series, role: str) -> None:
+        for (ch, pos, strand), alpha in alpha_series.items():
+            if ch != chrom:
+                continue
+            idx = int(pos) - 1 - start  # 1-based → 0-based relative
+            if not (0 <= idx < seq_len):
+                continue
+            beta2 = float(beta2_series.get((ch, pos, strand), 0.0))
+            denom = alpha + beta2
+            val = float(alpha / denom) if denom > 0 else 0.0
+            if strand == "+":
+                pos_arr[idx] = val
+            elif strand == "-":
+                neg_arr[idx] = val
+
+    _place(donor_alpha, donor_beta2, "donor")
+    _place(acceptor_alpha, acceptor_beta2, "acceptor")
+
+    return pos_arr, neg_arr
+
+
+def read_ssu_parquet(
+    path: str,
+    chrom: str,
+    start: int,
+    end: int,
+) -> pd.DataFrame:
+    """Read SSU parquet rows overlapping a genomic window.
+
+    Uses pyarrow predicate pushdown to load only the rows for the given
+    chromosome and 1-based position range (start < position <= end).
+
+    Args:
+        path: Path to SSU parquet file (produced by compute_ssu.py).
+        chrom: Chromosome to filter on.
+        start: 0-based genomic start of the window.
+        end: 0-based exclusive genomic end of the window.
+
+    Returns:
+        DataFrame with columns: chrom, position (1-based exonic), strand, role,
+        ssu_approx, and optionally ssu_full.
+    """
+    import pyarrow.parquet as pq
+    filters = [
+        ("chrom", "==", chrom),
+        ("exon_pos", ">", start),
+        ("exon_pos", "<=", end),
+    ]
+    df = pq.read_table(path, filters=filters).to_pandas()
+    return df.rename(columns={"exon_pos": "position"})
+
+
+def splice_sites_to_classification_array(
+    sites_list: "list[pd.DataFrame]",
+    chrom: str,
+    start: int,
+    seq_len: int,
+) -> np.ndarray:
+    """Build a 5-class one-hot classification array from splice site DataFrames.
+
+    Each DataFrame must have columns: chrom, position (1-based exonic), strand,
+    role ('donor' or 'acceptor').  The union of sites across all DataFrames is
+    used to assign each in-window position to one of five classes:
+        0: Donor on + strand
+        1: Acceptor on + strand
+        2: Donor on - strand
+        3: Acceptor on - strand
+        4: None (background)
+
+    Args:
+        sites_list: List of DataFrames with [chrom, position, strand, role].
+        chrom: Chromosome name of the window.
+        start: 0-based genomic start of the window.
+        seq_len: Length of the window in base pairs.
+
+    Returns:
+        Float32 array of shape (seq_len, 5) — one-hot over the 5 classes.
+    """
+    arr = np.zeros((seq_len, 5), dtype=np.float32)
+    arr[:, _CLASS_NONE] = 1.0
+
+    rows = []
+    for df in sites_list:
+        local = df.loc[df["chrom"] == chrom, ["position", "strand", "role"]]
+        if not local.empty:
+            rows.append(local)
+
+    if not rows:
+        return arr
+
+    sites = pd.concat(rows, ignore_index=True).drop_duplicates(
+        subset=["position", "strand", "role"]
+    )
+    for _, site in sites.iterrows():
+        idx = int(site["position"]) - 1 - start  # 1-based → 0-based relative
+        if 0 <= idx < seq_len:
+            cls = _CLASS_MAP.get((site["role"], site["strand"]))
+            if cls is not None:
+                arr[idx, _CLASS_NONE] = 0.0
+                arr[idx, cls] = 1.0
+
+    return arr
+
+
+def ssu_to_arrays_by_strand(
+    ssu_df: pd.DataFrame,
+    chrom: str,
+    start: int,
+    seq_len: int,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Build per-strand SSU value arrays for one sample within a window.
+
+    Places each site's SSU value (ssu_full if present, else ssu_approx) at
+    its 0-based relative position; all other positions are 0.
+
+    Args:
+        ssu_df: SSU DataFrame already filtered to the window, with columns:
+            chrom, position (1-based exonic), strand, ssu_approx, optionally ssu_full.
+        chrom: Chromosome name of the window.
+        start: 0-based genomic start of the window.
+        seq_len: Length of the window in base pairs.
+
+    Returns:
+        Tuple (pos_arr, neg_arr), each float32 of shape (seq_len,).
+    """
+    pos_arr = np.zeros(seq_len, dtype=np.float32)
+    neg_arr = np.zeros(seq_len, dtype=np.float32)
+
+    local = ssu_df.loc[ssu_df["chrom"] == chrom]
+    if local.empty:
+        return pos_arr, neg_arr
+
+    value_col = "ssu_full" if "ssu_full" in local.columns else "ssu_approx"
+
+    for _, site in local.iterrows():
+        idx = int(site["position"]) - 1 - start  # 1-based → 0-based relative
+        if 0 <= idx < seq_len:
+            val = float(site[value_col])
+            if site["strand"] == "+":
+                pos_arr[idx] = val
+            elif site["strand"] == "-":
+                neg_arr[idx] = val
+
+    return pos_arr, neg_arr
+
+
 def junctions_to_classification_array(
     all_juncs_list: list[pd.DataFrame],
     chrom: str,

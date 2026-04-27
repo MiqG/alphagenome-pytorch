@@ -554,11 +554,15 @@ class SpliceSitesJunctionHead(nn.Module):
         )
 
         def make_rope_params():
-            params = torch.zeros(self._num_organisms, 2, self._num_tissues, self._hidden_dim)
-            # Initialize scale (index 0) to 1.0 (identity for multiplication) and offset (index 1) to 0.0
-            # This allows gradients to flow immediately: x_transformed = 1 * x + 0 = x
-            params[:, 0, :, :] = 1.0  # scale = 1 (identity)
-            params[:, 1, :, :] = 0.0  # offset = 0 (no shift)
+            # TruncatedNormal(0.1) matches the JAX reference init and the pretrained weight
+            # distribution (mean≈0, std≈0.1). Zero-init blocks gradient flow during finetuning;
+            # scale=1/offset=0 injects a spurious large signal. See alphagenome_research commit
+            # e2acbfae: "Fix RoPE param initialization in splice junction head for finetuning."
+            std = 0.1
+            params = torch.nn.init.trunc_normal_(
+                torch.empty(self._num_organisms, 2, self._num_tissues, self._hidden_dim),
+                mean=0.0, std=std, a=-2 * std, b=2 * std,
+            )
             return nn.Parameter(params)
 
         self.rope_params = nn.ParameterDict({

@@ -620,10 +620,11 @@ class AlphaGenome(nn.Module):
                             pad_to_length=512,
                             threshold=0.1,
                         )
+                    # embeddings_1bp is always NCL from _compute_embeddings_ncl
                     outputs['splice_sites_junction'] = self.splice_sites_junction_head(
                         embeddings_1bp,
                         organism_index,
-                        channels_last=channels_last,
+                        channels_last=False,
                         splice_site_positions=top_k_positions,
                     )
 
