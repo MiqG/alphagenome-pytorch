@@ -257,7 +257,7 @@ def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_
     return 0.2 * (donor_ratios_loss + acceptor_ratios_loss) + 0.04 * (donor_total_loss + accept_total_loss)
 
 
-def _compute_splice_loss(head, predictions, targets_dict, device, num_splice_partitions: int = 1):
+def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: int = 1):
     """Compute loss for any of the three splice head types.
 
     Args:
@@ -266,7 +266,7 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_splice_par
         targets_dict: Dict with string keys: 'probs', 'usage',
             'junction_positions', 'junction_matrix'.
         device: Torch device.
-        num_splice_partitions: Number of equal-length partitions to split the sequence
+        num_segments: Number of equal-length partitions to split the sequence
             into before computing loss. Each partition's loss is computed independently
             and the results are averaged. Values > 1 upweight sequence regions with
             fewer splice sites relative to a global mean, since each partition
@@ -283,10 +283,10 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_splice_par
     if isinstance(head, SpliceSitesClassificationHead):
         pred = predictions[1]
         target = targets_dict["probs"].to(device)
-        if num_splice_partitions > 1:
+        if num_segments > 1:
             loss = _partitioned_loss(
                 pred, target,
-                num_partitions=num_splice_partitions,
+                num_partitions=num_segments,
                 loss_fn=lambda p, t: _ce_loss_with_smoothing(p, t, label_smoothing, N_CLASSES),
                 mask_fn=lambda t: t.any(dim=-1, keepdim=True).expand_as(t),
                 device=device,
@@ -305,10 +305,10 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_splice_par
     elif isinstance(head, SpliceSitesUsageHead):
         pred = predictions[1]
         target = targets_dict["usage"].to(device)
-        if num_splice_partitions > 1:
+        if num_segments > 1:
             loss = _partitioned_loss(
                 pred, target,
-                num_partitions=num_splice_partitions,
+                num_partitions=num_segments,
                 loss_fn=lambda p, t: binary_crossentropy_from_logits(
                     y_pred=p,
                     y_true=t.float(),
@@ -1460,7 +1460,6 @@ def train_epoch_multihead(
     frozen_backbone: bool = False,
     num_segments: int = NUM_SEGMENTS,
     min_segment_size: int | None = None,
-    loss_partitions: dict[str, int] | None = None,
     train_sampler: DistributedSampler | None = None,
     rank: int = 0,
     world_size: int = 1,
@@ -1499,7 +1498,7 @@ def train_epoch_multihead(
         frozen_backbone: If True, use torch.no_grad() for backbone.
         num_segments: Number of segments for multinomial loss.
         min_segment_size: Minimum positions per segment.
-        loss_partitions: Per-modality partition counts for loss, e.g. {"splice_site": 8}. See _compute_splice_loss.
+        num_segments: Number of sequence segments for both multinomial count loss and splice losses.
         train_sampler: DistributedSampler for DDP.
         rank: Process rank for DDP.
         world_size: Total number of processes.
@@ -1644,7 +1643,7 @@ def train_epoch_multihead(
             if isinstance(head_module, SPLICE_HEAD_TYPES):
                 modality_loss, splice_components = _compute_splice_loss(
                     head_module, predictions, targets_dict, device,
-                    num_splice_partitions=(loss_partitions or {}).get(modality, 1),
+                    num_segments=num_segments,
                 )
                 for k, v in splice_components.items():
                     loss_components[f"{modality}_{k}"] = v
@@ -1807,7 +1806,6 @@ def validate_multihead(
     use_amp: bool = True,
     num_segments: int = NUM_SEGMENTS,
     min_segment_size: int | None = None,
-    loss_partitions: dict[str, int] | None = None,
     compute_pearson: bool = True,
     rank: int = 0,
     world_size: int = 1,
@@ -1929,7 +1927,7 @@ def validate_multihead(
             if isinstance(head_module, SPLICE_HEAD_TYPES):
                 modality_loss, _ = _compute_splice_loss(
                     head_module, predictions_scaled, targets_dict, device,
-                    num_splice_partitions=(loss_partitions or {}).get(modality, 1),
+                    num_segments=num_segments,
                 )
                 if compute_pearson:
                     _splice_pred, _splice_true = _extract_splice_pearson_pairs(
@@ -2064,7 +2062,6 @@ def train_epoch_sequence_parallel(
     frozen_backbone: bool = False,
     num_segments: int = NUM_SEGMENTS,
     min_segment_size: int | None = None,
-    loss_partitions: dict[str, int] | None = None,
     train_sampler: DistributedSampler | None = None,
     rank: int = 0,
     world_size: int = 1,
@@ -2270,7 +2267,7 @@ def train_epoch_sequence_parallel(
                     splice_targets_dict[res] = tgt
                 modality_loss, splice_components = _compute_splice_loss(
                     head_module, predictions, splice_targets_dict, device,
-                    num_splice_partitions=(loss_partitions or {}).get(modality, 1),
+                    num_segments=num_segments,
                 )
                 for k, v in splice_components.items():
                     loss_components[f"{modality}_{k}"] = v

@@ -395,18 +395,6 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--num-segments", type=int, default=DEFAULTS["num_segments"])
     train.add_argument("--min-segment-size", type=int, default=DEFAULTS["min_segment_size"])
     train.add_argument(
-        "--loss-partitions",
-        type=str,
-        default=None,
-        help=(
-            "Per-modality number of sequence partitions for loss computation, e.g. "
-            "'splice_site:8,splice_usage:8'. Each partition's loss is computed "
-            "independently and averaged, upweighting gene-sparse regions. "
-            "Default (omitted) = 1 for all modalities (standard global mean). "
-            "Not applicable to splice_junctions (matrix-based loss)."
-        ),
-    )
-    train.add_argument(
         "--junction-position-source",
         type=str,
         choices=["annotated", "predicted"],
@@ -587,7 +575,6 @@ def parse_args() -> argparse.Namespace:
         "max_grad_norm",
         "num_segments",
         "min_segment_size",
-        "loss_partitions",
         "num_workers",
         "track_means_samples",
         "profile_batches",
@@ -787,21 +774,6 @@ def parse_args() -> argparse.Namespace:
             if mod not in args.modality_to_bigwigs:
                 parser.error(f"Unknown modality in --modality-weights: {mod}")
             args.modality_weight_dict[mod] = float(weight.strip())
-
-    args.loss_partitions_dict: dict[str, int] = {}
-    if args.loss_partitions:
-        for item in args.loss_partitions.split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if ":" not in item:
-                parser.error("Each --loss-partitions item must be 'modality:N'")
-            mod, n = item.split(":", 1)
-            mod = mod.strip()
-            try:
-                args.loss_partitions_dict[mod] = int(n.strip())
-            except ValueError:
-                parser.error(f"Partition count must be an integer, got '{n.strip()}'")
 
     # Parse --organism into an integer index
     _ORGANISM_NAMES = {"human": 0, "mouse": 1}
@@ -1603,7 +1575,6 @@ def main() -> None:
                     frozen_backbone=frozen_backbone,
                     num_segments=args.num_segments,
                     min_segment_size=args.min_segment_size,
-                    loss_partitions=args.loss_partitions_dict,
                     train_sampler=train_sampler,
                     rank=rank,
                     world_size=world_size,
@@ -1642,7 +1613,6 @@ def main() -> None:
                     max_grad_norm=args.max_grad_norm,
                     num_segments=args.num_segments,
                     min_segment_size=args.min_segment_size,
-                    loss_partitions=args.loss_partitions_dict,
                     profile_batches=args.profile_batches if epoch == start_epoch else 0,
                     log_fn=logger.log_step if is_main_process(rank) else None,
                     encoder_only=encoder_only,
@@ -1676,7 +1646,6 @@ def main() -> None:
                 use_amp=use_amp,
                 num_segments=args.num_segments,
                 min_segment_size=args.min_segment_size,
-                loss_partitions=args.loss_partitions_dict,
                 compute_pearson=True,
                 rank=rank,
                 world_size=world_size,
