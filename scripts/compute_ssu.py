@@ -3,13 +3,14 @@
 
 For each splice site in a SJ.out.tab file, computes:
 
-  SSU approx = α / (α + β2)          [junction-only, no BAM needed]
-  SSU full   = α / (α + β1 + β2)     [requires BAM, SpliSER definition]
+  SSU approx  = α / (α + β2)         [junction-only, no BAM needed]
+  SSU full    = α / (α + β1 + β2)    [α/β2 from junctions, β1 from BAM]
+  SSU spliser = α / (α + β1 + β2)    [all counts from BAM, equivalent to SpliSER]
 
 where:
-  α  = split reads using this site (from SJ.out.tab)
-  β1 = reads spanning the site continuously without splicing (from BAM)
-  β2 = reads using a competing site for the same partner (from junction data)
+  α  = split reads using this site
+  β1 = reads spanning the site continuously without splicing (no N CIGAR)
+  β2 = reads using a competing site for the same partner
 
 Coordinates are 1-based.  Each splice site is reported with both its exonic
 coordinate (last exon base for donor, first exon base for acceptor) and its
@@ -21,7 +22,7 @@ Usage:
         --junctions second_pass.SJ.out.tab \\
         --output ssu.parquet
 
-    # Full SSU with BAM ground truth
+    # Full SSU with BAM ground truth (3 metrics)
     python scripts/compute_ssu.py \\
         --junctions second_pass.SJ.out.tab \\
         --bam second_pass.Aligned.sortedByCoord.out.filtered.bam \\
@@ -237,6 +238,178 @@ def build_beta1_counts(
 
 
 # ------------------------------------------------------------------ #
+# Step 3b: SpliSER-equivalent counts from BAM (all α, β1, β2 from BAM)
+# ------------------------------------------------------------------ #
+
+def _check_strand_from_flag(flag: int, strandedType: str = "rf") -> str | None:
+    """Determine transcript strand from SAM flag bits (mirrors SpliSER check_strand)."""
+    is_paired   = bool(flag & 0x1)
+    is_reverse  = bool(flag & 0x10)
+    is_read1    = bool(flag & 0x40)
+
+    if not is_paired:
+        mate = 1
+    elif is_read1:
+        mate = 1
+    else:
+        mate = 2
+
+    if strandedType == "rf":
+        if mate == 1:
+            return "+" if is_reverse else "-"
+        else:
+            return "-" if is_reverse else "+"
+    elif strandedType == "fr":
+        if mate == 1:
+            return "-" if is_reverse else "+"
+        else:
+            return "+" if is_reverse else "-"
+    return None
+
+
+def compute_spliser_counts(
+    bam_path: str | Path,
+    junctions: "pd.DataFrame",
+    mapq_min: int = 30,
+    strandedType: str = "rf",
+) -> "pd.DataFrame":
+    """Compute SpliSER-equivalent α, β1, β2 for all splice sites from BAM.
+
+    Single BAM pass using find_introns.  Returns DataFrame with columns:
+    chrom, position, strand, role, alpha_bam, beta1_bam, beta2_bam, ssu_spliser.
+    Position uses 1-based exon convention (last exon base for donors,
+    first exon base for acceptors).
+    """
+    try:
+        import pysam
+    except ImportError as e:
+        raise ImportError("pysam is required for SpliSER computation") from e
+
+    import pandas as pd
+
+    bam = pysam.AlignmentFile(str(bam_path), "rb")
+
+    donor_alpha_bam:    dict[tuple[str, int, str], int] = {}
+    acceptor_alpha_bam: dict[tuple[str, int, str], int] = {}
+
+    chroms = junctions["chrom"].unique()
+
+    for chrom in chroms:
+        for strand in ("+", "-"):
+            gen = (
+                r for r in bam.fetch(chrom)
+                if not r.is_unmapped
+                and not r.is_secondary
+                and not r.is_supplementary
+                and r.mapping_quality >= mapq_min
+                and _check_strand_from_flag(r.flag, strandedType) == strand
+            )
+            for (iv_s, iv_e), count in bam.find_introns(gen).items():
+                donor_alpha_bam[(chrom, iv_s, strand)]    = donor_alpha_bam.get((chrom, iv_s, strand), 0)    + count
+                acceptor_alpha_bam[(chrom, iv_e, strand)] = acceptor_alpha_bam.get((chrom, iv_e, strand), 0) + count
+
+    all_targets: dict[str, list[int]] = {}
+    target_roles: dict[str, dict[int, list[str]]] = {}
+    acceptor_scan_to_alpha: dict[tuple[int, str], int] = {}
+    for strand in ("+", "-"):
+        pos_set: dict[int, list[str]] = {}
+        for (_, pos, s) in donor_alpha_bam:
+            if s == strand:
+                pos_set.setdefault(pos, []).append("donor")
+        for (_, pos, s) in acceptor_alpha_bam:
+            if s == strand:
+                pos_set.setdefault(pos - 1, []).append("acceptor")
+        all_targets[strand] = sorted(pos_set)
+        target_roles[strand] = pos_set
+
+    beta1_bam: dict[tuple[int, str, str], int] = {}
+    beta2_bam: dict[tuple[int, str, str], int] = {}
+
+    for chrom in chroms:
+        for read in bam.fetch(chrom):
+            if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                continue
+            if read.mapping_quality < mapq_min:
+                continue
+            if not read.cigartuples:
+                continue
+
+            read_strand = _check_strand_from_flag(read.flag, strandedType)
+            if read_strand not in ("+", "-"):
+                continue
+
+            introns: list[tuple[int, int]] = []
+            ref_pos = read.reference_start
+            for op, length in read.cigartuples:
+                if op == 3:
+                    introns.append((ref_pos, ref_pos + length))
+                    ref_pos += length
+                elif op in (0, 2, 7, 8):
+                    ref_pos += length
+
+            read_start = read.reference_start
+            read_end   = read.reference_end
+
+            targets = all_targets.get(read_strand, [])
+            lo = bisect.bisect_left(targets, read_start)
+            hi = bisect.bisect_right(targets, read_end - 1)
+
+            for target_pos in targets[lo:hi]:
+                for role in target_roles[read_strand][target_pos]:
+                    key = (target_pos, read_strand, role)
+
+                    if not any(iv_s <= target_pos < iv_e for iv_s, iv_e in introns):
+                        beta1_bam[key] = beta1_bam.get(key, 0) + 1
+
+                    if role == "acceptor":
+                        is_alpha = any(iv_e_r == target_pos + 1 for _, iv_e_r in introns)
+                        if not is_alpha and any(iv_s < target_pos < iv_e for iv_s, iv_e in introns):
+                            beta2_bam[key] = beta2_bam.get(key, 0) + 1
+                    else:
+                        if any(iv_s < target_pos < iv_e for iv_s, iv_e in introns):
+                            beta2_bam[key] = beta2_bam.get(key, 0) + 1
+
+    bam.close()
+
+    rows = []
+    for (chrom, pos, strand), alpha in donor_alpha_bam.items():
+        key  = (pos, strand, "donor")
+        b1   = beta1_bam.get(key, 0)
+        b2   = beta2_bam.get(key, 0)
+        denom = alpha + b1 + b2
+        rows.append({
+            "chrom":       chrom,
+            "position":    pos,
+            "strand":      strand,
+            "role":        "donor",
+            "alpha_bam":   int(alpha),
+            "beta1_bam":   int(b1),
+            "beta2_bam":   int(b2),
+            "ssu_spliser": alpha / denom if denom > 0 else float("nan"),
+        })
+    for (chrom, pos, strand), alpha in acceptor_alpha_bam.items():
+        scan_key = (pos - 1, strand, "acceptor")
+        b1   = beta1_bam.get(scan_key, 0)
+        b2   = beta2_bam.get(scan_key, 0)
+        denom = alpha + b1 + b2
+        rows.append({
+            "chrom":       chrom,
+            "position":    pos + 1,
+            "strand":      strand,
+            "role":        "acceptor",
+            "alpha_bam":   int(alpha),
+            "beta1_bam":   int(b1),
+            "beta2_bam":   int(b2),
+            "ssu_spliser": alpha / denom if denom > 0 else float("nan"),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.drop_duplicates(subset=["chrom", "position", "strand", "role"]).reset_index(drop=True)
+
+
+# ------------------------------------------------------------------ #
 # Step 4: assemble site table
 # ------------------------------------------------------------------ #
 
@@ -260,7 +433,7 @@ def assemble_site_table(
 
     Returns:
         DataFrame with columns: chrom, strand, role, exon_pos, intron_pos,
-        alpha, beta2, ssu_approx, [beta1, ssu_full].
+        alpha_juncs, beta2_juncs, ssu_approx, [beta1_bam, ssu_full].
     """
     import numpy as np
     import pandas as pd
@@ -276,20 +449,20 @@ def assemble_site_table(
         b2 = int(donor_beta2.get((chrom, exon_pos, strand), 0))
         d_approx = alpha + b2
         row: dict = {
-            "chrom":      chrom,
-            "strand":     strand,
-            "role":       "donor",
-            "exon_pos":   int(exon_pos),
-            "intron_pos": intron_pos,
-            "alpha":      int(alpha),
-            "beta2":      b2,
-            "ssu_approx": alpha / d_approx if d_approx > 0 else float("nan"),
+            "chrom":        chrom,
+            "strand":       strand,
+            "role":         "donor",
+            "exon_pos":     int(exon_pos),
+            "intron_pos":   intron_pos,
+            "alpha_juncs":  int(alpha),
+            "beta2_juncs":  b2,
+            "ssu_approx":   alpha / d_approx if d_approx > 0 else float("nan"),
         }
         if beta1_counts is not None:
             b1 = beta1_counts.get((chrom, int(exon_pos) - 1), 0)
             d_full = alpha + b1 + b2
-            row["beta1"]    = int(b1)
-            row["ssu_full"] = alpha / d_full if d_full > 0 else float("nan")
+            row["beta1_bam"] = int(b1)
+            row["ssu_full"]  = alpha / d_full if d_full > 0 else float("nan")
         rows.append(row)
 
     for (chrom, exon_pos, strand), alpha in acceptor_alpha.items():
@@ -297,20 +470,20 @@ def assemble_site_table(
         b2 = int(acceptor_beta2.get((chrom, exon_pos, strand), 0))
         d_approx = alpha + b2
         row = {
-            "chrom":      chrom,
-            "strand":     strand,
-            "role":       "acceptor",
-            "exon_pos":   int(exon_pos),
-            "intron_pos": intron_pos,
-            "alpha":      int(alpha),
-            "beta2":      b2,
-            "ssu_approx": alpha / d_approx if d_approx > 0 else float("nan"),
+            "chrom":        chrom,
+            "strand":       strand,
+            "role":         "acceptor",
+            "exon_pos":     int(exon_pos),
+            "intron_pos":   intron_pos,
+            "alpha_juncs":  int(alpha),
+            "beta2_juncs":  b2,
+            "ssu_approx":   alpha / d_approx if d_approx > 0 else float("nan"),
         }
         if beta1_counts is not None:
             b1 = beta1_counts.get((chrom, int(exon_pos) - 1), 0)
             d_full = alpha + b1 + b2
-            row["beta1"]    = int(b1)
-            row["ssu_full"] = alpha / d_full if d_full > 0 else float("nan")
+            row["beta1_bam"] = int(b1)
+            row["ssu_full"]  = alpha / d_full if d_full > 0 else float("nan")
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -344,11 +517,16 @@ def main() -> None:
     print(f"  {len(donor_alpha):,} donor sites, {len(acceptor_alpha):,} acceptor sites")
 
     beta1_counts = None
+    df_spliser = None
     if args.bam is not None:
         print(f"Computing β1 from BAM {args.bam!r} …")
         beta1_counts = build_beta1_counts(args.bam, junctions, args.mapq)
         total_b1 = sum(beta1_counts.values())
         print(f"  total β1 reads counted: {total_b1:,}")
+
+        print(f"Computing SpliSER-equivalent (all counts from BAM) …")
+        df_spliser = compute_spliser_counts(args.bam, junctions, args.mapq)
+        print(f"  {len(df_spliser):,} sites with BAM counts")
 
     print("Assembling site table …")
     df = assemble_site_table(
@@ -359,7 +537,19 @@ def main() -> None:
     )
     print(f"  {len(df):,} unique splice sites")
 
-    n_b2_zero = int((df["beta2"] == 0).sum())
+    if df_spliser is not None and not df_spliser.empty:
+        df = df.merge(
+            df_spliser[["chrom", "position", "strand", "role",
+                        "alpha_bam", "beta1_bam", "beta2_bam", "ssu_spliser"]],
+            left_on=["chrom", "exon_pos", "strand", "role"],
+            right_on=["chrom", "position", "strand", "role"],
+            how="left",
+        ).drop(columns=["position"])
+    elif args.bam is not None:
+        for col in ("alpha_bam", "beta1_bam", "beta2_bam", "ssu_spliser"):
+            df[col] = float("nan")
+
+    n_b2_zero = int((df["beta2_juncs"] == 0).sum())
     print(f"  sites with β2=0 (uncontested, ssu_approx=1.0): "
           f"{n_b2_zero} ({100 * n_b2_zero / len(df):.1f}%)")
 
