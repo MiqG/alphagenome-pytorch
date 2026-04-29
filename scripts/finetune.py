@@ -422,6 +422,8 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--profile-batches", type=int, default=0, help="Profile first N batches")
     train.add_argument("--compile", action="store_true", help="Use torch.compile")
     train.add_argument("--seed", type=int, default=None, help="Random seed")
+    train.add_argument("--eval-train-pearson", action="store_true", help="Run an eval pass on train set each epoch to compute Pearson R")
+    train.add_argument("--eval-only", action="store_true", help="Load checkpoint and run validation metrics without training; outputs to eval_only_metrics.json")
 
     # Distributed/Sequence Parallel arguments
     dist = parser.add_argument_group("Distributed")
@@ -1152,7 +1154,7 @@ def create_model(
         head_resolutions = (128,) if is_encoder_only else resolutions
         print_rank0(f"Created {modality} head with {n_tracks} tracks at resolutions {head_resolutions}", rank)
 
-    # Optionally initialize head conv weights from pretrained organism slice
+    # Optionally initialize head weights from pretrained organism slice
     if args.pretrained_head_sample_dict and rank == 0:
         print_rank0("Loading pretrained head weights:", rank)
         loaded = load_pretrained_head_weights(
@@ -1520,6 +1522,107 @@ def main() -> None:
     es_min_delta = args.early_stopping_min_delta
     es_epochs_without_improvement = 0
 
+    encoder_only = args.mode == "encoder-only"
+
+    # Eval-only mode: load checkpoint and run validation, then exit
+    if args.eval_only:
+        import json
+        if resume_path is None or not resume_path.exists():
+            print_rank0("ERROR: --eval-only requires a checkpoint via --resume; none found", rank)
+            sys.exit(1)
+        print_rank0(f"\n{'='*60}", rank)
+        print_rank0(f"Eval-only mode: loaded checkpoint from {resume_path}", rank)
+        print_rank0(f"{'='*60}", rank)
+
+        # Validation pass
+        if world_size > 1:
+            val_loss, val_metrics = validate_multihead(
+                model=model,
+                heads=heads,
+                val_loader=val_loader,
+                device=device,
+                modality_weights=args.modality_weight_dict,
+                resolution_weights=resolution_weights_per_modality,
+                positional_weight=args.positional_weight,
+                count_weight=args.count_weight,
+                compute_pearson=True,
+                num_segments=args.num_segments,
+                min_segment_size=args.min_segment_size,
+                rank=rank,
+                world_size=world_size,
+                encoder_only=encoder_only,
+                junction_top_k=args.junction_top_k,
+            )
+        else:
+            val_loss, val_metrics = validate_multihead(
+                model=model,
+                heads=heads,
+                val_loader=val_loader,
+                device=device,
+                modality_weights=args.modality_weight_dict,
+                resolution_weights=resolution_weights_per_modality,
+                positional_weight=args.positional_weight,
+                count_weight=args.count_weight,
+                compute_pearson=True,
+                num_segments=args.num_segments,
+                min_segment_size=args.min_segment_size,
+                rank=rank,
+                world_size=world_size,
+                encoder_only=encoder_only,
+                junction_top_k=args.junction_top_k,
+            )
+
+        # Optionally run on train set if eval-train-pearson is set
+        train_metrics = {}
+        if args.eval_train_pearson:
+            if world_size > 1:
+                train_loss, train_metrics = validate_multihead(
+                    model=model,
+                    heads=heads,
+                    val_loader=train_loader,
+                    device=device,
+                    modality_weights=args.modality_weight_dict,
+                    resolution_weights=resolution_weights_per_modality,
+                    positional_weight=args.positional_weight,
+                    count_weight=args.count_weight,
+                    compute_pearson=True,
+                    num_segments=args.num_segments,
+                    min_segment_size=args.min_segment_size,
+                    rank=rank,
+                    world_size=world_size,
+                    encoder_only=encoder_only,
+                    junction_top_k=args.junction_top_k,
+                )
+            else:
+                train_loss, train_metrics = validate_multihead(
+                    model=model,
+                    heads=heads,
+                    val_loader=train_loader,
+                    device=device,
+                    modality_weights=args.modality_weight_dict,
+                    resolution_weights=resolution_weights_per_modality,
+                    positional_weight=args.positional_weight,
+                    count_weight=args.count_weight,
+                    compute_pearson=True,
+                    num_segments=args.num_segments,
+                    min_segment_size=args.min_segment_size,
+                    rank=rank,
+                    world_size=world_size,
+                    encoder_only=encoder_only,
+                    junction_top_k=args.junction_top_k,
+                )
+            train_metrics = {f"train_{k}": v for k, v in train_metrics.items()}
+
+        # Combine metrics and save
+        all_metrics = {**val_metrics, **train_metrics}
+        metrics_file = output_dir / "eval_only_metrics.json"
+        metrics_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(metrics_file, "w") as f:
+            json.dump(all_metrics, f, indent=2)
+        if is_main_process(rank):
+            print(f"\nEval metrics saved to {metrics_file}")
+        sys.exit(0)
+
     # Training loop
     print_rank0("\n" + "=" * 60, rank)
     print_rank0(f"Starting training (epoch {start_epoch} to {args.epochs})", rank)
@@ -1633,6 +1736,42 @@ def main() -> None:
                 handler.save_and_exit()
                 break
 
+            # Optional train-set Pearson eval pass
+            train_eval_metrics: dict = {}
+            if args.eval_train_pearson:
+                n_val = len(val_loader.dataset)
+                train_ds = train_loader.dataset
+                n_sample = min(n_val, len(train_ds))
+                subset_indices = torch.randperm(len(train_ds))[:n_sample].tolist()
+                train_eval_loader = DataLoader(
+                    torch.utils.data.Subset(train_ds, subset_indices),
+                    batch_size=train_loader.batch_size,
+                    shuffle=False,
+                    num_workers=train_loader.num_workers,
+                    pin_memory=True,
+                    collate_fn=train_loader.collate_fn,
+                    prefetch_factor=2 if train_loader.num_workers > 0 else None,
+                )
+                _, train_eval_metrics = validate_multihead(
+                    model=model,
+                    heads=heads,
+                    val_loader=train_eval_loader,
+                    device=device,
+                    modality_weights=args.modality_weight_dict,
+                    resolution_weights=resolution_weights_per_modality,
+                    positional_weight=args.positional_weight,
+                    count_weight=args.count_weight,
+                    use_amp=use_amp,
+                    num_segments=args.num_segments,
+                    min_segment_size=args.min_segment_size,
+                    compute_pearson=True,
+                    rank=rank,
+                    world_size=world_size,
+                    encoder_only=encoder_only,
+                    junction_top_k=args.junction_top_k,
+                    organism_idx=args.organism_idx,
+                )
+
             # Validation (always use multihead since we always have multimodal dataset format now)
             val_loss, val_metrics = validate_multihead(
                 model=model,
@@ -1673,6 +1812,11 @@ def main() -> None:
                         continue
                     if "pearson" in key or "_loss" in key:
                         summary += f", {key}={val:.4f}"
+                for key, val in train_eval_metrics.items():
+                    if key.endswith("_values") or key.endswith("_std"):
+                        continue
+                    if "pearson" in key:
+                        summary += f", train_{key}={val:.4f}"
                 print(summary)
 
             # Log epoch
@@ -1685,6 +1829,11 @@ def main() -> None:
                     extra[key] = val
                 else:
                     extra[f"val_loss_{key}"] = val
+            for key, val in train_eval_metrics.items():
+                if key.endswith("_values"):
+                    histograms[f"train_{key}"] = val
+                elif "pearson" in key:
+                    extra[f"train_{key}"] = val
 
             logger.log_epoch(epoch, train_loss, val_loss, current_lr, is_best, extra, histograms)
 

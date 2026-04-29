@@ -27,7 +27,6 @@ from tqdm import tqdm
 from alphagenome_pytorch.losses import (
     multinomial_loss,
     cross_entropy_loss,
-    cross_entropy_loss_pseudocode,
     cross_entropy_loss_from_logits,
     binary_crossentropy_from_logits,
     poisson_loss,
@@ -244,8 +243,13 @@ def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_
     target = torch.where(pairs_mask, target_counts, torch.zeros_like(target_counts))
     pred   = torch.where(pairs_mask, pred_counts,   torch.zeros_like(pred_counts))
 
-    donor_ratios_loss    = cross_entropy_loss_pseudocode(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
-    acceptor_ratios_loss = cross_entropy_loss_pseudocode(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
+    # Skip intervals with no observed junction counts — the JAX cross-entropy
+    # goes negative when targets are all zero, polluting the loss with noise.
+    if not (target > 0).any():
+        return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
+
+    donor_ratios_loss    = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
+    acceptor_ratios_loss = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
 
     sum_pred_d = pred.sum(dim=1)
     sum_tgt_d  = _soft_clip_counts(target.sum(dim=1))
@@ -351,12 +355,15 @@ def _extract_splice_pearson_pairs(
 ):
     """Extract flat (N,) pred and true tensors over valid positions for Pearson R.
 
-    For SpliceSitesUsageHead: valid positions are where any target > 0; flatten over
-    positions and samples.
-    For SpliceSitesJunctionHead: valid pairs are where donor and acceptor are both >= 0;
-    flatten over (d, a, strand_sample) for pos and neg strands combined.
+    For SpliceSitesUsageHead: returns (pred_flat, true_flat) tuple.
+    For SpliceSitesJunctionHead: returns dict with variants:
+        - "full": all valid (donor, acceptor) cells
+        - "nonzero": valid cells with target > 0
+        - "donor_marginal": sums along acceptor axis
+        - "acceptor_marginal": sums along donor axis
+        Each value is a dict with "pred" and "true" keys, or None if empty.
 
-    Returns (pred_flat, true_flat) or (None, None) if no valid entries.
+    Returns tuple/dict or (None, None) if no valid entries.
     """
     if isinstance(head, SpliceSitesUsageHead):
         if 1 not in predictions:
@@ -377,7 +384,12 @@ def _extract_splice_pearson_pairs(
         positions = targets_dict["junction_positions"].to(device)
         n_s = head._num_tissues
 
-        preds, trues = [], []
+        variants = {"full": {}, "nonzero": {}, "donor_marginal": {}, "acceptor_marginal": {}}
+        all_pred_full, all_true_full = [], []
+        all_pred_nz, all_true_nz = [], []
+        all_pred_d_marg, all_true_d_marg = [], []
+        all_pred_a_marg, all_true_a_marg = [], []
+
         for strand_idx, (pred_key, tgt_slice, donor_row, accept_row) in enumerate([
             ("pos_counts", (slice(None), slice(None), slice(None), slice(None, n_s)),   0, 1),
             ("neg_counts", (slice(None), slice(None), slice(None), slice(n_s, None)),   2, 3),
@@ -390,13 +402,49 @@ def _extract_splice_pearson_pairs(
             valid_a = (accept_pos >= 0).float()
             pairs_mask = torch.einsum('bd,ba->bda', valid_d, valid_a).bool()
             pairs_mask4 = pairs_mask.unsqueeze(-1).expand_as(pred_counts)
-            if pairs_mask4.any():
-                preds.append(pred_counts[pairs_mask4])
-                trues.append(tgt_counts[pairs_mask4])
 
-        if not preds:
+            # Full variant: all valid pairs
+            if pairs_mask4.any():
+                all_pred_full.append(pred_counts[pairs_mask4])
+                all_true_full.append(tgt_counts[pairs_mask4])
+
+            # Nonzero variant: valid pairs with target > 0
+            nonzero_mask = pairs_mask4 & (tgt_counts > 0)
+            if nonzero_mask.any():
+                all_pred_nz.append(pred_counts[nonzero_mask])
+                all_true_nz.append(tgt_counts[nonzero_mask])
+
+            # Donor marginal: sum over acceptors, mask to donors with any valid acceptor
+            donor_mask = pairs_mask.any(dim=2)  # (B, D)
+            if donor_mask.any():
+                pred_d = pred_counts.sum(dim=2)  # (B, D, n_s)
+                true_d = tgt_counts.sum(dim=2)   # (B, D, n_s)
+                donor_mask_exp = donor_mask.unsqueeze(-1).expand_as(pred_d)
+                all_pred_d_marg.append(pred_d[donor_mask_exp])
+                all_true_d_marg.append(true_d[donor_mask_exp])
+
+            # Acceptor marginal: sum over donors, mask to acceptors with any valid donor
+            accept_mask = pairs_mask.any(dim=1)  # (B, A)
+            if accept_mask.any():
+                pred_a = pred_counts.sum(dim=1)  # (B, A, n_s)
+                true_a = tgt_counts.sum(dim=1)   # (B, A, n_s)
+                accept_mask_exp = accept_mask.unsqueeze(-1).expand_as(pred_a)
+                all_pred_a_marg.append(pred_a[accept_mask_exp])
+                all_true_a_marg.append(true_a[accept_mask_exp])
+
+        # Aggregate variants
+        if all_pred_full:
+            variants["full"] = {"pred": torch.cat(all_pred_full), "true": torch.cat(all_true_full)}
+        if all_pred_nz:
+            variants["nonzero"] = {"pred": torch.cat(all_pred_nz), "true": torch.cat(all_true_nz)}
+        if all_pred_d_marg:
+            variants["donor_marginal"] = {"pred": torch.cat(all_pred_d_marg), "true": torch.cat(all_true_d_marg)}
+        if all_pred_a_marg:
+            variants["acceptor_marginal"] = {"pred": torch.cat(all_pred_a_marg), "true": torch.cat(all_true_a_marg)}
+
+        if not variants["full"]:
             return None, None
-        return torch.cat(preds), torch.cat(trues)
+        return variants
 
     return None, None
 
@@ -1856,9 +1904,12 @@ def validate_multihead(
     accumulated_pred_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
     accumulated_true_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
 
-    # For splice Pearson R - flat valid-pair predictions vs targets
-    accumulated_splice_pred: dict[str, list[Tensor]] = {m: [] for m in heads}
-    accumulated_splice_true: dict[str, list[Tensor]] = {m: [] for m in heads}
+    # For splice Pearson R - per variant (full, nonzero, donor_marginal, acceptor_marginal)
+    # For junction head: dict[modality][variant] = {"pred": [], "true": []}
+    # For usage head: dict[modality]["full"] = {"pred": [], "true": []}
+    accumulated_splice: dict[str, dict[str, dict[str, list[Tensor]]]] = {
+        m: {"full": {"pred": [], "true": []}} for m in heads
+    }
 
     if is_main_process(rank):
         pbar = tqdm(val_loader, desc="Validation")
@@ -1930,12 +1981,25 @@ def validate_multihead(
                     num_segments=num_segments,
                 )
                 if compute_pearson:
-                    _splice_pred, _splice_true = _extract_splice_pearson_pairs(
+                    result = _extract_splice_pearson_pairs(
                         head_module, predictions_scaled, targets_dict, device
                     )
-                    if _splice_pred is not None:
-                        accumulated_splice_pred[modality].append(_splice_pred.float().cpu())
-                        accumulated_splice_true[modality].append(_splice_true.float().cpu())
+                    if result is not None and result != (None, None):
+                        # For junction head: result is a dict of variants
+                        if isinstance(head_module, SpliceSitesJunctionHead):
+                            if result != (None, None):
+                                for variant_name, variant_data in result.items():
+                                    if variant_name not in accumulated_splice[modality]:
+                                        accumulated_splice[modality][variant_name] = {"pred": [], "true": []}
+                                    if variant_data:
+                                        accumulated_splice[modality][variant_name]["pred"].append(variant_data["pred"].float().cpu())
+                                        accumulated_splice[modality][variant_name]["true"].append(variant_data["true"].float().cpu())
+                        # For usage head: result is (pred_flat, true_flat) tuple
+                        else:
+                            _splice_pred, _splice_true = result
+                            if _splice_pred is not None:
+                                accumulated_splice[modality]["full"]["pred"].append(_splice_pred.float().cpu())
+                                accumulated_splice[modality]["full"]["true"].append(_splice_true.float().cpu())
             else:
                 for res, weight in res_weights.items():
                     if res not in predictions_scaled or res not in targets_dict:
@@ -2026,19 +2090,34 @@ def validate_multihead(
                     else:
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = float("nan")
 
-    # Compute splice Pearson R
+    # Compute splice Pearson R for each variant
     if compute_pearson:
         for modality in heads:
-            if not accumulated_splice_pred[modality]:
-                continue
-            all_pred = torch.cat(accumulated_splice_pred[modality], dim=0)
-            all_true = torch.cat(accumulated_splice_true[modality], dim=0)
-            if world_size > 1:
-                all_pred = gather_tensors(all_pred, world_size, device)
-                all_true = gather_tensors(all_true, world_size, device)
-            if all_pred.shape[0] > 1:
-                r = pearson_r(all_pred.unsqueeze(0), all_true.unsqueeze(0), dim=1)
-                metrics[f"{modality}_pearson_r"] = r.item()
+            head_module = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
+            is_junction = isinstance(head_module, SpliceSitesJunctionHead)
+
+            for variant_name, variant_data in accumulated_splice[modality].items():
+                if not variant_data["pred"]:
+                    continue
+                all_pred = torch.cat(variant_data["pred"], dim=0)
+                all_true = torch.cat(variant_data["true"], dim=0)
+                if world_size > 1:
+                    all_pred = gather_tensors(all_pred, world_size, device)
+                    all_true = gather_tensors(all_true, world_size, device)
+                if all_pred.shape[0] > 1:
+                    r = pearson_r(all_pred.unsqueeze(0), all_true.unsqueeze(0), dim=1)
+                    metric_key = f"{modality}_pearson_r"
+                    if variant_name != "full":
+                        metric_key += f"_{variant_name}"
+                    metrics[metric_key] = r.item()
+
+            # Add target nonzero fraction diagnostic for junction head
+            if is_junction and "full" in accumulated_splice[modality]:
+                full_true = accumulated_splice[modality]["full"]["true"]
+                if full_true:
+                    all_true = torch.cat(full_true, dim=0)
+                    nonzero_frac = (all_true > 0).float().mean().item()
+                    metrics[f"{modality}_target_nonzero_frac"] = nonzero_frac
 
     return avg_loss, metrics
 

@@ -485,12 +485,14 @@ def load_pretrained_head_weights(
 
     Transferable:
         splice_site      — full head (5-class output is fixed; indices are ignored)
-        splice_junctions — conv only (rope_params have tissue-count mismatch)
+        splice_junctions — conv + rope_params (tissue axis sliced/broadcast to match finetuning)
         splice_usage     — conv, broadcast or per-track gather
         rna_seq / atac / dnase / procap / cage — conv at each resolution
 
-    rope_params in splice_junctions are left at default init (scale=1, offset=0)
-    because they are tissue-specific and cannot be meaningfully transferred.
+    rope_params in splice_junctions: the pretrained tensor has shape
+    (num_organisms, 2, T_pretrained, H). We slice organism_idx and gather/broadcast
+    along the tissue axis using the same indices as conv, giving the finetuning head a
+    realistic scale/offset starting point so conv features propagate from step 1.
 
     Args:
         model: AlphaGenome model with finetuning heads already attached.
@@ -626,6 +628,58 @@ def load_pretrained_head_weights(
                     if _try_copy(params[param_suffix], pt_slice, indices, label):
                         loaded.append(label)
                         print(f"  [pretrained-head] Loaded {pt_key}[org={organism_idx}] track={_fmt(indices)} → {label}")
+
+            # For splice_junctions, also transfer rope_params.
+            # The pretrained tensor shape is (num_orgs, 2, T_pretrained, H).
+            # We slice the organism axis then gather/broadcast along the tissue axis
+            # using the same indices as conv, so the finetuning head starts with a
+            # realistic scale/offset rather than TruncNormal≈0 which kills position signal.
+            if modality == "splice_junctions":
+                for rope_key in ("pos_donor", "pos_acceptor", "neg_donor", "neg_acceptor"):
+                    param_suffix = f"rope_params.{rope_key}"
+                    pt_key = f"{pt_prefix}.{param_suffix}"
+                    if pt_key not in sd:
+                        print(f"  [pretrained-head] {pt_key} not found in pretrained weights, skipping rope_params.")
+                        continue
+                    if param_suffix not in params:
+                        continue
+                    # pt_rope: (1, 2, T_pretrained, H) after organism slice
+                    pt_rope = sd[pt_key][organism_idx : organism_idx + 1]  # (1, 2, T_pt, H)
+                    T_pt = pt_rope.shape[2]
+                    param = params[param_suffix]           # (1, 2, T_ft, H)
+                    T_ft = param.shape[2]
+                    label = f"{modality}.{param_suffix}"
+                    with torch.no_grad():
+                        if isinstance(indices, int):
+                            if indices >= T_pt:
+                                print(
+                                    f"  [pretrained-head] rope index {indices} out of range "
+                                    f"(pretrained has {T_pt} tissues) for {label}, skipping."
+                                )
+                                continue
+                            # Broadcast single tissue to all T_ft tissues
+                            src = pt_rope[:, :, indices : indices + 1, :]  # (1, 2, 1, H)
+                            param.copy_(src.expand_as(param).to(param.device))
+                        else:
+                            # Per-tissue gather: list of T_ft indices
+                            if len(indices) != T_ft:
+                                print(
+                                    f"  [pretrained-head] {len(indices)} rope indices given but head has "
+                                    f"{T_ft} tissues for {label}, skipping."
+                                )
+                                continue
+                            bad = [i for i in indices if i is not None and i >= T_pt]
+                            if bad:
+                                print(
+                                    f"  [pretrained-head] rope indices {bad} out of range "
+                                    f"(pretrained has {T_pt} tissues) for {label}, skipping."
+                                )
+                                continue
+                            for out_i, src_i in enumerate(indices):
+                                if src_i is not None:
+                                    param[:, :, out_i, :] = pt_rope[0, :, src_i, :].to(param.device)
+                    loaded.append(label)
+                    print(f"  [pretrained-head] Loaded {pt_key}[org={organism_idx}] tissue={_fmt(indices)} → {label}")
 
         elif modality in _GENOME_TRACKS or any(modality.startswith(f"{m}@") for m in _GENOME_TRACKS):
             # Support 'modality@resolution' to restrict to a single resolution head
