@@ -363,45 +363,6 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
     return torch.tensor(0.0, device=device), {}
 
 
-def _extract_junction_cls_per_sample(predictions, targets_dict, device):
-    """Extract per-sample (scores, binary_labels) for junction true/false classification.
-
-    Positive: valid (donor, acceptor) pair with target count > 0 (observed in RNA-seq).
-    Negative: valid pair with target count == 0 (splice sites present but junction absent).
-
-    Returns list of (scores, labels) tensors of length 2*n_tissues
-    (first n_tissues = pos strand, last n_tissues = neg strand), or None.
-    """
-    if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
-        return None
-
-    junc_matrix = targets_dict["junction_matrix"].to(device)  # (B, D, A, 2*n_s)
-    positions   = targets_dict["junction_positions"].to(device)  # (B, 4, P)
-    n_s = junc_matrix.shape[-1] // 2
-
-    per_sample = []
-    for pred_key, tgt_slice, donor_row, accept_row in [
-        ("pos_counts", slice(None, n_s),  0, 1),
-        ("neg_counts", slice(n_s, None),  2, 3),
-    ]:
-        pred_counts = predictions[pred_key]                       # (B, D, A, n_s)
-        tgt_counts  = junc_matrix[:, :, :, tgt_slice]            # (B, D, A, n_s)
-        donor_pos   = positions[:, donor_row,  :].long()
-        accept_pos  = positions[:, accept_row, :].long()
-        pairs_mask  = torch.einsum(
-            "bd,ba->bda",
-            (donor_pos >= 0).float(),
-            (accept_pos >= 0).float(),
-        ).bool()                                                   # (B, D, A)
-
-        for s in range(n_s):
-            scores_s = pred_counts[:, :, :, s][pairs_mask].float().cpu()
-            labels_s = (tgt_counts[:, :, :, s][pairs_mask] > 0).float().cpu()
-            per_sample.append((scores_s, labels_s))
-
-    return per_sample  # length 2*n_s
-
-
 def _extract_junction_pearson_per_sample(predictions, targets_dict, device):
     """Per-biological-sample (pred, true) tensors for junction Pearson.
 
@@ -2042,10 +2003,6 @@ def validate_multihead(
         m: {"logits": [], "true": []} for m in heads
     }
 
-    # For junction true/false classification auPRC: per-sample scores and labels
-    # accumulated_junc_cls[modality][sample_idx] = {"scores": [], "labels": []}
-    accumulated_junc_cls: dict[str, dict[int, dict[str, list]]] = {m: {} for m in heads}
-
     # For per-sample Pearson (only populated when compute_per_sample=True)
     # accumulated_junc_ps_pearson[modality] = list[n_s dicts], each {"full":..., "nonzero":...}
     accumulated_junc_ps_pearson: dict[str, list] = {m: [] for m in heads}
@@ -2146,15 +2103,6 @@ def validate_multihead(
                                     if variant_data:
                                         accumulated_splice[modality][variant_name]["pred"].append(variant_data["pred"].float().cpu())
                                         accumulated_splice[modality][variant_name]["true"].append(variant_data["true"].float().cpu())
-                            cls_pairs = _extract_junction_cls_per_sample(
-                                predictions_scaled, targets_dict, device
-                            )
-                            if cls_pairs is not None:
-                                for s, (scores_s, labels_s) in enumerate(cls_pairs):
-                                    if s not in accumulated_junc_cls[modality]:
-                                        accumulated_junc_cls[modality][s] = {"scores": [], "labels": []}
-                                    accumulated_junc_cls[modality][s]["scores"].append(scores_s)
-                                    accumulated_junc_cls[modality][s]["labels"].append(labels_s)
                             if compute_per_sample:
                                 ps_junc = _extract_junction_pearson_per_sample(
                                     predictions_scaled, targets_dict, device
@@ -2312,34 +2260,10 @@ def validate_multihead(
                     nonzero_frac = (all_true > 0).float().mean().item()
                     metrics[f"{modality}_target_nonzero_frac"] = nonzero_frac
 
-    # Compute junction classification auPRC (aggregate flat keys, and per-sample if requested)
+    # Compute per-sample Pearson rows (only when compute_per_sample=True)
     if compute_pearson:
         import numpy as np
-        from sklearn.metrics import average_precision_score
 
-        # --- aggregate auprc_sample{s} / auprc_mean (backward compat, always computed) ---
-        for modality in heads:
-            head_module = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
-            if not isinstance(head_module, SpliceSitesJunctionHead):
-                continue
-            if not accumulated_junc_cls[modality]:
-                continue
-
-            auprc_values = []
-            for s, data in sorted(accumulated_junc_cls[modality].items()):
-                all_scores = torch.cat(data["scores"]).numpy()
-                all_labels = torch.cat(data["labels"]).numpy()
-                n_pos = all_labels.sum()
-                if n_pos == 0 or n_pos == len(all_labels):
-                    continue
-                ap = average_precision_score(all_labels, all_scores)
-                metrics[f"{modality}_auprc_sample{s}"] = ap
-                auprc_values.append(ap)
-
-            if auprc_values:
-                metrics[f"{modality}_auprc_mean"] = float(np.mean(auprc_values))
-
-        # --- per-sample rows (only when compute_per_sample=True) ---
         if compute_per_sample:
             # Infer n_s from junction accumulation, fallback to usage
             n_s = None
@@ -2377,28 +2301,6 @@ def validate_multihead(
                                 if all_pred.shape[0] > 1:
                                     r = pearson_r(all_pred.unsqueeze(0), all_true.unsqueeze(0), dim=1)
                                     per_sample_metrics[s][metric_key] = r.item()
-
-                # Junction AUPRC per sample (average pos-strand[s] and neg-strand[s+n_s])
-                for modality in heads:
-                    hm = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
-                    if not isinstance(hm, SpliceSitesJunctionHead):
-                        continue
-                    if not accumulated_junc_cls[modality]:
-                        continue
-                    for s in range(n_s):
-                        auprc_vals = []
-                        for strand_key in (s, s + n_s):
-                            if strand_key not in accumulated_junc_cls[modality]:
-                                continue
-                            data = accumulated_junc_cls[modality][strand_key]
-                            all_scores = torch.cat(data["scores"]).numpy()
-                            all_labels = torch.cat(data["labels"]).numpy()
-                            n_pos = all_labels.sum()
-                            if n_pos == 0 or n_pos == len(all_labels):
-                                continue
-                            auprc_vals.append(average_precision_score(all_labels, all_scores))
-                        if auprc_vals:
-                            per_sample_metrics[s][f"{modality}_auprc"] = float(np.mean(auprc_vals))
 
                 # Usage Pearson per sample
                 for modality in heads:
@@ -2449,14 +2351,15 @@ def validate_multihead(
                     ap = average_precision_score(true_flat[:, i], probs_flat[:, i])
                     metrics[f"{modality}_auprc_{cls_name}"] = ap
 
-            # Macro average over splice-site classes only (exclude no_site = index 0)
+            # Macro and weighted average over splice-site classes only (exclude no_site)
             splice_cols = [i for i, n in enumerate(_CLS_NAMES) if n != "no_site"
                            and true_flat[:, i].sum() > 0]
             if splice_cols:
-                macro_ap = average_precision_score(
-                    true_flat[:, splice_cols], probs_flat[:, splice_cols], average="macro"
-                )
-                metrics[f"{modality}_auprc_macro"] = macro_ap
+                per_class_aps = [metrics[f"{modality}_auprc_{_CLS_NAMES[i]}"] for i in splice_cols]
+                metrics[f"{modality}_auprc_macro"] = sum(per_class_aps) / len(per_class_aps)
+                weights = [true_flat[:, i].sum() for i in splice_cols]
+                total = sum(weights)
+                metrics[f"{modality}_auprc_weighted"] = sum(ap * w / total for ap, w in zip(per_class_aps, weights))
 
     return avg_loss, metrics
 
