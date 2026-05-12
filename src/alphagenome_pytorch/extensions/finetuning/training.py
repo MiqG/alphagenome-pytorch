@@ -27,6 +27,7 @@ from tqdm import tqdm
 from alphagenome_pytorch.losses import (
     multinomial_loss,
     cross_entropy_loss,
+    cross_entropy_loss_normalized,
     cross_entropy_loss_from_logits,
     binary_crossentropy_from_logits,
     poisson_loss,
@@ -225,12 +226,18 @@ def _soft_clip_counts(counts: torch.Tensor, clip: float = 10.0) -> torch.Tensor:
     return torch.where(counts > clip, 2.0 * torch.sqrt(counts * clip) - clip, counts)
 
 
-def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_pos, device):
+def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_pos, device,
+                                   junction_loss: str = "original"):
     """Strand-specific junction loss matching JAX SpliceSitesJunctionHead.loss.
 
     loss = 0.2 * (CE(axis=donor) + CE(axis=acceptor)) + 0.04 * (Poisson(axis=donor) + Poisson(axis=acceptor))
 
     pairs_mask[b,d,a,s] = (donor_pos[b,d] >= 0) & (accept_pos[b,a] >= 0)
+
+    Args:
+        junction_loss: "original" uses cross_entropy_loss (JAX pre-de264f5);
+                       "normalized" uses cross_entropy_loss_normalized (JAX post-de264f5,
+                       both targets and predictions normalized to ratios within mask).
     """
     valid_d = (donor_pos >= 0).float()
     valid_a = (accept_pos >= 0).float()
@@ -248,8 +255,9 @@ def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_
     if not (target > 0).any():
         return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
 
-    donor_ratios_loss    = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
-    acceptor_ratios_loss = cross_entropy_loss(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
+    _ce = cross_entropy_loss_normalized if junction_loss == "normalized" else cross_entropy_loss
+    donor_ratios_loss    = _ce(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
+    acceptor_ratios_loss = _ce(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
 
     sum_pred_d = pred.sum(dim=1)
     sum_tgt_d  = _soft_clip_counts(target.sum(dim=1))
@@ -261,7 +269,8 @@ def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_
     return 0.2 * (donor_ratios_loss + acceptor_ratios_loss) + 0.04 * (donor_total_loss + accept_total_loss)
 
 
-def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: int = 1):
+def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: int = 1,
+                         junction_loss: str = "original"):
     """Compute loss for any of the three splice head types.
 
     Args:
@@ -276,6 +285,8 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
             fewer splice sites relative to a global mean, since each partition
             contributes equally regardless of how many valid positions it contains.
             Defaults to 1 (standard global mean, unchanged behaviour).
+        junction_loss: Cross-entropy variant for the junction head. "original" matches
+            JAX pre-de264f5; "normalized" matches JAX post-de264f5 (ratio CE).
 
     Returns:
         (loss_tensor, components_dict) where components_dict has keys like
@@ -339,15 +350,126 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
         pos_loss = _compute_junction_strand_loss(
             predictions["pos_counts"], junc_matrix[..., :n_s],
             positions[:, 0, :].long(), positions[:, 1, :].long(), device,
+            junction_loss=junction_loss,
         )
         neg_loss = _compute_junction_strand_loss(
             predictions["neg_counts"], junc_matrix[..., n_s:],
             positions[:, 2, :].long(), positions[:, 3, :].long(), device,
+            junction_loss=junction_loss,
         )
         loss = pos_loss + neg_loss
         return loss, {"junction_pos_loss": pos_loss.item(), "junction_neg_loss": neg_loss.item()}
 
     return torch.tensor(0.0, device=device), {}
+
+
+def _extract_junction_cls_per_sample(predictions, targets_dict, device):
+    """Extract per-sample (scores, binary_labels) for junction true/false classification.
+
+    Positive: valid (donor, acceptor) pair with target count > 0 (observed in RNA-seq).
+    Negative: valid pair with target count == 0 (splice sites present but junction absent).
+
+    Returns list of (scores, labels) tensors of length 2*n_tissues
+    (first n_tissues = pos strand, last n_tissues = neg strand), or None.
+    """
+    if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
+        return None
+
+    junc_matrix = targets_dict["junction_matrix"].to(device)  # (B, D, A, 2*n_s)
+    positions   = targets_dict["junction_positions"].to(device)  # (B, 4, P)
+    n_s = junc_matrix.shape[-1] // 2
+
+    per_sample = []
+    for pred_key, tgt_slice, donor_row, accept_row in [
+        ("pos_counts", slice(None, n_s),  0, 1),
+        ("neg_counts", slice(n_s, None),  2, 3),
+    ]:
+        pred_counts = predictions[pred_key]                       # (B, D, A, n_s)
+        tgt_counts  = junc_matrix[:, :, :, tgt_slice]            # (B, D, A, n_s)
+        donor_pos   = positions[:, donor_row,  :].long()
+        accept_pos  = positions[:, accept_row, :].long()
+        pairs_mask  = torch.einsum(
+            "bd,ba->bda",
+            (donor_pos >= 0).float(),
+            (accept_pos >= 0).float(),
+        ).bool()                                                   # (B, D, A)
+
+        for s in range(n_s):
+            scores_s = pred_counts[:, :, :, s][pairs_mask].float().cpu()
+            labels_s = (tgt_counts[:, :, :, s][pairs_mask] > 0).float().cpu()
+            per_sample.append((scores_s, labels_s))
+
+    return per_sample  # length 2*n_s
+
+
+def _extract_junction_pearson_per_sample(predictions, targets_dict, device):
+    """Per-biological-sample (pred, true) tensors for junction Pearson.
+
+    Combines pos+neg strand data for each biological sample.
+    Returns list of n_s dicts {"full": (pred, true), "nonzero": (pred[nz], true[nz]) | None},
+    or None if data unavailable.
+    """
+    if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
+        return None
+
+    junc_matrix = targets_dict["junction_matrix"].to(device)  # (B, D, A, 2*n_s)
+    positions   = targets_dict["junction_positions"].to(device)
+    n_s = junc_matrix.shape[-1] // 2
+
+    per_sample_pred = [[] for _ in range(n_s)]
+    per_sample_true = [[] for _ in range(n_s)]
+
+    for pred_key, tgt_slice, donor_row, accept_row in [
+        ("pos_counts", slice(None, n_s),  0, 1),
+        ("neg_counts", slice(n_s, None),  2, 3),
+    ]:
+        pred_strand = predictions[pred_key]
+        tgt_strand  = junc_matrix[:, :, :, tgt_slice]
+        donor_pos   = positions[:, donor_row,  :].long()
+        accept_pos  = positions[:, accept_row, :].long()
+        pairs_mask  = torch.einsum(
+            "bd,ba->bda",
+            (donor_pos >= 0).float(),
+            (accept_pos >= 0).float(),
+        ).bool()
+        for s in range(n_s):
+            per_sample_pred[s].append(pred_strand[:, :, :, s][pairs_mask].float().cpu())
+            per_sample_true[s].append(tgt_strand[:, :, :, s][pairs_mask].float().cpu())
+
+    result = []
+    for s in range(n_s):
+        pred_s = torch.cat(per_sample_pred[s])
+        true_s = torch.cat(per_sample_true[s])
+        nz = true_s > 0
+        result.append({
+            "full":    (pred_s, true_s),
+            "nonzero": (pred_s[nz], true_s[nz]) if nz.any() else None,
+        })
+    return result  # length n_s
+
+
+def _extract_usage_pearson_per_sample(predictions, targets_dict, device):
+    """Per-sample (pred, true) tensors for splice usage Pearson.
+
+    Returns list of n_s (pred_flat, true_flat) tuples, or None per empty sample.
+    """
+    if 1 not in predictions:
+        return None
+    pred   = torch.sigmoid(predictions[1])        # (B, S, n_s)
+    target = targets_dict["usage"].to(device)     # (B, S, n_s)
+    n_s    = pred.shape[-1]
+
+    result = []
+    for s in range(n_s):
+        mask_s = target[:, :, s] > 0
+        if not mask_s.any():
+            result.append(None)
+        else:
+            result.append((
+                pred[:, :, s][mask_s].float().cpu(),
+                target[:, :, s][mask_s].float().cpu(),
+            ))
+    return result  # length n_s
 
 
 def _extract_splice_pearson_pairs(
@@ -1522,6 +1644,7 @@ def train_epoch_multihead(
     save_state: dict | None = None,
     organism_idx: int = 0,
     junction_top_k: int | None = None,
+    junction_loss: str = "original",
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1692,6 +1815,7 @@ def train_epoch_multihead(
                 modality_loss, splice_components = _compute_splice_loss(
                     head_module, predictions, targets_dict, device,
                     num_segments=num_segments,
+                    junction_loss=junction_loss,
                 )
                 for k, v in splice_components.items():
                     loss_components[f"{modality}_{k}"] = v
@@ -1860,6 +1984,8 @@ def validate_multihead(
     encoder_only: bool = False,
     organism_idx: int = 0,
     junction_top_k: int | None = None,
+    junction_loss: str = "original",
+    compute_per_sample: bool = False,
 ) -> tuple[float, dict[str, Any]]:
     """Validate model with multiple modality heads.
 
@@ -1910,6 +2036,21 @@ def validate_multihead(
     accumulated_splice: dict[str, dict[str, dict[str, list[Tensor]]]] = {
         m: {"full": {"pred": [], "true": []}} for m in heads
     }
+
+    # For classification head auPRC: accumulate logits and one-hot targets
+    accumulated_cls: dict[str, dict[str, list[Tensor]]] = {
+        m: {"logits": [], "true": []} for m in heads
+    }
+
+    # For junction true/false classification auPRC: per-sample scores and labels
+    # accumulated_junc_cls[modality][sample_idx] = {"scores": [], "labels": []}
+    accumulated_junc_cls: dict[str, dict[int, dict[str, list]]] = {m: {} for m in heads}
+
+    # For per-sample Pearson (only populated when compute_per_sample=True)
+    # accumulated_junc_ps_pearson[modality] = list[n_s dicts], each {"full":..., "nonzero":...}
+    accumulated_junc_ps_pearson: dict[str, list] = {m: [] for m in heads}
+    # accumulated_usage_ps_pearson[modality] = list[n_s dicts], each {"pred":[], "true":[]}
+    accumulated_usage_ps_pearson: dict[str, list] = {m: [] for m in heads}
 
     if is_main_process(rank):
         pbar = tqdm(val_loader, desc="Validation")
@@ -1979,8 +2120,19 @@ def validate_multihead(
                 modality_loss, _ = _compute_splice_loss(
                     head_module, predictions_scaled, targets_dict, device,
                     num_segments=num_segments,
+                    junction_loss=junction_loss,
                 )
                 if compute_pearson:
+                    # Accumulate logits + one-hot targets for auPRC (classification head only)
+                    if isinstance(head_module, SpliceSitesClassificationHead):
+                        if 1 in predictions_scaled and "probs" in targets_dict:
+                            accumulated_cls[modality]["logits"].append(
+                                predictions_scaled[1].float().cpu()
+                            )
+                            accumulated_cls[modality]["true"].append(
+                                targets_dict["probs"].float().cpu()
+                            )
+
                     result = _extract_splice_pearson_pairs(
                         head_module, predictions_scaled, targets_dict, device
                     )
@@ -1994,12 +2146,51 @@ def validate_multihead(
                                     if variant_data:
                                         accumulated_splice[modality][variant_name]["pred"].append(variant_data["pred"].float().cpu())
                                         accumulated_splice[modality][variant_name]["true"].append(variant_data["true"].float().cpu())
+                            cls_pairs = _extract_junction_cls_per_sample(
+                                predictions_scaled, targets_dict, device
+                            )
+                            if cls_pairs is not None:
+                                for s, (scores_s, labels_s) in enumerate(cls_pairs):
+                                    if s not in accumulated_junc_cls[modality]:
+                                        accumulated_junc_cls[modality][s] = {"scores": [], "labels": []}
+                                    accumulated_junc_cls[modality][s]["scores"].append(scores_s)
+                                    accumulated_junc_cls[modality][s]["labels"].append(labels_s)
+                            if compute_per_sample:
+                                ps_junc = _extract_junction_pearson_per_sample(
+                                    predictions_scaled, targets_dict, device
+                                )
+                                if ps_junc is not None:
+                                    if not accumulated_junc_ps_pearson[modality]:
+                                        accumulated_junc_ps_pearson[modality] = [
+                                            {"full": {"pred": [], "true": []}, "nonzero": {"pred": [], "true": []}}
+                                            for _ in range(len(ps_junc))
+                                        ]
+                                    for s, data in enumerate(ps_junc):
+                                        for variant in ("full", "nonzero"):
+                                            if data[variant] is not None:
+                                                p, t = data[variant]
+                                                accumulated_junc_ps_pearson[modality][s][variant]["pred"].append(p)
+                                                accumulated_junc_ps_pearson[modality][s][variant]["true"].append(t)
                         # For usage head: result is (pred_flat, true_flat) tuple
                         else:
                             _splice_pred, _splice_true = result
                             if _splice_pred is not None:
                                 accumulated_splice[modality]["full"]["pred"].append(_splice_pred.float().cpu())
                                 accumulated_splice[modality]["full"]["true"].append(_splice_true.float().cpu())
+                            if compute_per_sample:
+                                ps_usage = _extract_usage_pearson_per_sample(
+                                    predictions_scaled, targets_dict, device
+                                )
+                                if ps_usage is not None:
+                                    if not accumulated_usage_ps_pearson[modality]:
+                                        accumulated_usage_ps_pearson[modality] = [
+                                            {"pred": [], "true": []} for _ in range(len(ps_usage))
+                                        ]
+                                    for s, item in enumerate(ps_usage):
+                                        if item is not None:
+                                            p, t = item
+                                            accumulated_usage_ps_pearson[modality][s]["pred"].append(p)
+                                            accumulated_usage_ps_pearson[modality][s]["true"].append(t)
             else:
                 for res, weight in res_weights.items():
                     if res not in predictions_scaled or res not in targets_dict:
@@ -2105,7 +2296,9 @@ def validate_multihead(
                     all_pred = gather_tensors(all_pred, world_size, device)
                     all_true = gather_tensors(all_true, world_size, device)
                 if all_pred.shape[0] > 1:
-                    r = pearson_r(all_pred.unsqueeze(0), all_true.unsqueeze(0), dim=1)
+                    _pred_for_r = torch.log1p(all_pred) if is_junction else all_pred
+                    _true_for_r = torch.log1p(all_true) if is_junction else all_true
+                    r = pearson_r(_pred_for_r.unsqueeze(0), _true_for_r.unsqueeze(0), dim=1)
                     metric_key = f"{modality}_pearson_r"
                     if variant_name != "full":
                         metric_key += f"_{variant_name}"
@@ -2118,6 +2311,152 @@ def validate_multihead(
                     all_true = torch.cat(full_true, dim=0)
                     nonzero_frac = (all_true > 0).float().mean().item()
                     metrics[f"{modality}_target_nonzero_frac"] = nonzero_frac
+
+    # Compute junction classification auPRC (aggregate flat keys, and per-sample if requested)
+    if compute_pearson:
+        import numpy as np
+        from sklearn.metrics import average_precision_score
+
+        # --- aggregate auprc_sample{s} / auprc_mean (backward compat, always computed) ---
+        for modality in heads:
+            head_module = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
+            if not isinstance(head_module, SpliceSitesJunctionHead):
+                continue
+            if not accumulated_junc_cls[modality]:
+                continue
+
+            auprc_values = []
+            for s, data in sorted(accumulated_junc_cls[modality].items()):
+                all_scores = torch.cat(data["scores"]).numpy()
+                all_labels = torch.cat(data["labels"]).numpy()
+                n_pos = all_labels.sum()
+                if n_pos == 0 or n_pos == len(all_labels):
+                    continue
+                ap = average_precision_score(all_labels, all_scores)
+                metrics[f"{modality}_auprc_sample{s}"] = ap
+                auprc_values.append(ap)
+
+            if auprc_values:
+                metrics[f"{modality}_auprc_mean"] = float(np.mean(auprc_values))
+
+        # --- per-sample rows (only when compute_per_sample=True) ---
+        if compute_per_sample:
+            # Infer n_s from junction accumulation, fallback to usage
+            n_s = None
+            junc_modality = None
+            for m in heads:
+                if accumulated_junc_ps_pearson[m]:
+                    n_s = len(accumulated_junc_ps_pearson[m])
+                    junc_modality = m
+                    break
+            if n_s is None:
+                for m in heads:
+                    if accumulated_usage_ps_pearson[m]:
+                        n_s = len(accumulated_usage_ps_pearson[m])
+                        break
+
+            if n_s is not None:
+                per_sample_metrics = [{} for _ in range(n_s)]
+
+                # Junction Pearson per sample (log1p)
+                for modality in heads:
+                    hm = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
+                    if not isinstance(hm, SpliceSitesJunctionHead):
+                        continue
+                    for s in range(n_s):
+                        if not accumulated_junc_ps_pearson[modality] or s >= len(accumulated_junc_ps_pearson[modality]):
+                            continue
+                        for variant, metric_key in [
+                            ("full",    f"{modality}_pearson_r"),
+                            ("nonzero", f"{modality}_pearson_r_nonzero"),
+                        ]:
+                            data = accumulated_junc_ps_pearson[modality][s][variant]
+                            if data["pred"]:
+                                all_pred = torch.log1p(torch.cat(data["pred"]))
+                                all_true = torch.log1p(torch.cat(data["true"]))
+                                if all_pred.shape[0] > 1:
+                                    r = pearson_r(all_pred.unsqueeze(0), all_true.unsqueeze(0), dim=1)
+                                    per_sample_metrics[s][metric_key] = r.item()
+
+                # Junction AUPRC per sample (average pos-strand[s] and neg-strand[s+n_s])
+                for modality in heads:
+                    hm = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
+                    if not isinstance(hm, SpliceSitesJunctionHead):
+                        continue
+                    if not accumulated_junc_cls[modality]:
+                        continue
+                    for s in range(n_s):
+                        auprc_vals = []
+                        for strand_key in (s, s + n_s):
+                            if strand_key not in accumulated_junc_cls[modality]:
+                                continue
+                            data = accumulated_junc_cls[modality][strand_key]
+                            all_scores = torch.cat(data["scores"]).numpy()
+                            all_labels = torch.cat(data["labels"]).numpy()
+                            n_pos = all_labels.sum()
+                            if n_pos == 0 or n_pos == len(all_labels):
+                                continue
+                            auprc_vals.append(average_precision_score(all_labels, all_scores))
+                        if auprc_vals:
+                            per_sample_metrics[s][f"{modality}_auprc"] = float(np.mean(auprc_vals))
+
+                # Usage Pearson per sample
+                for modality in heads:
+                    hm = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
+                    if not isinstance(hm, SpliceSitesUsageHead):
+                        continue
+                    for s in range(n_s):
+                        if not accumulated_usage_ps_pearson[modality] or s >= len(accumulated_usage_ps_pearson[modality]):
+                            continue
+                        data = accumulated_usage_ps_pearson[modality][s]
+                        if data["pred"]:
+                            all_pred = torch.cat(data["pred"])
+                            all_true = torch.cat(data["true"])
+                            if all_pred.shape[0] > 1:
+                                r = pearson_r(all_pred.unsqueeze(0), all_true.unsqueeze(0), dim=1)
+                                per_sample_metrics[s][f"{modality}_pearson_r"] = r.item()
+
+                metrics["_per_sample"] = per_sample_metrics
+
+    # Compute auPRC for classification head
+    if compute_pearson:
+        import torch.nn.functional as F
+        from sklearn.metrics import average_precision_score
+
+        _CLS_NAMES = ["donor_pos", "acceptor_pos", "donor_neg", "acceptor_neg", "no_site"]
+
+        for modality in heads:
+            head_module = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
+            if not isinstance(head_module, SpliceSitesClassificationHead):
+                continue
+            if not accumulated_cls[modality]["logits"]:
+                continue
+
+            all_logits = torch.cat(accumulated_cls[modality]["logits"], dim=0)  # (N, S, 5)
+            all_true   = torch.cat(accumulated_cls[modality]["true"],   dim=0)  # (N, S, 5)
+            probs = F.softmax(all_logits, dim=-1)
+
+            # Keep only positions where any class is active
+            active = all_true.any(dim=-1).reshape(-1)
+            probs_flat = probs.reshape(-1, 5)[active].numpy()
+            true_flat  = all_true.reshape(-1, 5)[active].numpy()
+
+            if true_flat.shape[0] == 0:
+                continue
+
+            for i, cls_name in enumerate(_CLS_NAMES):
+                if true_flat[:, i].sum() > 0:
+                    ap = average_precision_score(true_flat[:, i], probs_flat[:, i])
+                    metrics[f"{modality}_auprc_{cls_name}"] = ap
+
+            # Macro average over splice-site classes only (exclude no_site = index 0)
+            splice_cols = [i for i, n in enumerate(_CLS_NAMES) if n != "no_site"
+                           and true_flat[:, i].sum() > 0]
+            if splice_cols:
+                macro_ap = average_precision_score(
+                    true_flat[:, splice_cols], probs_flat[:, splice_cols], average="macro"
+                )
+                metrics[f"{modality}_auprc_macro"] = macro_ap
 
     return avg_loss, metrics
 
@@ -2154,6 +2493,7 @@ def train_epoch_sequence_parallel(
     skip_batches: int = 0,
     save_state: dict | None = None,
     junction_top_k: int | None = None,
+    junction_loss: str = "original",
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with sequence parallelism.
 
@@ -2347,6 +2687,7 @@ def train_epoch_sequence_parallel(
                 modality_loss, splice_components = _compute_splice_loss(
                     head_module, predictions, splice_targets_dict, device,
                     num_segments=num_segments,
+                    junction_loss=junction_loss,
                 )
                 for k, v in splice_components.items():
                     loss_components[f"{modality}_{k}"] = v

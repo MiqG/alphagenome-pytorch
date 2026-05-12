@@ -266,34 +266,50 @@ def cross_entropy_loss(
     log_loss = log_normalizer - log_likelihood
     return _safe_masked_mean(log_loss, mask.any(dim=axis))
 
-def cross_entropy_loss_pseudocode(                                           
-      *,                                                                       
-      y_true: Tensor,                                                          
-      y_pred: Tensor,                                                          
-      mask: Tensor,                                                            
-      axis: int,
-      eps: float = 1e-7,                                                       
-  ) -> Tensor:                                
-      """Multinomial cross-entropy loss on counts (paper pseudocode 
-  formulation).                               
-                                                                               
-      Args:
-          y_true: Target counts.                                               
-          y_pred: Predicted counts.
-          mask: Boolean mask.                                                  
-          axis: Axis for normalization.
-          eps: Small epsilon for numerical stability.
+def cross_entropy_loss_normalized(
+    *,
+    y_true: Tensor,
+    y_pred: Tensor,
+    mask: Tensor,
+    axis: int,
+    eps: float = 1e-7,
+) -> Tensor:
+    """Cross entropy loss on counts — normalized (ratio) formulation.
 
-      Returns:
-          Scalar loss.
-      """                                     
-      mask = mask.expand_as(y_true)       
-      assert y_true.shape == y_pred.shape == mask.shape
-                                                                               
-      y_pred_m = torch.where(mask, y_pred.float(), torch.zeros_like(y_pred.float()))
-      y_true_m = torch.where(mask, y_true.float(), torch.zeros_like(y_true.float()))           
-                                          
-      pred_ratios = (y_pred_m + eps) / (y_pred_m + eps).sum(dim=axis, keepdim=True)
-      n_valid = mask.float().sum().clamp(min=1.0)
-      return -(y_true_m * torch.log(pred_ratios)).sum() / n_valid
+    Port of the JAX implementation after commit de264f5 in alphagenome_research.
+    Both y_true and y_pred are explicitly normalized to probability ratios within
+    masked positions before computing CE, and eps is added to y_true for label
+    smoothing. Fully-masked axes are handled to prevent NaN propagation.
+
+    Args:
+        y_true: Target counts.
+        y_pred: Predicted counts.
+        mask: Boolean mask.
+        axis: Axis for normalization.
+        eps: Small epsilon for numerical stability and label smoothing.
+
+    Returns:
+        Scalar loss.
+    """
+    mask = mask.expand_as(y_true)
+    assert y_true.shape == y_pred.shape == mask.shape
+
+    y_true = y_true.float() + eps
+    y_pred = y_pred.float() + eps
+
+    # For fully-masked axes, temporarily set mask to True to prevent NaN in
+    # the normalizer; these positions are masked out in the final mean.
+    axis_mask = mask.sum(dim=axis, keepdim=True) > 0
+    mask_safe = torch.where(axis_mask, mask, torch.ones_like(mask))
+
+    p_true = y_true / (y_true * mask_safe).sum(dim=axis, keepdim=True)
+    p_pred = y_pred / (y_pred * mask_safe).sum(dim=axis, keepdim=True)
+
+    log_loss = torch.where(
+        mask_safe,
+        -p_true * torch.log(p_pred),
+        torch.zeros_like(y_true),
+    ).sum(dim=axis)
+
+    return _safe_masked_mean(log_loss, axis_mask.squeeze(dim=axis))
 

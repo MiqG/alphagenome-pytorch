@@ -62,6 +62,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -368,6 +369,18 @@ def parse_args() -> argparse.Namespace:
         choices=["truncated_normal", "uniform"],
         help="Head weight initialization",
     )
+    model.add_argument(
+        "--rope-init",
+        type=str,
+        default="truncated_normal",
+        choices=["truncated_normal", "zeros"],
+        help=(
+            "RoPE parameter initialization for the splice junction head. "
+            "'truncated_normal' (default) matches the JAX pretrained weight distribution. "
+            "'zeros' replicates the original (buggy) JAX init that blocks gradient flow; "
+            "use only for ablation experiments."
+        ),
+    )
     model.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing")
 
     # Training arguments
@@ -416,6 +429,19 @@ def parse_args() -> argparse.Namespace:
             "to select when --junction-position-source=predicted. Default: 512."
         ),
     )
+    train.add_argument(
+        "--junction-loss",
+        type=str,
+        default="original",
+        choices=["original", "normalized"],
+        help=(
+            "Cross-entropy variant for the splice junction head loss. "
+            "'original' (default) matches JAX pre-de264f5: log-space decomposition, "
+            "y_pred not explicitly normalized. "
+            "'normalized' matches JAX post-de264f5: both targets and predictions "
+            "normalized to ratios within masked positions before computing CE."
+        ),
+    )
     train.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])
     train.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision")
     train.add_argument("--track-means-samples", type=int, default=None, help="Samples for track means (default: all)")
@@ -423,6 +449,7 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--compile", action="store_true", help="Use torch.compile")
     train.add_argument("--seed", type=int, default=None, help="Random seed")
     train.add_argument("--eval-train-pearson", action="store_true", help="Run an eval pass on train set each epoch to compute Pearson R")
+    train.add_argument("--metrics-per-sample", action="store_true", default=False, help="Also write per-biological-sample rows to epoch_log.csv (splice_junctions and splice_usage only)")
     train.add_argument("--eval-only", action="store_true", help="Load checkpoint and run validation metrics without training; outputs to eval_only_metrics.json")
 
     # Distributed/Sequence Parallel arguments
@@ -958,7 +985,7 @@ def create_datasets(
         resolutions = args.modality_resolutions[modality]
         if modality in SPLICE_MODALITIES:
             junc_files = args.modality_to_star_junctions.get(modality, [])
-            ssu_files = args.modality_to_ssu_files.get(modality, [])
+            ssu_files = args.modality_to_ssu_files.get(modality) or []
             # Cache by (junction files, ssu files) tuple to share datasets for co-expanded modalities
             junc_key = (tuple(sorted(junc_files)), tuple(sorted(ssu_files)))
             if junc_key not in _splice_dataset_cache:
@@ -1148,6 +1175,7 @@ def create_model(
             track_means=track_means,
             init_scheme=args.head_init_scheme,
             encoder_only=is_encoder_only,
+            rope_init=args.rope_init,
         )
         add_head(model, modality, head)
         heads[modality] = head
@@ -1552,6 +1580,8 @@ def main() -> None:
                 world_size=world_size,
                 encoder_only=encoder_only,
                 junction_top_k=args.junction_top_k,
+                junction_loss=args.junction_loss,
+                compute_per_sample=args.metrics_per_sample,
             )
         else:
             val_loss, val_metrics = validate_multihead(
@@ -1570,6 +1600,8 @@ def main() -> None:
                 world_size=world_size,
                 encoder_only=encoder_only,
                 junction_top_k=args.junction_top_k,
+                junction_loss=args.junction_loss,
+                compute_per_sample=args.metrics_per_sample,
             )
 
         # Optionally run on train set if eval-train-pearson is set
@@ -1592,6 +1624,8 @@ def main() -> None:
                     world_size=world_size,
                     encoder_only=encoder_only,
                     junction_top_k=args.junction_top_k,
+                    junction_loss=args.junction_loss,
+                    compute_per_sample=args.metrics_per_sample,
                 )
             else:
                 train_loss, train_metrics = validate_multihead(
@@ -1610,6 +1644,8 @@ def main() -> None:
                     world_size=world_size,
                     encoder_only=encoder_only,
                     junction_top_k=args.junction_top_k,
+                    junction_loss=args.junction_loss,
+                    compute_per_sample=args.metrics_per_sample,
                 )
             train_metrics = {f"train_{k}": v for k, v in train_metrics.items()}
 
@@ -1653,6 +1689,8 @@ def main() -> None:
             # Clear GPU cache between epochs for robustness
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats(device)
+            _epoch_t0 = time.perf_counter()
 
             # Training
             epoch_skip = skip_batches if epoch == start_epoch else 0
@@ -1691,6 +1729,7 @@ def main() -> None:
                     skip_batches=epoch_skip,
                     save_state=_save_state,
                     junction_top_k=args.junction_top_k,
+                    junction_loss=args.junction_loss,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
@@ -1726,6 +1765,7 @@ def main() -> None:
                     save_state=_save_state,
                     organism_idx=args.organism_idx,
                     junction_top_k=args.junction_top_k,
+                    junction_loss=args.junction_loss,
                 )
 
             skip_batches = 0  # Only skip on first resumed epoch
@@ -1770,6 +1810,8 @@ def main() -> None:
                     encoder_only=encoder_only,
                     junction_top_k=args.junction_top_k,
                     organism_idx=args.organism_idx,
+                    junction_loss=args.junction_loss,
+                    compute_per_sample=args.metrics_per_sample,
                 )
 
             # Validation (always use multihead since we always have multimodal dataset format now)
@@ -1791,6 +1833,8 @@ def main() -> None:
                 encoder_only=encoder_only,
                 junction_top_k=args.junction_top_k,
                 organism_idx=args.organism_idx,
+                junction_loss=args.junction_loss,
+                compute_per_sample=args.metrics_per_sample,
             )
 
             # Synchronize CUDA to ensure all validation ops complete before next epoch
@@ -1815,25 +1859,48 @@ def main() -> None:
                 for key, val in train_eval_metrics.items():
                     if key.endswith("_values") or key.endswith("_std"):
                         continue
-                    if "pearson" in key:
+                    if "pearson" in key or "auprc" in key:
                         summary += f", train_{key}={val:.4f}"
                 print(summary)
 
             # Log epoch
             extra = {}
+            for mod, mod_loss in per_modality_train_loss.items():
+                extra[f"train_loss_{mod}"] = mod_loss
             histograms = {}
             for key, val in val_metrics.items():
+                if key == "_per_sample":
+                    continue
                 if key.endswith("_values"):
                     histograms[key] = val
-                elif "pearson" in key:
+                elif "pearson" in key or "auprc" in key:
                     extra[key] = val
                 else:
                     extra[f"val_loss_{key}"] = val
             for key, val in train_eval_metrics.items():
+                if key == "_per_sample":
+                    continue
                 if key.endswith("_values"):
                     histograms[f"train_{key}"] = val
-                elif "pearson" in key:
+                elif "pearson" in key or "auprc" in key:
                     extra[f"train_{key}"] = val
+
+            # Merge val + train per-sample metric dicts
+            val_ps   = val_metrics.get("_per_sample")
+            train_ps = train_eval_metrics.get("_per_sample")
+            if val_ps or train_ps:
+                n_s = len(val_ps or train_ps)
+                combined_ps = [{} for _ in range(n_s)]
+                for s in range(n_s):
+                    if val_ps and s < len(val_ps):
+                        combined_ps[s].update(val_ps[s])
+                    if train_ps and s < len(train_ps):
+                        combined_ps[s].update({f"train_{k}": v for k, v in train_ps[s].items()})
+                extra["_per_sample"] = combined_ps
+
+            extra["epoch_wall_time_s"] = time.perf_counter() - _epoch_t0
+            if torch.cuda.is_available():
+                extra["peak_gpu_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
 
             logger.log_epoch(epoch, train_loss, val_loss, current_lr, is_best, extra, histograms)
 

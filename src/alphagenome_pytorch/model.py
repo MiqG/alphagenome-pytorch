@@ -181,6 +181,7 @@ class AlphaGenome(nn.Module):
         dtype_policy: Optional[DtypePolicy] = None,
         track_means_dict: Optional[dict] = None,
         gradient_checkpointing: bool = False,
+        rope_init: str = "truncated_normal",
     ):
         """Initialize AlphaGenome model."""
         super().__init__()
@@ -299,6 +300,7 @@ class AlphaGenome(nn.Module):
             num_tissues=max(splice_junction_tracks_per_organism),
             num_organisms=num_organisms,
             num_tracks_per_organism=splice_junction_tracks_per_organism,
+            rope_init=rope_init,
         )
 
         # Convert model parameters to params_dtype

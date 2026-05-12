@@ -40,6 +40,7 @@ def create_finetuning_head(
     track_means: torch.Tensor | None = None,
     init_scheme: Literal['truncated_normal', 'uniform'] = 'truncated_normal',
     encoder_only: bool = False,
+    rope_init: str = "truncated_normal",
 ) -> nn.Module:
     """Create a finetuning head configured for the given assay type.
 
@@ -77,7 +78,8 @@ def create_finetuning_head(
     if assay_type == 'splice_usage':
         return SpliceSitesUsageHead(in_channels=1536, num_output_tracks=n_tracks, num_organisms=1)
     if assay_type == 'splice_junctions':
-        return SpliceSitesJunctionHead(in_channels=1536, num_tissues=n_tracks, num_organisms=1)
+        return SpliceSitesJunctionHead(in_channels=1536, num_tissues=n_tracks, num_organisms=1,
+                                       rope_init=rope_init)
 
     assay_config = ASSAY_TYPES[assay_type]
 

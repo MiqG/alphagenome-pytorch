@@ -516,6 +516,7 @@ class SpliceSitesJunctionHead(nn.Module):
         num_tissues=NUM_SPLICE_TISSUES,
         num_organisms=2,
         num_tracks_per_organism=None,
+        rope_init: str = "truncated_normal",
     ):
         super().__init__()
         self._num_organisms = num_organisms
@@ -554,15 +555,18 @@ class SpliceSitesJunctionHead(nn.Module):
         )
 
         def make_rope_params():
-            # TruncatedNormal(0.1) matches the JAX reference init and the pretrained weight
-            # distribution (mean≈0, std≈0.1). Zero-init blocks gradient flow during finetuning;
-            # scale=1/offset=0 injects a spurious large signal. See alphagenome_research commit
-            # e2acbfae: "Fix RoPE param initialization in splice junction head for finetuning."
-            std = 0.1
-            params = torch.nn.init.trunc_normal_(
-                torch.empty(self._num_organisms, 2, self._num_tissues, self._hidden_dim),
-                mean=0.0, std=std, a=-2 * std, b=2 * std,
-            )
+            shape = (self._num_organisms, 2, self._num_tissues, self._hidden_dim)
+            if rope_init == "zeros":
+                # Original (buggy) JAX init: zeros block gradient flow during finetuning.
+                # Retained only for ablation experiments.
+                params = torch.zeros(shape)
+            else:
+                # TruncatedNormal(0.1) matches the JAX reference init and the pretrained
+                # weight distribution. See alphagenome_research commit e2acbfae.
+                std = 0.1
+                params = torch.nn.init.trunc_normal_(
+                    torch.empty(shape), mean=0.0, std=std, a=-2 * std, b=2 * std,
+                )
             return nn.Parameter(params)
 
         self.rope_params = nn.ParameterDict({

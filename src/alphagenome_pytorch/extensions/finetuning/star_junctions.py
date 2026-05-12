@@ -461,12 +461,12 @@ def ssu_to_arrays_by_strand(
 ) -> "tuple[np.ndarray, np.ndarray]":
     """Build per-strand SSU value arrays for one sample within a window.
 
-    Places each site's SSU value (ssu_full if present, else ssu_approx) at
+    Places each site's SSU value (ssu_spliser > ssu_full > ssu_approx) at
     its 0-based relative position; all other positions are 0.
 
     Args:
         ssu_df: SSU DataFrame already filtered to the window, with columns:
-            chrom, position (1-based exonic), strand, ssu_approx, optionally ssu_full.
+            chrom, position (1-based exonic), strand, ssu_approx, optionally ssu_full / ssu_spliser.
         chrom: Chromosome name of the window.
         start: 0-based genomic start of the window.
         seq_len: Length of the window in base pairs.
@@ -481,7 +481,12 @@ def ssu_to_arrays_by_strand(
     if local.empty:
         return pos_arr, neg_arr
 
-    value_col = "ssu_full" if "ssu_full" in local.columns else "ssu_approx"
+    for _col in ("ssu_spliser", "ssu_full", "ssu_approx"):
+        if _col in local.columns:
+            value_col = _col
+            break
+    else:
+        return pos_arr, neg_arr
 
     for _, site in local.iterrows():
         idx = int(site["position"]) - 1 - start  # 1-based → 0-based relative
