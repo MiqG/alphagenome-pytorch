@@ -433,13 +433,16 @@ def parse_args() -> argparse.Namespace:
         "--junction-loss",
         type=str,
         default="original",
-        choices=["original", "normalized"],
+        choices=["original", "normalized", "sparse"],
         help=(
             "Cross-entropy variant for the splice junction head loss. "
             "'original' (default) matches JAX pre-de264f5: log-space decomposition, "
             "y_pred not explicitly normalized. "
             "'normalized' matches JAX post-de264f5: both targets and predictions "
-            "normalized to ratios within masked positions before computing CE."
+            "normalized to ratios within masked positions before computing CE. "
+            "'sparse' restricts CE and Poisson to donors/acceptors that have at least "
+            "one observed junction count, avoiding the suppression gradient from the "
+            "many zero-target positions in sparse training data."
         ),
     )
     train.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"])

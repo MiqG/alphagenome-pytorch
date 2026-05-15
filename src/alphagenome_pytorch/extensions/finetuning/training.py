@@ -255,16 +255,30 @@ def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_
     if not (target > 0).any():
         return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
 
-    _ce = cross_entropy_loss_normalized if junction_loss == "normalized" else cross_entropy_loss
-    donor_ratios_loss    = _ce(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
-    acceptor_ratios_loss = _ce(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
-
     sum_pred_d = pred.sum(dim=1)
     sum_tgt_d  = _soft_clip_counts(target.sum(dim=1))
     sum_pred_a = pred.sum(dim=2)
     sum_tgt_a  = _soft_clip_counts(target.sum(dim=2))
-    donor_total_loss  = poisson_loss(y_true=sum_tgt_d, y_pred=sum_pred_d, mask=pairs_mask.any(dim=1))
-    accept_total_loss = poisson_loss(y_true=sum_tgt_a, y_pred=sum_pred_a, mask=pairs_mask.any(dim=2))
+
+    if junction_loss == "sparse":
+        # Restrict CE and Poisson to donors/acceptors that have observed junction
+        # counts. The standard loss applies Poisson to all 512 positions; for sparse
+        # targets (~45 real junctions) this creates a ~25:1 suppression gradient from
+        # zero-target positions that overwhelms the signal from true junctions.
+        has_d = (sum_tgt_d > 0) & pairs_mask.any(dim=1)  # (B, A, S) acceptors with incoming reads
+        has_a = (sum_tgt_a > 0) & pairs_mask.any(dim=2)  # (B, D, S) donors with outgoing reads
+        ce_mask_d = pairs_mask & has_d.unsqueeze(1).expand_as(pairs_mask)
+        ce_mask_a = pairs_mask & has_a.unsqueeze(2).expand_as(pairs_mask)
+        donor_ratios_loss    = cross_entropy_loss(y_true=target, y_pred=pred, mask=ce_mask_d, axis=1)
+        acceptor_ratios_loss = cross_entropy_loss(y_true=target, y_pred=pred, mask=ce_mask_a, axis=2)
+        donor_total_loss  = poisson_loss(y_true=sum_tgt_d, y_pred=sum_pred_d, mask=has_d)
+        accept_total_loss = poisson_loss(y_true=sum_tgt_a, y_pred=sum_pred_a, mask=has_a)
+    else:
+        _ce = cross_entropy_loss_normalized if junction_loss == "normalized" else cross_entropy_loss
+        donor_ratios_loss    = _ce(y_true=target, y_pred=pred, mask=pairs_mask, axis=1)
+        acceptor_ratios_loss = _ce(y_true=target, y_pred=pred, mask=pairs_mask, axis=2)
+        donor_total_loss  = poisson_loss(y_true=sum_tgt_d, y_pred=sum_pred_d, mask=pairs_mask.any(dim=1))
+        accept_total_loss = poisson_loss(y_true=sum_tgt_a, y_pred=sum_pred_a, mask=pairs_mask.any(dim=2))
 
     return 0.2 * (donor_ratios_loss + acceptor_ratios_loss) + 0.04 * (donor_total_loss + accept_total_loss)
 
