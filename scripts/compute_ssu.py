@@ -34,11 +34,10 @@ from __future__ import annotations
 import argparse
 import bisect
 import sys
+from collections import defaultdict
 from pathlib import Path
-
-# Allow importing from the alphagenome-pytorch package bundled in this repo
-sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-from alphagenome_pytorch.extensions.finetuning.star_junctions import read_star_junctions
+import pandas as pd
+import numpy as np
 
 
 # ------------------------------------------------------------------ #
@@ -64,7 +63,11 @@ def parse_args() -> argparse.Namespace:
     filt.add_argument("--min-unique-reads", type=int, default=1,
                       help="Minimum uniquely mapped reads to retain a junction (default: 1)")
     filt.add_argument("--mapq", type=int, default=30,
-                      help="Minimum MAPQ for β1 BAM reads (default: 30)")
+                      help="Minimum MAPQ for all BAM reads (α, β1, β2 counting and "
+                           "whiteset construction). Use 0 to match SpliSER's "
+                           "unfiltered behaviour (default: 30)")
+    filt.add_argument("--chroms", "-C", nargs="*", default=None, metavar="CHROM",
+                      help="Chromosomes to process (default: all). Space-separated list.")
 
     out = p.add_argument_group("Output")
     out.add_argument("--compression", "-c",
@@ -79,23 +82,74 @@ def parse_args() -> argparse.Namespace:
 # Step 1: load and filter junctions
 # ------------------------------------------------------------------ #
 
-def load_junctions(path: str | Path, min_unique_reads: int) -> "pd.DataFrame":
+_STRAND_MAP = {"0": ".", "1": "+", "2": "-"}
+
+def read_star_junctions(path: str) -> pd.DataFrame:
+    """Read a STAR SJ.out.tab file into a DataFrame.
+
+    Args:
+        path: Path to SJ.out.tab file.
+
+    Returns:
+        DataFrame with columns: chrom, intron_start, intron_end, strand,
+        intron_motif, annotated, n_uniquely_mapped_reads, n_multi_mapped_reads,
+        max_overhang.
+    """
+    df = pd.read_csv(
+        path,
+        sep="\t",
+        header=None,
+        names=[
+            "chrom",
+            "intron_start",
+            "intron_end",
+            "strand_code",
+            "intron_motif",
+            "annotated",
+            "n_uniquely_mapped_reads",
+            "n_multi_mapped_reads",
+            "max_overhang",
+        ],
+        dtype={
+            "chrom": str,
+            "intron_start": np.int64,
+            "intron_end": np.int64,
+            "strand_code": str,
+            "intron_motif": np.int64,
+            "annotated": np.int64,
+            "n_uniquely_mapped_reads": np.int64,
+            "n_multi_mapped_reads": np.int64,
+            "max_overhang": np.int64,
+        },
+    )
+    df["strand"] = df["strand_code"].map(_STRAND_MAP).fillna(".")
+    df = df.drop(columns=["strand_code"])
+    return df
+
+def load_junctions(
+    path: str | Path,
+    min_unique_reads: int,
+    chroms: "list[str] | None" = None,
+) -> "pd.DataFrame":
     """Read and quality-filter a STAR SJ.out.tab file.
 
     Args:
         path: Path to SJ.out.tab.
         min_unique_reads: Minimum n_uniquely_mapped_reads threshold.
+        chroms: Optional list of chromosomes to retain (default: all).
 
     Returns:
         DataFrame with added columns exon_start, exon_end, count.
     """
-    import pandas as pd
 
     junctions = read_star_junctions(str(path))
-    junctions = junctions.loc[
+    mask = (
         (junctions["n_uniquely_mapped_reads"] >= min_unique_reads)
         & (junctions["strand"].isin(["+", "-"]))
-    ].copy()
+    )
+    if chroms is not None:
+        mask &= junctions["chrom"].isin(chroms)
+    junctions = junctions.loc[mask].copy()
     junctions["exon_start"] = junctions["intron_start"] - 1  # last exon base (1-based)
     junctions["exon_end"]   = junctions["intron_end"]   + 1  # first exon base (1-based)
     junctions["count"]      = junctions["n_uniquely_mapped_reads"]
@@ -151,94 +205,8 @@ def compute_alpha_beta2(
 # Step 3: β1 from BAM (optional)
 # ------------------------------------------------------------------ #
 
-def build_beta1_counts(
-    bam_path: str | Path,
-    junctions: "pd.DataFrame",
-    mapq_min: int = 30,
-) -> "dict[tuple[str, int], int]":
-    """Count unspliced reads spanning each splice site (β1).
-
-    Reads the BAM once per chromosome.  A read contributes β1 at a site when
-    it overlaps the site, has MAPQ >= mapq_min, is not a duplicate, has no
-    N CIGAR operation covering the position, and matches the site's strand
-    (via XS tag).
-
-    Args:
-        bam_path: Path to coordinate-sorted, indexed BAM.
-        junctions: Filtered junctions DataFrame (used to derive site positions).
-        mapq_min: Minimum MAPQ filter.
-
-    Returns:
-        Dict mapping (chrom, 0-based position) to β1 count.
-    """
-    try:
-        import pysam
-    except ImportError as e:
-        raise ImportError("pysam is required for β1 computation (--bam mode)") from e
-
-    # Collect all sites: {chrom → {0-based pos → set of strands}}
-    sites_by_chrom: dict[str, dict[int, set[str]]] = {}
-    for _, row in junctions[["chrom", "exon_start", "exon_end", "strand"]].drop_duplicates().iterrows():
-        chrom, strand = row["chrom"], row["strand"]
-        for pos_1based in (row["exon_start"], row["exon_end"]):
-            p0 = int(pos_1based) - 1
-            sites_by_chrom.setdefault(chrom, {}).setdefault(p0, set()).add(strand)
-
-    beta1: dict[tuple[str, int], int] = {
-        (chrom, pos): 0
-        for chrom, sites in sites_by_chrom.items()
-        for pos in sites
-    }
-
-    bam = pysam.AlignmentFile(str(bam_path), "rb")
-    try:
-        for chrom, site_strands in sites_by_chrom.items():
-            sites_sorted = sorted(site_strands)
-            chrom_start  = sites_sorted[0]
-            chrom_end    = sites_sorted[-1] + 1
-
-            for read in bam.fetch(chrom, chrom_start, chrom_end):
-                if read.is_unmapped or read.is_duplicate:
-                    continue
-                if read.mapping_quality < mapq_min:
-                    continue
-                if not read.cigartuples:
-                    continue
-
-                try:
-                    read_strand = read.get_tag("XS")
-                except KeyError:
-                    read_strand = None
-
-                introns: list[tuple[int, int]] = []
-                ref_pos = read.reference_start
-                for op, length in read.cigartuples:
-                    if op == 3:
-                        introns.append((ref_pos, ref_pos + length))
-                        ref_pos += length
-                    elif op in (0, 2, 7, 8):
-                        ref_pos += length
-
-                read_start = read.reference_start
-                read_end   = read.reference_end
-
-                lo = bisect.bisect_left(sites_sorted, read_start)
-                hi = bisect.bisect_right(sites_sorted, read_end - 1)
-
-                for site_pos in sites_sorted[lo:hi]:
-                    if read_strand is not None:
-                        if read_strand not in site_strands[site_pos]:
-                            continue
-                    if not any(iv_s <= site_pos < iv_e for iv_s, iv_e in introns):
-                        beta1[(chrom, site_pos)] += 1
-    finally:
-        bam.close()
-
-    return beta1
-
-
 # ------------------------------------------------------------------ #
-# Step 3b: SpliSER-equivalent counts from BAM (all α, β1, β2 from BAM)
+# Step 3: SpliSER-equivalent counts from BAM (all α, β1, β2 from BAM)
 # ------------------------------------------------------------------ #
 
 def _check_strand_from_flag(flag: int, strandedType: str = "rf") -> str | None:
@@ -275,107 +243,204 @@ def compute_spliser_counts(
 ) -> "pd.DataFrame":
     """Compute SpliSER-equivalent α, β1, β2 for all splice sites from BAM.
 
-    Single BAM pass using find_introns.  Returns DataFrame with columns:
+    Single streaming pass per chromosome — no read buffering.  The target
+    index is pre-built from the junction file so alpha and beta can be
+    accumulated simultaneously as each read is consumed.
+
+    Coordinate note: donor scan pos = exon_start (= iv_s, 0-based intron
+    start); acceptor scan pos = exon_end - 2 (= iv_e - 1, 0-based last
+    intron base).  Both equal the corresponding pysam find_introns keys
+    numerically, so results are identical to the find_introns approach.
+
+    Returns DataFrame with columns:
     chrom, position, strand, role, alpha_bam, beta1_bam, beta2_bam, ssu_spliser.
-    Position uses 1-based exon convention (last exon base for donors,
-    first exon base for acceptors).
     """
     try:
         import pysam
     except ImportError as e:
         raise ImportError("pysam is required for SpliSER computation") from e
 
-    import pandas as pd
-
     bam = pysam.AlignmentFile(str(bam_path), "rb")
 
-    donor_alpha_bam:    dict[tuple[str, int, str], int] = {}
-    acceptor_alpha_bam: dict[tuple[str, int, str], int] = {}
+    donor_alpha_bam:    defaultdict = defaultdict(int)
+    acceptor_alpha_bam: defaultdict = defaultdict(int)
+    beta1_bam: defaultdict = defaultdict(int)
+    beta2_bam: defaultdict = defaultdict(int)
 
-    chroms = junctions["chrom"].unique()
+    for chrom, chrom_junc in junctions.groupby("chrom"):
+        # ── Target index ───────────────────────────────────────────────
+        # donor scan pos    = exon_start      (= iv_s,   0-based intron start)
+        # acceptor scan pos = exon_end - 2    (= iv_e-1, 0-based last intron base)
+        # Sets deduplicate roles so a site shared by N junctions is only
+        # scanned once per read.
+        chrom_target_roles: dict[str, dict[int, set[str]]] = {"+": {}, "-": {}}
 
-    for chrom in chroms:
-        for strand in ("+", "-"):
-            gen = (
-                r for r in bam.fetch(chrom)
-                if not r.is_unmapped
-                and not r.is_secondary
-                and not r.is_supplementary
-                and r.mapping_quality >= mapq_min
-                and _check_strand_from_flag(r.flag, strandedType) == strand
-            )
-            for (iv_s, iv_e), count in bam.find_introns(gen).items():
-                donor_alpha_bam[(chrom, iv_s, strand)]    = donor_alpha_bam.get((chrom, iv_s, strand), 0)    + count
-                acceptor_alpha_bam[(chrom, iv_e, strand)] = acceptor_alpha_bam.get((chrom, iv_e, strand), 0) + count
+        # Partner/competitor maps for SpliSER-compatible beta2 classification.
+        # donor_to_acc[strand][d_pos]  → {a_pos, ...}   (a_pos = iv_e - 1)
+        # acc_to_donor[strand][a_pos]  → {d_pos, ...}
+        donor_to_acc: dict[str, dict] = {"+": defaultdict(set), "-": defaultdict(set)}
+        acc_to_donor: dict[str, dict] = {"+": defaultdict(set), "-": defaultdict(set)}
 
-    all_targets: dict[str, list[int]] = {}
-    target_roles: dict[str, dict[int, list[str]]] = {}
-    acceptor_scan_to_alpha: dict[tuple[int, str], int] = {}
-    for strand in ("+", "-"):
-        pos_set: dict[int, list[str]] = {}
-        for (_, pos, s) in donor_alpha_bam:
-            if s == strand:
-                pos_set.setdefault(pos, []).append("donor")
-        for (_, pos, s) in acceptor_alpha_bam:
-            if s == strand:
-                pos_set.setdefault(pos - 1, []).append("acceptor")
-        all_targets[strand] = sorted(pos_set)
-        target_roles[strand] = pos_set
+        for row in chrom_junc[["strand", "exon_start", "exon_end"]].itertuples(index=False):
+            d_pos = int(row.exon_start)
+            a_pos = int(row.exon_end) - 1
+            s     = row.strand
+            chrom_target_roles[s].setdefault(d_pos, set()).add("donor")
+            chrom_target_roles[s].setdefault(a_pos, set()).add("acceptor")
+            donor_to_acc[s][d_pos].add(a_pos)
+            acc_to_donor[s][a_pos].add(d_pos)
 
-    beta1_bam: dict[tuple[int, str, str], int] = {}
-    beta2_bam: dict[tuple[int, str, str], int] = {}
+        # Competitor maps: sites sharing a partner with this site.
+        # donor_comps[strand][d_pos]  → {competing d_pos', ...}
+        # acc_comps[strand][a_pos]    → {competing a_pos', ...}
+        donor_comps: dict[str, dict] = {"+": defaultdict(set), "-": defaultdict(set)}
+        acc_comps:   dict[str, dict] = {"+": defaultdict(set), "-": defaultdict(set)}
+        # Whiteset + partner map extension: bam.find_introns includes junctions
+        # absent from SJ.out.tab (e.g. non-canonical or low-overhang junctions).
+        # Extending donor_to_acc / acc_to_donor with these gives complete
+        # competitor maps so compSplicing is detected even for STAR-missed partners.
+        # Majority-rule strand collapse (mirrors SpliSER's collapse_duplicate_introns):
+        # for introns seen on both strands, keep only the dominant strand to prevent
+        # antisense-noise reads from polluting the whiteset of the sense strand.
+        whiteset: dict[str, set[int]] = {"+": set(), "-": set()}
+        _gen_p = (
+            r for r in bam.fetch(chrom)
+            if not r.is_unmapped and not r.is_secondary and not r.is_supplementary
+            and r.mapping_quality >= mapq_min
+            and _check_strand_from_flag(r.flag, strandedType) == "+"
+        )
+        _gen_m = (
+            r for r in bam.fetch(chrom)
+            if not r.is_unmapped and not r.is_secondary and not r.is_supplementary
+            and r.mapping_quality >= mapq_min
+            and _check_strand_from_flag(r.flag, strandedType) == "-"
+        )
+        _introns_by_strand: dict[str, dict] = {
+            "+": dict(bam.find_introns(_gen_p)),
+            "-": dict(bam.find_introns(_gen_m)),
+        }
+        for _iv in set(_introns_by_strand["+"]) & set(_introns_by_strand["-"]):
+            if _introns_by_strand["+"][_iv] >= _introns_by_strand["-"][_iv]:
+                _introns_by_strand["+"][_iv] += _introns_by_strand["-"][_iv]
+                del _introns_by_strand["-"][_iv]
+            else:
+                _introns_by_strand["-"][_iv] += _introns_by_strand["+"][_iv]
+                del _introns_by_strand["+"][_iv]
+        for s, _introns_s in _introns_by_strand.items():
+            for iv_s_w, iv_e_w in _introns_s:
+                whiteset[s].add(iv_s_w)
+                whiteset[s].add(iv_e_w)
+                donor_to_acc[s][iv_s_w].add(iv_e_w)
+                acc_to_donor[s][iv_e_w].add(iv_s_w)
 
-    for chrom in chroms:
+        for s in ("+", "-"):
+            for d, acc_set in donor_to_acc[s].items():
+                for a in acc_set:
+                    for other_d in acc_to_donor[s][a]:
+                        if other_d != d:
+                            donor_comps[s][d].add(other_d)
+            for a, don_set in acc_to_donor[s].items():
+                for d in don_set:
+                    for other_a in donor_to_acc[s][d]:
+                        if other_a != a:
+                            acc_comps[s][a].add(other_a)
+
+        chrom_targets: dict[str, list[int]] = {
+            strand: sorted(pos_roles)
+            for strand, pos_roles in chrom_target_roles.items()
+        }
+
+        # Alpha from the collapsed intron dict (same majority-rule as whiteset/SpliSER).
+        chrom_donor_alpha:    defaultdict = defaultdict(int)
+        chrom_acceptor_alpha: defaultdict = defaultdict(int)
+        for s, _introns_s in _introns_by_strand.items():
+            for (iv_s, iv_e), count in _introns_s.items():
+                chrom_donor_alpha[(iv_s, s)]    += count
+                chrom_acceptor_alpha[(iv_e, s)] += count
+
+        # Single streaming pass for beta counting.
         for read in bam.fetch(chrom):
             if read.is_unmapped or read.is_secondary or read.is_supplementary:
                 continue
             if read.mapping_quality < mapq_min:
-                continue
-            if not read.cigartuples:
                 continue
 
             read_strand = _check_strand_from_flag(read.flag, strandedType)
             if read_strand not in ("+", "-"):
                 continue
 
-            introns: list[tuple[int, int]] = []
-            ref_pos = read.reference_start
-            for op, length in read.cigartuples:
-                if op == 3:
-                    introns.append((ref_pos, ref_pos + length))
-                    ref_pos += length
-                elif op in (0, 2, 7, 8):
-                    ref_pos += length
+            # get_blocks() returns contiguous mapped intervals [(start, end), ...].
+            # Introns are the gaps between consecutive blocks.
+            blocks = read.get_blocks()
+            if not blocks:
+                continue
+            introns = [(blocks[i][1], blocks[i + 1][0]) for i in range(len(blocks) - 1)]
 
-            read_start = read.reference_start
-            read_end   = read.reference_end
-
-            targets = all_targets.get(read_strand, [])
-            lo = bisect.bisect_left(targets, read_start)
-            hi = bisect.bisect_right(targets, read_end - 1)
+            # Beta: check junction-file target sites in this read's span.
+            targets = chrom_targets.get(read_strand, [])
+            lo = bisect.bisect_left(targets, read.reference_start)
+            hi = bisect.bisect_right(targets, read.reference_end - 1)
 
             for target_pos in targets[lo:hi]:
-                for role in target_roles[read_strand][target_pos]:
-                    key = (target_pos, read_strand, role)
+                for role in chrom_target_roles[read_strand][target_pos]:
+                    key = (chrom, target_pos, read_strand, role)
 
-                    if not any(iv_s <= target_pos < iv_e for iv_s, iv_e in introns):
-                        beta1_bam[key] = beta1_bam.get(key, 0) + 1
+                    is_in_block = any(bs < target_pos < be for bs, be in blocks)
 
-                    if role == "acceptor":
-                        is_alpha = any(iv_e_r == target_pos + 1 for _, iv_e_r in introns)
-                        if not is_alpha and any(iv_s < target_pos < iv_e for iv_s, iv_e in introns):
-                            beta2_bam[key] = beta2_bam.get(key, 0) + 1
-                    else:
-                        if any(iv_s < target_pos < iv_e for iv_s, iv_e in introns):
-                            beta2_bam[key] = beta2_bam.get(key, 0) + 1
+                    if role == "donor":
+                        # Alpha: intron starts exactly at target_pos.
+                        # Naturally excluded from is_in_block (block ends at iv_s).
+                        is_alpha_r = any(iv_s_r == target_pos for iv_s_r, _ in introns)
+                        is_in_gap  = any(iv_s_r < target_pos < iv_e_r
+                                         for iv_s_r, iv_e_r in introns)
+                        d_partners = donor_to_acc[read_strand].get(target_pos, set())
+                        d_comps    = donor_comps[read_strand].get(target_pos, set())
+                        # compSplicing: read uses a junction (competing_donor → partner_acceptor).
+                        comp_splicing = any(
+                            iv_s_r in d_comps and iv_e_r in d_partners
+                            for iv_s_r, iv_e_r in introns
+                        )
+                    else:  # acceptor
+                        # Alpha: intron ends at target_pos + 1 (= iv_e).
+                        is_alpha_r = any(iv_e_r == target_pos + 1 for _, iv_e_r in introns)
+                        is_in_gap  = any(iv_s_r < target_pos < iv_e_r
+                                         for iv_s_r, iv_e_r in introns)
+                        a_partners = acc_to_donor[read_strand].get(target_pos, set())
+                        a_comps    = acc_comps[read_strand].get(target_pos, set())
+                        comp_splicing = any(
+                            iv_s_r in a_partners and iv_e_r in a_comps
+                            for iv_s_r, iv_e_r in introns
+                        )
+
+                    if not is_alpha_r:
+                        if (is_in_block or is_in_gap) and comp_splicing:
+                            # SimpleBeta2_flanking or SimpleBeta2_beta1type:
+                            # read uses a competing junction while spanning target.
+                            beta2_bam[key] += 1
+                        elif is_in_gap:
+                            # SimpleBeta2_mutuallyExclusive: spanning intron whose
+                            # endpoints are both known sites (SpliSER Whiteset).
+                            ws = whiteset[read_strand]
+                            if any(
+                                iv_s_r < target_pos < iv_e_r
+                                and iv_s_r in ws and iv_e_r in ws
+                                for iv_s_r, iv_e_r in introns
+                            ):
+                                beta2_bam[key] += 1
+                        elif is_in_block:
+                            beta1_bam[key] += 1
+
+        for (pos, strand), count in chrom_donor_alpha.items():
+            donor_alpha_bam[(chrom, pos, strand)] = count
+        for (pos, strand), count in chrom_acceptor_alpha.items():
+            acceptor_alpha_bam[(chrom, pos, strand)] = count
 
     bam.close()
 
     rows = []
     for (chrom, pos, strand), alpha in donor_alpha_bam.items():
-        key  = (pos, strand, "donor")
-        b1   = beta1_bam.get(key, 0)
-        b2   = beta2_bam.get(key, 0)
+        b1    = beta1_bam.get((chrom, pos, strand, "donor"), 0)
+        b2    = beta2_bam.get((chrom, pos, strand, "donor"), 0)
         denom = alpha + b1 + b2
         rows.append({
             "chrom":       chrom,
@@ -388,9 +453,8 @@ def compute_spliser_counts(
             "ssu_spliser": alpha / denom if denom > 0 else float("nan"),
         })
     for (chrom, pos, strand), alpha in acceptor_alpha_bam.items():
-        scan_key = (pos - 1, strand, "acceptor")
-        b1   = beta1_bam.get(scan_key, 0)
-        b2   = beta2_bam.get(scan_key, 0)
+        b1    = beta1_bam.get((chrom, pos, strand, "acceptor"), 0)
+        b2    = beta2_bam.get((chrom, pos, strand, "acceptor"), 0)
         denom = alpha + b1 + b2
         rows.append({
             "chrom":       chrom,
@@ -419,7 +483,6 @@ def assemble_site_table(
     acceptor_alpha: "pd.Series",
     donor_beta2: "pd.Series",
     acceptor_beta2: "pd.Series",
-    beta1_counts: "dict[tuple[str, int], int] | None",
 ) -> "pd.DataFrame":
     """Build one row per splice site with SSU scores.
 
@@ -429,15 +492,12 @@ def assemble_site_table(
         acceptor_alpha: Series indexed by (chrom, exon_end, strand).
         donor_beta2: Series indexed by (chrom, exon_start, strand).
         acceptor_beta2: Series indexed by (chrom, exon_end, strand).
-        beta1_counts: Optional dict (chrom, 0-based pos) → count; None skips SSU full.
 
     Returns:
         DataFrame with columns: chrom, strand, role, exon_pos, intron_pos,
-        alpha_juncs, beta2_juncs, ssu_approx, [beta1_bam, ssu_full].
+        alpha_juncs, beta2_juncs, ssu_approx.
     """
-    import numpy as np
-    import pandas as pd
-
+    
     # Build a lookup from exon coord → intron coord
     donor_intron   = junctions.groupby(["chrom", "exon_start", "strand"])["intron_start"].first()
     acceptor_intron = junctions.groupby(["chrom", "exon_end",   "strand"])["intron_end"].first()
@@ -448,7 +508,7 @@ def assemble_site_table(
         intron_pos = int(donor_intron.get((chrom, exon_pos, strand), exon_pos + 1))
         b2 = int(donor_beta2.get((chrom, exon_pos, strand), 0))
         d_approx = alpha + b2
-        row: dict = {
+        rows.append({
             "chrom":        chrom,
             "strand":       strand,
             "role":         "donor",
@@ -457,19 +517,13 @@ def assemble_site_table(
             "alpha_juncs":  int(alpha),
             "beta2_juncs":  b2,
             "ssu_approx":   alpha / d_approx if d_approx > 0 else float("nan"),
-        }
-        if beta1_counts is not None:
-            b1 = beta1_counts.get((chrom, int(exon_pos) - 1), 0)
-            d_full = alpha + b1 + b2
-            row["beta1_bam"] = int(b1)
-            row["ssu_full"]  = alpha / d_full if d_full > 0 else float("nan")
-        rows.append(row)
+        })
 
     for (chrom, exon_pos, strand), alpha in acceptor_alpha.items():
         intron_pos = int(acceptor_intron.get((chrom, exon_pos, strand), exon_pos - 1))
         b2 = int(acceptor_beta2.get((chrom, exon_pos, strand), 0))
         d_approx = alpha + b2
-        row = {
+        rows.append({
             "chrom":        chrom,
             "strand":       strand,
             "role":         "acceptor",
@@ -478,13 +532,7 @@ def assemble_site_table(
             "alpha_juncs":  int(alpha),
             "beta2_juncs":  b2,
             "ssu_approx":   alpha / d_approx if d_approx > 0 else float("nan"),
-        }
-        if beta1_counts is not None:
-            b1 = beta1_counts.get((chrom, int(exon_pos) - 1), 0)
-            d_full = alpha + b1 + b2
-            row["beta1_bam"] = int(b1)
-            row["ssu_full"]  = alpha / d_full if d_full > 0 else float("nan")
-        rows.append(row)
+        })
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -504,8 +552,10 @@ def main() -> None:
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.chroms:
+        print(f"Restricting to chromosomes: {' '.join(args.chroms)}")
     print(f"Loading junctions from {args.junctions!r} …")
-    junctions = load_junctions(args.junctions, args.min_unique_reads)
+    junctions = load_junctions(args.junctions, args.min_unique_reads, args.chroms)
     print(f"  {len(junctions):,} junctions after quality filtering")
 
     if junctions.empty:
@@ -516,14 +566,8 @@ def main() -> None:
     donor_alpha, acceptor_alpha, donor_beta2, acceptor_beta2 = compute_alpha_beta2(junctions)
     print(f"  {len(donor_alpha):,} donor sites, {len(acceptor_alpha):,} acceptor sites")
 
-    beta1_counts = None
     df_spliser = None
     if args.bam is not None:
-        print(f"Computing β1 from BAM {args.bam!r} …")
-        beta1_counts = build_beta1_counts(args.bam, junctions, args.mapq)
-        total_b1 = sum(beta1_counts.values())
-        print(f"  total β1 reads counted: {total_b1:,}")
-
         print(f"Computing SpliSER-equivalent (all counts from BAM) …")
         df_spliser = compute_spliser_counts(args.bam, junctions, args.mapq)
         print(f"  {len(df_spliser):,} sites with BAM counts")
@@ -533,7 +577,6 @@ def main() -> None:
         junctions,
         donor_alpha, acceptor_alpha,
         donor_beta2, acceptor_beta2,
-        beta1_counts,
     )
     print(f"  {len(df):,} unique splice sites")
 
@@ -545,8 +588,10 @@ def main() -> None:
             right_on=["chrom", "position", "strand", "role"],
             how="left",
         ).drop(columns=["position"])
+        denom = df["alpha_juncs"] + df["beta1_bam"].fillna(0) + df["beta2_juncs"]
+        df["ssu_full"] = (df["alpha_juncs"] / denom).where(denom > 0)
     elif args.bam is not None:
-        for col in ("alpha_bam", "beta1_bam", "beta2_bam", "ssu_spliser"):
+        for col in ("alpha_bam", "beta1_bam", "beta2_bam", "ssu_spliser", "ssu_full"):
             df[col] = float("nan")
 
     n_b2_zero = int((df["beta2_juncs"] == 0).sum())
