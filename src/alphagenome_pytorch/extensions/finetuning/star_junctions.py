@@ -492,6 +492,8 @@ def ssu_to_arrays_by_strand(
         idx = int(site["position"]) - 1 - start  # 1-based → 0-based relative
         if 0 <= idx < seq_len:
             val = float(site[value_col])
+            if np.isnan(val):
+                continue
             if site["strand"] == "+":
                 pos_arr[idx] = val
             elif site["strand"] == "-":

@@ -1177,7 +1177,12 @@ class SplicingDataset(Dataset):
             from alphagenome_pytorch.extensions.finetuning.star_junctions import read_ssu_parquet
             ssu_dfs = [read_ssu_parquet(p, chrom, start, end) for p in self.ssu_files]
 
-            cls_sources = ssu_dfs[:]
+            cls_sources = []
+            for _ssu_df in ssu_dfs:
+                if "ssu_spliser" in _ssu_df.columns:
+                    cls_sources.append(_ssu_df[_ssu_df["ssu_spliser"].notna()])
+                else:
+                    cls_sources.append(_ssu_df)
             if self._gtf_sites is not None:
                 cls_sources.append(self._gtf_sites)
             cls_arr = self._splice_sites_to_classification_array(cls_sources, chrom, start, seq_len)
