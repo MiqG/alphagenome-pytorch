@@ -240,6 +240,15 @@ def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_
                        "normalized" uses cross_entropy_loss_normalized (JAX post-de264f5,
                        both targets and predictions normalized to ratios within mask).
     """
+    assert pred_counts.shape == target_counts.shape, (
+        f"pred_counts {tuple(pred_counts.shape)} and target_counts {tuple(target_counts.shape)} must match"
+    )
+    assert donor_pos.shape[-1] == pred_counts.shape[1], (
+        f"donor positions K={donor_pos.shape[-1]} must equal pred_counts dim-1={pred_counts.shape[1]}"
+    )
+    assert accept_pos.shape[-1] == pred_counts.shape[2], (
+        f"acceptor positions K={accept_pos.shape[-1]} must equal pred_counts dim-2={pred_counts.shape[2]}"
+    )
     valid_d = (donor_pos >= 0).float()
     valid_a = (accept_pos >= 0).float()
     pairs_mask = torch.einsum('bd,ba->bda', valid_d, valid_a).bool()
@@ -297,6 +306,10 @@ def _get_junction_targets(predictions, targets_dict, device):
             junctions_to_junction_matrix,
         )
         pred_pos = predictions["positions"]          # (B, 4, K)
+        assert pred_pos.ndim == 3 and pred_pos.shape[1] == 4, (
+            f"Expected positions shape (B, 4, K), got {tuple(pred_pos.shape)}"
+        )
+        assert (pred_pos >= -1).all(), "positions must be -1 (padding) or a valid 0-based index"
         pred_pos_np = pred_pos.cpu().numpy()
         all_juncs_batch = targets_dict["all_junctions"]  # list[B] of list[DataFrame]
         max_splice_sites = pred_pos_np.shape[-1]
@@ -308,12 +321,20 @@ def _get_junction_targets(predictions, targets_dict, device):
                 positions=pred_pos_np[b],
             )
             mats.append(torch.from_numpy(mat))
-        return torch.stack(mats).to(device), pred_pos
-    else:
-        return (
-            targets_dict["junction_matrix"].to(device),
-            targets_dict["junction_positions"].to(device),
+        junc_matrix = torch.stack(mats).to(device)
+        assert junc_matrix.shape[1] == junc_matrix.shape[2] == pred_pos.shape[2], (
+            f"K mismatch after building junction matrix: "
+            f"junc_matrix {tuple(junc_matrix.shape)} vs positions K={pred_pos.shape[2]}"
         )
+        return junc_matrix, pred_pos
+    else:
+        junc_matrix = targets_dict["junction_matrix"].to(device)
+        positions   = targets_dict["junction_positions"].to(device)
+        assert junc_matrix.shape[1] == junc_matrix.shape[2] == positions.shape[-1], (
+            f"K mismatch in annotated targets: "
+            f"junc_matrix {tuple(junc_matrix.shape)} vs positions {tuple(positions.shape)}"
+        )
+        return junc_matrix, positions
 
 
 def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: int = 1,
