@@ -977,10 +977,16 @@ def collate_multimodal(
                     item[1][modality][key] for item in batch
                 ])
             elif isinstance(key, str):
-                # String keys (junction_positions, junction_matrix): also stack across batch
-                modality_targets[modality][key] = torch.stack([
-                    item[1][modality][key] for item in batch
-                ])
+                first_value = batch[0][1][modality][key]
+                if isinstance(first_value, list):
+                    # List values (e.g. all_junctions): collect per-batch-item lists
+                    modality_targets[modality][key] = [
+                        item[1][modality][key] for item in batch
+                    ]
+                else:
+                    modality_targets[modality][key] = torch.stack([
+                        item[1][modality][key] for item in batch
+                    ])
 
     return sequences, modality_targets
 
@@ -1206,15 +1212,37 @@ class SplicingDataset(Dataset):
 
         # Junction matrix targets (from STAR junction files)
         junc_positions, junc_matrix = self._junctions_to_junction_matrix(
-            self._all_juncs, cls_arr, chrom, start, seq_len,
+            self._all_juncs,
             max_splice_sites=self.max_splice_sites,
+            cls_arr=cls_arr,
+            chrom=chrom,
+            start=start,
+            seq_len=seq_len,
         )
+
+        # Pre-filtered per-sample junctions for predicted-mode target building
+        end = start + seq_len
+        all_junctions = []
+        for junc_df in self._all_juncs:
+            mask = (
+                (junc_df["chrom"] == chrom)
+                & (junc_df["exon_start"] > start)
+                & (junc_df["exon_start"] <= end)
+                & (junc_df["exon_end"] > start)
+                & (junc_df["exon_end"] <= end)
+            )
+            local = junc_df.loc[mask].copy()
+            if not local.empty:
+                local["d_rel"] = local["exon_start"].astype(int) - 1 - start
+                local["a_rel"] = local["exon_end"].astype(int) - 1 - start
+            all_junctions.append(local)
 
         targets_dict = {
             "probs": torch.from_numpy(cls_arr).float(),
             "usage": torch.from_numpy(usage_arr).float(),
             "junction_positions": torch.from_numpy(junc_positions),
             "junction_matrix": torch.from_numpy(junc_matrix),
+            "all_junctions": all_junctions,
         }
         return sequence, targets_dict
 

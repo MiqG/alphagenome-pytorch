@@ -570,104 +570,134 @@ def junctions_to_classification_array(
 
 def junctions_to_junction_matrix(
     all_juncs_list: list[pd.DataFrame],
-    cls_arr: np.ndarray,
-    chrom: str,
-    start: int,
-    seq_len: int,
     max_splice_sites: int = 256,
+    cls_arr: np.ndarray | None = None,
+    positions: np.ndarray | None = None,
+    chrom: str | None = None,
+    start: int | None = None,
+    seq_len: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build a sparse donor×acceptor count matrix for a genomic window.
 
-    Selects the top ``max_splice_sites`` donor and acceptor positions (separately
-    per strand) from ``cls_arr`` — the 5-class classification array already
-    computed for this window.  For every STAR junction whose donor and acceptor
-    both fall within the selected positions, the read count is placed at the
-    corresponding matrix entry.
+    Exactly one of ``cls_arr`` or ``positions`` must be provided.
+
+    **Annotated mode** (``cls_arr`` given):
+      - ``chrom``, ``start``, ``seq_len`` are required.
+      - Positions are derived from ``cls_arr`` columns (0=Donor+, 1=Acceptor+,
+        2=Donor−, 3=Acceptor−).
+      - Junctions are filtered to [start, start+seq_len) inside this function.
+
+    **Predicted mode** (``positions`` given):
+      - ``chrom``, ``start``, ``seq_len`` are ignored.
+      - ``positions`` is used directly (shape ``(4, max_splice_sites)``, padded
+        with ``-1``).
+      - DataFrames in ``all_juncs_list`` must already be pre-filtered to the
+        interval and must contain ``d_rel`` (0-based donor) and ``a_rel``
+        (0-based acceptor) columns.
 
     Args:
-        all_juncs_list: List of junction DataFrames (one per sample), each with
-            columns: chrom, exon_start (1-based), exon_end (1-based), strand, count.
-        cls_arr: Float32 array of shape ``(seq_len, 5)`` — the 5-class one-hot
-            classification array (Donor+, Acceptor+, Donor−, Acceptor−, None).
-        chrom: Chromosome name of the window.
-        start: 0-based genomic start of the window.
-        seq_len: Length of the window in base pairs.
+        all_juncs_list: List of junction DataFrames (one per sample).
         max_splice_sites: Maximum number of splice sites per role (padded with -1).
+        cls_arr: Float32 array ``(seq_len, 5)`` — annotated classification array.
+        positions: int32 array ``(4, max_splice_sites)`` — explicit positions.
+        chrom: Chromosome name (annotated mode only).
+        start: 0-based genomic start (annotated mode only).
+        seq_len: Window length in base pairs (annotated mode only).
 
     Returns:
-        positions: int32 array of shape ``(4, max_splice_sites)`` — relative
-            0-based positions for [pos_donors, pos_acceptors, neg_donors,
-            neg_acceptors], padded with ``-1``.
-        matrix: float32 array of shape
-            ``(max_splice_sites, max_splice_sites, 2 * n_samples)`` —
-            ``matrix[d, a, s]`` is the read count for the positive-strand
-            junction from ``pos_donors[d]`` to ``pos_acceptors[a]`` in sample
-            ``s``.  The second half of the last dimension (indices
-            ``n_samples … 2*n_samples-1``) holds the same for the negative
-            strand using ``neg_donors`` and ``neg_acceptors``.
+        positions: int32 array ``(4, max_splice_sites)`` — [pos_donors,
+            pos_acceptors, neg_donors, neg_acceptors], padded with ``-1``.
+        matrix: float32 array ``(max_splice_sites, max_splice_sites, 2*n_samples)``.
     """
+    if (cls_arr is None) == (positions is None):
+        raise ValueError("Exactly one of cls_arr or positions must be provided.")
+
     n_samples = len(all_juncs_list)
 
-    # Extract positions for each role from cls_arr columns
-    # 0=Donor+, 1=Acceptor+, 2=Donor-, 3=Acceptor-
-    pos_donor_pos = np.where(cls_arr[:, 0] > 0)[0][:max_splice_sites]
-    pos_accept_pos = np.where(cls_arr[:, 1] > 0)[0][:max_splice_sites]
-    neg_donor_pos = np.where(cls_arr[:, 2] > 0)[0][:max_splice_sites]
-    neg_accept_pos = np.where(cls_arr[:, 3] > 0)[0][:max_splice_sites]
+    if cls_arr is not None:
+        # Derive positions from cls_arr (annotated mode)
+        pos_donor_pos  = np.where(cls_arr[:, 0] > 0)[0][:max_splice_sites]
+        pos_accept_pos = np.where(cls_arr[:, 1] > 0)[0][:max_splice_sites]
+        neg_donor_pos  = np.where(cls_arr[:, 2] > 0)[0][:max_splice_sites]
+        neg_accept_pos = np.where(cls_arr[:, 3] > 0)[0][:max_splice_sites]
 
-    def _pad(arr: np.ndarray) -> np.ndarray:
-        out = np.full(max_splice_sites, -1, dtype=np.int32)
-        out[: len(arr)] = arr
-        return out
+        def _pad(arr: np.ndarray) -> np.ndarray:
+            out = np.full(max_splice_sites, -1, dtype=np.int32)
+            out[: len(arr)] = arr
+            return out
 
-    positions = np.stack([
-        _pad(pos_donor_pos),
-        _pad(pos_accept_pos),
-        _pad(neg_donor_pos),
-        _pad(neg_accept_pos),
-    ])  # (4, max_splice_sites)
+        positions = np.stack([
+            _pad(pos_donor_pos),
+            _pad(pos_accept_pos),
+            _pad(neg_donor_pos),
+            _pad(neg_accept_pos),
+        ])  # (4, max_splice_sites)
+    else:
+        # Use provided positions (predicted mode); extract valid entries for lookup
+        pos_donor_pos  = positions[0][positions[0] >= 0]
+        pos_accept_pos = positions[1][positions[1] >= 0]
+        neg_donor_pos  = positions[2][positions[2] >= 0]
+        neg_accept_pos = positions[3][positions[3] >= 0]
+
+    # Build reverse-lookup maps: 0-based relative position → index in positions array
+    pos_donor_map  = {int(p): i for i, p in enumerate(pos_donor_pos)}
+    pos_accept_map = {int(p): i for i, p in enumerate(pos_accept_pos)}
+    neg_donor_map  = {int(p): i for i, p in enumerate(neg_donor_pos)}
+    neg_accept_map = {int(p): i for i, p in enumerate(neg_accept_pos)}
 
     matrix = np.zeros(
         (max_splice_sites, max_splice_sites, 2 * n_samples), dtype=np.float32
     )
 
-    # Build reverse-lookup maps: 0-based relative position → index in positions array
-    pos_donor_map = {int(p): i for i, p in enumerate(pos_donor_pos)}
-    pos_accept_map = {int(p): i for i, p in enumerate(pos_accept_pos)}
-    neg_donor_map = {int(p): i for i, p in enumerate(neg_donor_pos)}
-    neg_accept_map = {int(p): i for i, p in enumerate(neg_accept_pos)}
-
-    end = start + seq_len
-
-    for s, junc_df in enumerate(all_juncs_list):
-        mask = (
-            (junc_df["chrom"] == chrom)
-            & (junc_df["exon_start"] > start)   # 1-based exon_start > start → ≥ start+1
-            & (junc_df["exon_start"] <= end)
-            & (junc_df["exon_end"] > start)
-            & (junc_df["exon_end"] <= end)
-        )
-        local = junc_df.loc[mask]
-        if local.empty:
-            continue
-
-        for _, junc in local.iterrows():
-            # 1-based exon coords → 0-based relative index
-            d_rel = int(junc["exon_start"]) - 1 - start
-            a_rel = int(junc["exon_end"]) - 1 - start
-            count = float(junc["count"])
-            strand = junc["strand"]
-
-            if strand == "+":
-                d_idx = pos_donor_map.get(d_rel)
-                a_idx = pos_accept_map.get(a_rel)
-                if d_idx is not None and a_idx is not None:
-                    matrix[d_idx, a_idx, s] += count
-            elif strand == "-":
-                d_idx = neg_donor_map.get(d_rel)
-                a_idx = neg_accept_map.get(a_rel)
-                if d_idx is not None and a_idx is not None:
-                    matrix[d_idx, a_idx, n_samples + s] += count
+    if cls_arr is not None:
+        # Annotated mode: filter by chrom/window and compute d_rel/a_rel on-the-fly
+        end = start + seq_len
+        for s, junc_df in enumerate(all_juncs_list):
+            mask = (
+                (junc_df["chrom"] == chrom)
+                & (junc_df["exon_start"] > start)
+                & (junc_df["exon_start"] <= end)
+                & (junc_df["exon_end"] > start)
+                & (junc_df["exon_end"] <= end)
+            )
+            local = junc_df.loc[mask]
+            if local.empty:
+                continue
+            for _, junc in local.iterrows():
+                d_rel  = int(junc["exon_start"]) - 1 - start
+                a_rel  = int(junc["exon_end"]) - 1 - start
+                count  = float(junc["count"])
+                strand = junc["strand"]
+                if strand == "+":
+                    d_idx = pos_donor_map.get(d_rel)
+                    a_idx = pos_accept_map.get(a_rel)
+                    if d_idx is not None and a_idx is not None:
+                        matrix[d_idx, a_idx, s] += count
+                elif strand == "-":
+                    d_idx = neg_donor_map.get(d_rel)
+                    a_idx = neg_accept_map.get(a_rel)
+                    if d_idx is not None and a_idx is not None:
+                        matrix[d_idx, a_idx, n_samples + s] += count
+    else:
+        # Predicted mode: DataFrames already filtered; use d_rel/a_rel columns
+        for s, junc_df in enumerate(all_juncs_list):
+            if junc_df.empty:
+                continue
+            for _, junc in junc_df.iterrows():
+                d_rel  = int(junc["d_rel"])
+                a_rel  = int(junc["a_rel"])
+                count  = float(junc["count"])
+                strand = junc["strand"]
+                if strand == "+":
+                    d_idx = pos_donor_map.get(d_rel)
+                    a_idx = pos_accept_map.get(a_rel)
+                    if d_idx is not None and a_idx is not None:
+                        matrix[d_idx, a_idx, s] += count
+                elif strand == "-":
+                    d_idx = neg_donor_map.get(d_rel)
+                    a_idx = neg_accept_map.get(a_rel)
+                    if d_idx is not None and a_idx is not None:
+                        matrix[d_idx, a_idx, n_samples + s] += count
 
     return positions, matrix
 

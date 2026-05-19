@@ -1309,6 +1309,10 @@ def main() -> None:
     """Main training function."""
     args = parse_args()
 
+    # None in annotated mode → _call_splice_head skips cls_head and uses dataset positions.
+    # Dataset is still built with max_splice_sites=args.junction_top_k either way.
+    _junction_top_k = args.junction_top_k if args.junction_position_source == "predicted" else None
+
     # Setup distributed
     rank, world_size, local_rank, device = setup_distributed()
 
@@ -1582,7 +1586,7 @@ def main() -> None:
                 rank=rank,
                 world_size=world_size,
                 encoder_only=encoder_only,
-                junction_top_k=args.junction_top_k,
+                junction_top_k=_junction_top_k,
                 junction_loss=args.junction_loss,
                 compute_per_sample=args.metrics_per_sample,
             )
@@ -1602,7 +1606,7 @@ def main() -> None:
                 rank=rank,
                 world_size=world_size,
                 encoder_only=encoder_only,
-                junction_top_k=args.junction_top_k,
+                junction_top_k=_junction_top_k,
                 junction_loss=args.junction_loss,
                 compute_per_sample=args.metrics_per_sample,
             )
@@ -1626,7 +1630,7 @@ def main() -> None:
                     rank=rank,
                     world_size=world_size,
                     encoder_only=encoder_only,
-                    junction_top_k=args.junction_top_k,
+                    junction_top_k=_junction_top_k,
                     junction_loss=args.junction_loss,
                     compute_per_sample=args.metrics_per_sample,
                 )
@@ -1646,7 +1650,7 @@ def main() -> None:
                     rank=rank,
                     world_size=world_size,
                     encoder_only=encoder_only,
-                    junction_top_k=args.junction_top_k,
+                    junction_top_k=_junction_top_k,
                     junction_loss=args.junction_loss,
                     compute_per_sample=args.metrics_per_sample,
                 )
@@ -1731,7 +1735,7 @@ def main() -> None:
                     global_step_offset=global_step_offset,
                     skip_batches=epoch_skip,
                     save_state=_save_state,
-                    junction_top_k=args.junction_top_k,
+                    junction_top_k=_junction_top_k,
                     junction_loss=args.junction_loss,
                 )
             else:
@@ -1767,7 +1771,7 @@ def main() -> None:
                     skip_batches=epoch_skip,
                     save_state=_save_state,
                     organism_idx=args.organism_idx,
-                    junction_top_k=args.junction_top_k,
+                    junction_top_k=_junction_top_k,
                     junction_loss=args.junction_loss,
                 )
 
@@ -1811,7 +1815,7 @@ def main() -> None:
                     rank=rank,
                     world_size=world_size,
                     encoder_only=encoder_only,
-                    junction_top_k=args.junction_top_k,
+                    junction_top_k=_junction_top_k,
                     organism_idx=args.organism_idx,
                     junction_loss=args.junction_loss,
                     compute_per_sample=args.metrics_per_sample,
@@ -1834,7 +1838,7 @@ def main() -> None:
                 rank=rank,
                 world_size=world_size,
                 encoder_only=encoder_only,
-                junction_top_k=args.junction_top_k,
+                junction_top_k=_junction_top_k,
                 organism_idx=args.organism_idx,
                 junction_loss=args.junction_loss,
                 compute_per_sample=args.metrics_per_sample,

@@ -171,6 +171,7 @@ def _call_splice_head(
         return {
             "pos_counts": out["pred_counts"][..., :n_tissues],
             "neg_counts": out["pred_counts"][..., n_tissues:],
+            "positions":  positions,  # (B, 4, K) — present only in predicted mode
         }
     else:
         out = head(emb, org, channels_last=channels_last)
@@ -283,6 +284,38 @@ def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_
     return 0.2 * (donor_ratios_loss + acceptor_ratios_loss) + 0.04 * (donor_total_loss + accept_total_loss)
 
 
+def _get_junction_targets(predictions, targets_dict, device):
+    """Return (junc_matrix, positions) aligned to the current predictions.
+
+    In predicted mode (``"positions"`` key present in predictions): builds the
+    junction matrix on-the-fly from pre-filtered DataFrames in
+    ``targets_dict["all_junctions"]`` and the predicted splice-site positions.
+    In annotated mode: uses the pre-built tensors from ``targets_dict``.
+    """
+    if "positions" in predictions:
+        from alphagenome_pytorch.extensions.finetuning.star_junctions import (
+            junctions_to_junction_matrix,
+        )
+        pred_pos = predictions["positions"]          # (B, 4, K)
+        pred_pos_np = pred_pos.cpu().numpy()
+        all_juncs_batch = targets_dict["all_junctions"]  # list[B] of list[DataFrame]
+        max_splice_sites = pred_pos_np.shape[-1]
+        mats = []
+        for b in range(pred_pos_np.shape[0]):
+            _, mat = junctions_to_junction_matrix(
+                all_juncs_batch[b],
+                max_splice_sites=max_splice_sites,
+                positions=pred_pos_np[b],
+            )
+            mats.append(torch.from_numpy(mat))
+        return torch.stack(mats).to(device), pred_pos
+    else:
+        return (
+            targets_dict["junction_matrix"].to(device),
+            targets_dict["junction_positions"].to(device),
+        )
+
+
 def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: int = 1,
                          junction_loss: str = "original"):
     """Compute loss for any of the three splice head types.
@@ -358,8 +391,7 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
     elif isinstance(head, SpliceSitesJunctionHead):
         if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
             return torch.tensor(0.0, device=device), {}
-        junc_matrix = targets_dict["junction_matrix"].to(device)
-        positions = targets_dict["junction_positions"].to(device)
+        junc_matrix, positions = _get_junction_targets(predictions, targets_dict, device)
         n_s = head._num_tissues
         pos_loss = _compute_junction_strand_loss(
             predictions["pos_counts"], junc_matrix[..., :n_s],
@@ -387,8 +419,7 @@ def _extract_junction_pearson_per_sample(predictions, targets_dict, device):
     if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
         return None
 
-    junc_matrix = targets_dict["junction_matrix"].to(device)  # (B, D, A, 2*n_s)
-    positions   = targets_dict["junction_positions"].to(device)
+    junc_matrix, positions = _get_junction_targets(predictions, targets_dict, device)
     n_s = junc_matrix.shape[-1] // 2
 
     per_sample_pred = [[] for _ in range(n_s)]
@@ -477,8 +508,7 @@ def _extract_splice_pearson_pairs(
     elif isinstance(head, SpliceSitesJunctionHead):
         if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
             return None, None
-        junc_matrix = targets_dict["junction_matrix"].to(device)
-        positions = targets_dict["junction_positions"].to(device)
+        junc_matrix, positions = _get_junction_targets(predictions, targets_dict, device)
         n_s = head._num_tissues
 
         variants = {"full": {}, "nonzero": {}, "donor_marginal": {}, "acceptor_marginal": {}}
