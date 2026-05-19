@@ -277,6 +277,27 @@ _CLASS_MAP = {
 _CLASS_NONE = 4
 
 
+def _assign_classes_to_arr(
+    arr: "np.ndarray",
+    sites: "pd.DataFrame",
+    start: int,
+    seq_len: int,
+    pos_col: str = "position",
+) -> None:
+    """Assign 5-class one-hot labels in-place from a sites DataFrame.
+
+    Sites must have columns: role, strand, and ``pos_col`` (1-based genomic position).
+    The assignment converts 1-based to 0-based relative index and sets the class.
+    """
+    for _, site in sites.iterrows():
+        idx = int(site[pos_col]) - 1 - start
+        if 0 <= idx < seq_len:
+            cls = _CLASS_MAP.get((site["role"], site["strand"]))
+            if cls is not None:
+                arr[idx, _CLASS_NONE] = 0.0
+                arr[idx, cls] = 1.0
+
+
 def compute_alpha_beta2(
     junctions: pd.DataFrame,
 ) -> "tuple[pd.Series, pd.Series, pd.Series, pd.Series]":
@@ -442,14 +463,7 @@ def splice_sites_to_classification_array(
     sites = pd.concat(rows, ignore_index=True).drop_duplicates(
         subset=["position", "strand", "role"]
     )
-    for _, site in sites.iterrows():
-        idx = int(site["position"]) - 1 - start  # 1-based → 0-based relative
-        if 0 <= idx < seq_len:
-            cls = _CLASS_MAP.get((site["role"], site["strand"]))
-            if cls is not None:
-                arr[idx, _CLASS_NONE] = 0.0
-                arr[idx, cls] = 1.0
-
+    _assign_classes_to_arr(arr, sites, start, seq_len, pos_col="position")
     return arr
 
 
@@ -556,15 +570,7 @@ def junctions_to_classification_array(
     sites = pd.concat(rows, ignore_index=True).drop_duplicates(
         subset=["strand", "pos1based", "role"]
     )
-
-    for _, site in sites.iterrows():
-        idx = int(site["pos1based"]) - 1 - start  # convert 1-based to 0-based relative
-        if 0 <= idx < seq_len:
-            cls = _CLASS_MAP.get((site["role"], site["strand"]))
-            if cls is not None:
-                arr[idx, _CLASS_NONE] = 0.0
-                arr[idx, cls] = 1.0
-
+    _assign_classes_to_arr(arr, sites, start, seq_len, pos_col="pos1based")
     return arr
 
 
@@ -1004,5 +1010,3 @@ def junctions_to_usage_arrays_by_strand(
                     neg_arr[accept_idx] += frac
 
     return pos_arr, neg_arr
-
-    return arr

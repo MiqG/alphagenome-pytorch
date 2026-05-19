@@ -871,15 +871,7 @@ def train_epoch(
             outputs = model(sequences, organism_idx, return_embeddings=True, channels_last=False)
 
             # Only get embeddings for requested resolutions (1bp is 128x larger than 128bp)
-            embeddings_dict = {}
-            if 1 in resolutions:
-                emb = outputs.get("embeddings_1bp")
-                if emb is not None:
-                    embeddings_dict[1] = emb
-            if 128 in resolutions:
-                emb = outputs.get("embeddings_128bp")
-                if emb is not None:
-                    embeddings_dict[128] = emb
+            embeddings_dict = _extract_embeddings(outputs, resolutions)
 
             # Forward through head
             predictions = head(embeddings_dict, organism_idx)
@@ -977,15 +969,7 @@ def validate(
             outputs = model(sequences, organism_idx, return_embeddings=True, channels_last=False)
 
             # Only get embeddings for requested resolutions
-            embeddings_dict = {}
-            if 1 in resolutions:
-                emb = outputs.get("embeddings_1bp")
-                if emb is not None:
-                    embeddings_dict[1] = emb
-            if 128 in resolutions:
-                emb = outputs.get("embeddings_128bp")
-                if emb is not None:
-                    embeddings_dict[128] = emb
+            embeddings_dict = _extract_embeddings(outputs, resolutions)
 
             predictions = head(embeddings_dict, organism_idx)
 
@@ -1095,6 +1079,48 @@ class ProfilingStats:
 # =============================================================================
 # Enhanced training functions with DDP and profiling support
 # =============================================================================
+
+
+def _extract_embeddings(
+    outputs: dict, resolutions: tuple[int, ...], frozen_backbone: bool = False
+) -> dict[int, Any]:
+    """Extract per-resolution embeddings from model output dict."""
+    result = {}
+    for res in resolutions:
+        emb = outputs.get(f"embeddings_{res}bp")
+        if emb is not None:
+            result[res] = emb.detach() if frozen_backbone else emb
+    return result
+
+
+def _run_head(
+    head,
+    head_module,
+    modality: str,
+    embeddings_dict: dict,
+    organism_idx,
+    targets_dict: dict,
+    device: torch.device,
+    junction_top_k: int | None,
+    heads: dict,
+    embeddings_pair=None,
+    return_scaled: bool = True,
+):
+    """Forward pass through a head, dispatching by type (splice, contact_maps, genomic)."""
+    if embeddings_pair is not None and modality == "contact_maps":
+        return head(embeddings_pair, organism_idx, channels_last=True)
+    if isinstance(head_module, SPLICE_HEAD_TYPES):
+        _positions = targets_dict.get("junction_positions")
+        if _positions is not None:
+            _positions = _positions.to(device)
+        _cls_head = heads.get("splice_site") if junction_top_k is not None else None
+        if _cls_head is not None:
+            _cls_head = _cls_head.module if hasattr(_cls_head, "module") else _cls_head
+        return _call_splice_head(
+            head_module, embeddings_dict, organism_idx, _positions, channels_last=False,
+            cls_head=_cls_head, junction_top_k=junction_top_k,
+        )
+    return head(embeddings_dict, organism_idx, return_scaled=return_scaled, channels_last=True)
 
 
 def _cuda_sync(device: torch.device) -> None:
@@ -1269,16 +1295,8 @@ def train_epoch_ddp(
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                     outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
-            embeddings_dict = {}
-            for res in resolution_weights:
-                emb_key = f"embeddings_{res}bp"
-                if emb_key in outputs:
-                    emb = outputs[emb_key]
-                    embeddings_dict[res] = emb.detach() if frozen_backbone else emb
-
-                predictions = head(
-                    embeddings_dict, organism_idx, return_scaled=True, channels_last=True
-                )
+            embeddings_dict = _extract_embeddings(outputs, resolutions, frozen_backbone)
+            predictions = head(embeddings_dict, organism_idx, return_scaled=True, channels_last=True)
 
         if is_profiling:
             _cuda_sync(device)
@@ -1511,11 +1529,7 @@ def validate_ddp(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
-            embeddings_dict = {}
-            for res in resolution_weights:
-                emb_key = f"embeddings_{res}bp"
-                if emb_key in outputs:
-                    embeddings_dict[res] = outputs[emb_key]
+            embeddings_dict = _extract_embeddings(outputs, resolutions)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
             # Get predictions in MODEL space for loss computation
@@ -1671,6 +1685,7 @@ def train_epoch_multihead(
     organism_idx: int = 0,
     junction_top_k: int | None = None,
     junction_loss: str = "original",
+    sequence_parallel: Any | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1775,7 +1790,47 @@ def train_epoch_multihead(
             all_resolutions.update(resolution_weights.get(modality, {}).keys())
         resolutions = tuple(all_resolutions)
 
-        if encoder_only:
+        embeddings_pair = None  # only populated in sequence-parallel mode (contact_maps)
+        original_length = None
+
+        if sequence_parallel is not None:
+            # Align sequence length so each rank's shard is divisible by 128.
+            pad_multiple = world_size * 128 * 16
+            seq_len = sequences.shape[1]
+            padded_len = ((seq_len + pad_multiple - 1) // pad_multiple) * pad_multiple
+            if padded_len > seq_len:
+                n_pad = padded_len - seq_len
+                if rank == 0:
+                    import warnings
+                    warnings.warn(
+                        f"Sequence length {seq_len} not divisible by {pad_multiple}. "
+                        f"Padding to {padded_len} (+{n_pad} bp) for sequence parallelism.",
+                        stacklevel=2,
+                    )
+                sequences = torch.nn.functional.pad(sequences, (0, 0, 0, n_pad))
+                original_length = seq_len
+
+            model_module = model.module if hasattr(model, "module") else model
+            model_module.train()
+            if frozen_backbone:
+                with torch.no_grad():
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                        emb_1bp, emb_128bp, embeddings_pair, need_1bp = sequence_parallel.forward(
+                            model=model_module, sequence=sequences, organism_index=organism_idx_tensor,
+                            resolutions=resolutions, original_length=original_length,
+                        )
+                emb_1bp = emb_1bp.detach() if emb_1bp is not None else None
+                emb_128bp = emb_128bp.detach()
+            else:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                    emb_1bp, emb_128bp, embeddings_pair, need_1bp = sequence_parallel.forward(
+                        model=model_module, sequence=sequences, organism_index=organism_idx_tensor,
+                        resolutions=resolutions, original_length=original_length,
+                    )
+            embeddings_dict = {128: emb_128bp}
+            if need_1bp and emb_1bp is not None:
+                embeddings_dict[1] = emb_1bp
+        elif encoder_only:
             # Run only the CNN encoder; backbone is always frozen in encoder-only mode.
             with torch.no_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
@@ -1787,12 +1842,7 @@ def train_epoch_multihead(
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                     outputs = model(sequences, organism_idx_tensor, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
-            embeddings_dict = {}
-            for res in resolutions:
-                emb_key = f"embeddings_{res}bp"
-                if emb_key in outputs:
-                    emb = outputs[emb_key]
-                    embeddings_dict[res] = emb.detach() if frozen_backbone else emb
+            embeddings_dict = _extract_embeddings(outputs, resolutions, frozen_backbone)
 
         if is_profiling:
             _cuda_sync(device)
@@ -1816,30 +1866,31 @@ def train_epoch_multihead(
             head_module = head.module if hasattr(head, "module") else head
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                # Embeddings are NCL (channels-first, channels_last=False).
-                # Splice heads must be told this so they don't incorrectly transpose.
-                if isinstance(head_module, SPLICE_HEAD_TYPES):
-                    _positions = targets_dict.get("junction_positions")
-                    if _positions is not None:
-                        _positions = _positions.to(device)
-                    _cls_head = heads.get("splice_site") if junction_top_k is not None else None
-                    if _cls_head is not None:
-                        _cls_head = _cls_head.module if hasattr(_cls_head, "module") else _cls_head
-                    predictions = _call_splice_head(
-                        head_module, embeddings_dict, organism_idx_tensor,
-                        _positions, channels_last=False,
-                        cls_head=_cls_head, junction_top_k=junction_top_k,
-                    )
-                else:
-                    predictions = head(
-                        embeddings_dict, organism_idx_tensor, return_scaled=True, channels_last=True
-                    )
+                # Embeddings are NCL (channels-first); splice heads handle channels_last=False internally.
+                predictions = _run_head(
+                    head, head_module, modality, embeddings_dict, organism_idx_tensor,
+                    targets_dict, device, junction_top_k, heads,
+                    embeddings_pair=embeddings_pair,
+                )
 
             modality_loss = torch.tensor(0.0, device=device)
 
             if isinstance(head_module, SPLICE_HEAD_TYPES):
+                # In SP mode, slice sequence-length dimension of integer-keyed targets per rank.
+                if sequence_parallel is not None:
+                    local_len = next(
+                        (tgt.shape[1] // world_size for k, tgt in targets_dict.items() if isinstance(k, int)),
+                        None,
+                    )
+                    t_start = rank * local_len if local_len is not None else 0
+                    splice_targets = {
+                        k: (tgt.to(device)[:, t_start:t_start + local_len, :] if isinstance(k, int) else tgt.to(device))
+                        for k, tgt in targets_dict.items()
+                    }
+                else:
+                    splice_targets = targets_dict
                 modality_loss, splice_components = _compute_splice_loss(
-                    head_module, predictions, targets_dict, device,
+                    head_module, predictions, splice_targets, device,
                     num_segments=num_segments,
                     junction_loss=junction_loss,
                 )
@@ -1852,6 +1903,12 @@ def train_epoch_multihead(
 
                     pred = predictions[res]
                     targets = targets_dict[res].to(device)
+
+                    # In SP mode, slice targets to match local shard for this rank.
+                    if sequence_parallel is not None:
+                        local_len = targets.shape[1] // world_size
+                        t_start = rank * local_len
+                        targets = targets[:, t_start:t_start + local_len, :]
 
                     targets = head_module.scale(
                         targets, organism_idx_tensor, resolution=res, channels_last=True
@@ -1914,6 +1971,12 @@ def train_epoch_multihead(
             for head in heads.values():
                 trainable_params.extend([p for p in head.parameters() if p.requires_grad])
             trainable_params.extend([p for p in model.parameters() if p.requires_grad])
+
+            # SP bypasses DDP's allreduce hook — manually average gradients across ranks.
+            if sequence_parallel is not None and world_size > 1:
+                for p in trainable_params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
             optimizer.step()
@@ -2096,11 +2159,7 @@ def validate_multihead(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 outputs = model(sequences, organism_idx_tensor, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
-            embeddings_dict = {}
-            for res in resolutions:
-                emb_key = f"embeddings_{res}bp"
-                if emb_key in outputs:
-                    embeddings_dict[res] = outputs[emb_key]
+            embeddings_dict = _extract_embeddings(outputs, resolutions)
 
         loss = torch.tensor(0.0, device=device)
 
@@ -2115,22 +2174,10 @@ def validate_multihead(
             head_module = head.module if hasattr(head, "module") else head
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                if isinstance(head_module, SPLICE_HEAD_TYPES):
-                    _positions = targets_dict.get("junction_positions")
-                    if _positions is not None:
-                        _positions = _positions.to(device)
-                    _cls_head = heads.get("splice_site") if junction_top_k is not None else None
-                    if _cls_head is not None:
-                        _cls_head = _cls_head.module if hasattr(_cls_head, "module") else _cls_head
-                    predictions_scaled = _call_splice_head(
-                        head_module, embeddings_dict, organism_idx_tensor,
-                        _positions, channels_last=False,
-                        cls_head=_cls_head, junction_top_k=junction_top_k,
-                    )
-                else:
-                    predictions_scaled = head(
-                        embeddings_dict, organism_idx_tensor, return_scaled=True, channels_last=True
-                    )
+                predictions_scaled = _run_head(
+                    head, head_module, modality, embeddings_dict, organism_idx_tensor,
+                    targets_dict, device, junction_top_k, heads,
+                )
                 if compute_pearson and not isinstance(head_module, SPLICE_HEAD_TYPES):
                     predictions_unscaled = head(
                         embeddings_dict, organism_idx_tensor, return_scaled=False, channels_last=True
@@ -2462,333 +2509,25 @@ def train_epoch_sequence_parallel(
     save_state: dict | None = None,
     junction_top_k: int | None = None,
     junction_loss: str = "original",
-) -> tuple[float, dict[str, float]]:
-    """Train for one epoch with sequence parallelism.
-
-    Splits the input sequence across GPUs instead of splitting the batch (DDP).
-    This enables training on longer sequences by keeping per-GPU memory constant
-    regardless of world size.
-
-    Follows the same structure as train_epoch_multihead, replacing the backbone
-    forward pass with sequence_parallel.forward() which performs the distributed
-    encode step and returns per-rank local embeddings in NCL format.
-
-    Args:
-        model: AlphaGenome model (may be DDP-wrapped).
-        heads: Dict mapping modality name to output head module.
-        train_loader: Training data loader (yields sequences, modality_targets).
-        optimizer: Optimizer.
-        scheduler: Learning rate scheduler.
-        device: Torch device.
-        modality_weights: Weight for each modality's loss.
-        resolution_weights: Per-modality resolution weights dict.
-        positional_weight: Weight for positional component of multinomial loss.
-        count_weight: Weight for count component of multinomial loss.
-        sequence_parallel: SequenceParallelism instance.
-        epoch: Current epoch number.
-        log_every: Log frequency in steps.
-        use_amp: Whether to use automatic mixed precision.
-        accumulation_steps: Number of batches to accumulate gradients over.
-        frozen_backbone: If True, run backbone under torch.no_grad().
-        num_segments: Number of segments for multinomial loss.
-        min_segment_size: Minimum segment size for multinomial loss.
-        train_sampler: DistributedSampler for shuffling across epochs.
-        rank: Process rank for DDP.
-        world_size: Total number of processes.
-        max_grad_norm: Maximum gradient norm for clipping.
-        profile_batches: Number of batches to profile (0 = disabled).
-        log_fn: Optional step logging function.
-        encoder_only: Not used in SP mode (full backbone always runs).
-
-    Returns:
-        Tuple of (avg_total_loss, per_modality_train_loss).
-    """
-    from alphagenome_pytorch.extensions.finetuning.distributed import (
-        is_main_process,
-        reduce_tensor,
-    )
+) -> tuple[float, dict[str, float]]:  # noqa: D103 — thin wrapper
+    """Thin wrapper — delegates to train_epoch_multihead with sequence_parallel enabled."""
     from alphagenome_pytorch.sequence_parallel import SequenceParallelism
-
     if not isinstance(sequence_parallel, SequenceParallelism):
         raise ValueError("sequence_parallel must be a SequenceParallelism instance")
-
-    model_module = model.module if hasattr(model, "module") else model
-    model_module.train()
-
-    if train_sampler is not None:
-        train_sampler.set_epoch(epoch)
-
-    # Collect all needed resolutions across modalities (same as train_epoch_multihead)
-    all_resolutions: set[int] = set()
-    for modality in heads:
-        all_resolutions.update(resolution_weights.get(modality, {}).keys())
-    resolutions = tuple(all_resolutions)
-
-    total_loss_accum = 0.0
-    modality_loss_accum: dict[str, float] = {m: 0.0 for m in heads}
-    n_batches = 0
-    running_loss = 0.0
-    accumulated_batches = 0
-    opt_step = 0
-
-    if is_main_process(rank):
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch} [SP]")
-    else:
-        pbar = train_loader
-
-    for batch_idx, (sequences, modality_targets) in enumerate(pbar):
-        if batch_idx < skip_batches:
-            continue
-
-        sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
-
-        # Align sequence length to world_size * 128 for sequence parallelism.
-        # This ensures each rank's base shard size is divisible by 128, so the
-        # encoder's strided convolutions produce exact token counts.
-        # this will be triggered when the world_size is not a multiple of 2
-        if sequence_parallel is not None and world_size > 1:
-            pad_multiple = world_size * 128 * 16  # lowres length must also be divisible by 16 for pair updates
-            seq_len = sequences.shape[1]
-            padded_len = ((seq_len + pad_multiple - 1) // pad_multiple) * pad_multiple
-            if padded_len > seq_len:
-                n_pad = padded_len - seq_len
-                if rank == 0:  # Print warning only once per batch
-                    import warnings
-                    warnings.warn(
-                        f"Sequence length {seq_len} not divisible by {pad_multiple}. "
-                        f"Padding to {padded_len} (+{n_pad} bp) for sequence parallelism.",
-                        stacklevel=2
-                    )
-                sequences = torch.nn.functional.pad(sequences, (0, 0, 0, n_pad))  # pad (S, 4) on S dim
-
-        # ===== BACKBONE: sequence-parallel forward =====
-        # Returns embeddings_dict in NCL format - same as model.encode(channels_last=False)
-        original_length = seq_len if padded_len > seq_len else None
-
-        def _build_embeddings_dict(embeddings_1bp, embeddings_128bp, need_1bp_):
-            d = {128: embeddings_128bp}
-            if need_1bp_ and embeddings_1bp is not None:
-                d[1] = embeddings_1bp
-            return d
-
-        if frozen_backbone:
-            with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                    embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = sequence_parallel.forward(
-                        model=model_module,
-                        sequence=sequences,
-                        organism_index=organism_idx,
-                        resolutions=resolutions,
-                        original_length=original_length,
-                    )
-            embeddings_1bp = embeddings_1bp.detach() if embeddings_1bp is not None else None
-            embeddings_128bp = embeddings_128bp.detach()
-            embeddings_dict = _build_embeddings_dict(embeddings_1bp, embeddings_128bp, need_1bp)
-        else:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = sequence_parallel.forward(
-                    model=model_module,
-                    sequence=sequences,
-                    organism_index=organism_idx,
-                    resolutions=resolutions,
-                    original_length=original_length,
-                )
-            embeddings_dict = _build_embeddings_dict(embeddings_1bp, embeddings_128bp, need_1bp)
-
-        # ===== HEADS + LOSS (mirrors train_epoch_multihead exactly) =====
-        loss = torch.tensor(0.0, device=device)
-        loss_components: dict[str, float] = {}
-
-        for modality, head in heads.items():
-            if modality not in modality_targets:
-                continue
-
-            modality_weight = modality_weights.get(modality, 1.0)
-            res_weights = resolution_weights.get(modality, {})
-            targets_dict = modality_targets[modality]
-
-            head_module = head.module if hasattr(head, "module") else head
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
-                # contact_maps head takes embeddings_pair directly; all other
-                # GenomeTracksHead variants take embeddings_dict.
-                # Sequence-parallel embeddings are in NCL (channels-first) format,
-                # so splice head must be called with channels_last=False.
-                if modality == "contact_maps":
-                    predictions = head(
-                        embeddings_pair, organism_idx, channels_last=True
-                    )
-                elif isinstance(head_module, SPLICE_HEAD_TYPES):
-                    # Junction positions are not sharded — pass directly.
-                    _positions = targets_dict.get("junction_positions")
-                    if _positions is not None:
-                        _positions = _positions.to(device)
-                    _cls_head = heads.get("splice_site") if junction_top_k is not None else None
-                    if _cls_head is not None:
-                        _cls_head = _cls_head.module if hasattr(_cls_head, "module") else _cls_head
-                    predictions = _call_splice_head(
-                        head_module, embeddings_dict, organism_idx,
-                        _positions, channels_last=False,
-                        cls_head=_cls_head, junction_top_k=junction_top_k,
-                    )
-                else:
-                    predictions = head(
-                        embeddings_dict, organism_idx, return_scaled=True, channels_last=True
-                    )
-
-            modality_loss = torch.tensor(0.0, device=device)
-
-            if isinstance(head_module, SPLICE_HEAD_TYPES):
-                # Slice and move targets for sequence-parallel shard, then compute splice loss.
-                # Preserve string keys (junction_positions, junction_matrix) without slicing.
-                splice_targets_dict = {}
-                for res, tgt in targets_dict.items():
-                    tgt = tgt.to(device)
-                    if isinstance(res, int):
-                        # Slice sequence-length dimension for integer keys (resolutions)
-                        full_len = tgt.shape[1]
-                        local_len = full_len // world_size
-                        t_start = rank * local_len
-                        tgt = tgt[:, t_start:t_start + local_len, :]
-                    splice_targets_dict[res] = tgt
-                modality_loss, splice_components = _compute_splice_loss(
-                    head_module, predictions, splice_targets_dict, device,
-                    num_segments=num_segments,
-                    junction_loss=junction_loss,
-                )
-                for k, v in splice_components.items():
-                    loss_components[f"{modality}_{k}"] = v
-            else:
-                for res, weight in res_weights.items():
-                    if res not in predictions or res not in targets_dict:
-                        continue
-
-                    pred = predictions[res]
-                    targets = targets_dict[res].to(device)
-
-                    # Slice targets to match local shard for this rank (sequence parallel).
-                    # Targets are at their native resolution (e.g. S_full for 1bp,
-                    # S_full//128 for 128bp), so a single split by world_size works
-                    # regardless of resolution.
-                    full_len = targets.shape[1]
-                    local_len = full_len // world_size
-                    t_start = rank * local_len
-                    targets = targets[:, t_start:t_start + local_len, :]
-
-                    targets = head_module.scale(
-                        targets, organism_idx, resolution=res, channels_last=True
-                    )
-                    mask = torch.ones(pred.shape[0], 1, pred.shape[-1], dtype=torch.bool, device=device)
-
-                    current_seq_len = pred.shape[-2]
-                    multinomial_res = _compute_multinomial_resolution(
-                        current_seq_len, num_segments, min_segment_size
-                    )
-
-                    loss_dict = multinomial_loss(
-                        y_pred=pred,
-                        y_true=targets,
-                        mask=mask,
-                        multinomial_resolution=multinomial_res,
-                        positional_weight=positional_weight,
-                        count_weight=count_weight,
-                        channels_last=True,
-                    )
-
-                    res_loss = loss_dict["loss"] * weight
-                    modality_loss = modality_loss + res_loss
-                    loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
-
-            weighted_modality_loss = modality_loss * modality_weight
-            loss = loss + weighted_modality_loss
-            loss_components[f"{modality}_loss"] = modality_loss.item()
-            modality_loss_accum[modality] += modality_loss.item()
-
-        # ===== BACKWARD + OPTIMIZER =====
-        scaled_loss = loss / accumulation_steps
-        scaled_loss.backward()
-
-        is_accumulation_step = (batch_idx + 1) % accumulation_steps == 0
-        is_last_batch = batch_idx == len(train_loader) - 1
-
-        if is_accumulation_step or is_last_batch:
-            # Sequence parallelism bypasses DDP's forward() so its allreduce hook
-            # never fires. Manually allreduce gradients so all ranks apply the same
-            # parameter update.
-            if world_size > 1:
-                trainable_params = []
-                for head in heads.values():
-                    trainable_params.extend([p for p in head.parameters() if p.requires_grad])
-                trainable_params.extend([p for p in model.parameters() if p.requires_grad])
-                for p in trainable_params:
-                    if p.grad is not None:
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-
-            trainable_params = []
-            for head in heads.values():
-                trainable_params.extend([p for p in head.parameters() if p.requires_grad])
-            trainable_params.extend([p for p in model.parameters() if p.requires_grad])
-
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            opt_step += 1
-
-            if save_every_steps is not None and save_fn is not None:
-                global_step = global_step_offset + opt_step
-                if global_step % save_every_steps == 0:
-                    if save_state is not None:
-                        save_state["batch_idx"] = batch_idx + 1
-                    save_fn()
-
-        # ===== LOGGING =====
-        raw_loss = loss.item()
-        total_loss_accum += raw_loss
-        n_batches += 1
-        running_loss += raw_loss
-        accumulated_batches += 1
-
-        current_lr = scheduler.get_last_lr()[0]
-
-        if is_main_process(rank) and batch_idx % log_every == 0:
-            avg_running_loss = running_loss / accumulated_batches
-            if hasattr(pbar, "set_postfix"):
-                pbar.set_postfix({
-                    "loss": f"{raw_loss:.4f}",
-                    "run_loss": f"{avg_running_loss:.4f}",
-                    "lr": f"{current_lr:.2e}",
-                })
-
-            if log_fn is not None:
-                log_fn({
-                    "batch": batch_idx,
-                    "epoch": epoch,
-                    "loss": raw_loss,
-                    "running_loss": avg_running_loss,
-                    "learning_rate": current_lr,
-                    **loss_components,
-                })
-
-            running_loss = 0.0
-            accumulated_batches = 0
-
-    # Reduce across processes
-    avg_loss = total_loss_accum / max(1, n_batches)
-    per_modality_loss = {m: v / max(1, n_batches) for m, v in modality_loss_accum.items()}
-
-    if world_size > 1:
-        avg_loss_tensor = torch.tensor(avg_loss, device=device)
-        avg_loss_tensor = reduce_tensor(avg_loss_tensor, world_size)
-        avg_loss = avg_loss_tensor.item()
-
-        for m in per_modality_loss:
-            m_tensor = torch.tensor(per_modality_loss[m], device=device)
-            m_tensor = reduce_tensor(m_tensor, world_size)
-            per_modality_loss[m] = m_tensor.item()
-
-    return avg_loss, per_modality_loss
+    return train_epoch_multihead(
+        model=model, heads=heads, train_loader=train_loader, optimizer=optimizer,
+        scheduler=scheduler, device=device, modality_weights=modality_weights,
+        resolution_weights=resolution_weights, positional_weight=positional_weight,
+        count_weight=count_weight, epoch=epoch, log_every=log_every, use_amp=use_amp,
+        accumulation_steps=accumulation_steps, frozen_backbone=frozen_backbone,
+        num_segments=num_segments, min_segment_size=min_segment_size,
+        train_sampler=train_sampler, rank=rank, world_size=world_size,
+        max_grad_norm=max_grad_norm, profile_batches=profile_batches, log_fn=log_fn,
+        encoder_only=encoder_only, save_every_steps=save_every_steps, save_fn=save_fn,
+        global_step_offset=global_step_offset, skip_batches=skip_batches,
+        save_state=save_state, junction_top_k=junction_top_k, junction_loss=junction_loss,
+        sequence_parallel=sequence_parallel,
+    )
 
 
 __all__ = [

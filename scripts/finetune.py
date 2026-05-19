@@ -897,7 +897,6 @@ def create_datasets(
         # Build modality_track_names the same way as the standard path so that
         # head construction is identical regardless of target type.
         modality_track_names: dict[str, list[str]] = {}
-        SPLICE_MODALITIES = {"splice_site", "splice_usage", "splice_junctions"}
         for modality in args.modalities:
             if modality in SPLICE_MODALITIES:
                 junc_files = args.modality_to_star_junctions.get(modality, [])
@@ -941,7 +940,6 @@ def create_datasets(
 
     # Build per-modality track names
     modality_track_names: dict[str, list[str]] = {}
-    SPLICE_MODALITIES = {'splice_site', 'splice_usage', 'splice_junctions'}
 
     for modality in args.modalities:
         if modality in SPLICE_MODALITIES:
@@ -981,7 +979,6 @@ def create_datasets(
     train_datasets = {}
     val_datasets = {}
 
-    SPLICE_MODALITIES = {'splice_site', 'splice_usage', 'splice_junctions'}
     _splice_dataset_cache = {}  # Cache to share datasets for co-expanded sub-modalities
 
     for modality in args.modalities:
@@ -1569,91 +1566,29 @@ def main() -> None:
         print_rank0(f"Eval-only mode: loaded checkpoint from {resume_path}", rank)
         print_rank0(f"{'='*60}", rank)
 
-        # Validation pass
-        if world_size > 1:
-            val_loss, val_metrics = validate_multihead(
-                model=model,
-                heads=heads,
-                val_loader=val_loader,
-                device=device,
-                modality_weights=args.modality_weight_dict,
-                resolution_weights=resolution_weights_per_modality,
-                positional_weight=args.positional_weight,
-                count_weight=args.count_weight,
-                compute_pearson=True,
-                num_segments=args.num_segments,
-                min_segment_size=args.min_segment_size,
-                rank=rank,
-                world_size=world_size,
-                encoder_only=encoder_only,
-                junction_top_k=_junction_top_k,
-                junction_loss=args.junction_loss,
-                compute_per_sample=args.metrics_per_sample,
-            )
-        else:
-            val_loss, val_metrics = validate_multihead(
-                model=model,
-                heads=heads,
-                val_loader=val_loader,
-                device=device,
-                modality_weights=args.modality_weight_dict,
-                resolution_weights=resolution_weights_per_modality,
-                positional_weight=args.positional_weight,
-                count_weight=args.count_weight,
-                compute_pearson=True,
-                num_segments=args.num_segments,
-                min_segment_size=args.min_segment_size,
-                rank=rank,
-                world_size=world_size,
-                encoder_only=encoder_only,
-                junction_top_k=_junction_top_k,
-                junction_loss=args.junction_loss,
-                compute_per_sample=args.metrics_per_sample,
-            )
+        # Shared kwargs for all eval-mode validate_multihead calls
+        _eval_validate_kwargs = dict(
+            model=model, heads=heads, device=device,
+            modality_weights=args.modality_weight_dict,
+            resolution_weights=resolution_weights_per_modality,
+            positional_weight=args.positional_weight,
+            count_weight=args.count_weight,
+            compute_pearson=True,
+            num_segments=args.num_segments,
+            min_segment_size=args.min_segment_size,
+            rank=rank, world_size=world_size,
+            encoder_only=encoder_only,
+            junction_top_k=_junction_top_k,
+            junction_loss=args.junction_loss,
+            compute_per_sample=args.metrics_per_sample,
+        )
+
+        val_loss, val_metrics = validate_multihead(val_loader=val_loader, **_eval_validate_kwargs)
 
         # Optionally run on train set if eval-train-pearson is set
         train_metrics = {}
         if args.eval_train_pearson:
-            if world_size > 1:
-                train_loss, train_metrics = validate_multihead(
-                    model=model,
-                    heads=heads,
-                    val_loader=train_loader,
-                    device=device,
-                    modality_weights=args.modality_weight_dict,
-                    resolution_weights=resolution_weights_per_modality,
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    compute_pearson=True,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    rank=rank,
-                    world_size=world_size,
-                    encoder_only=encoder_only,
-                    junction_top_k=_junction_top_k,
-                    junction_loss=args.junction_loss,
-                    compute_per_sample=args.metrics_per_sample,
-                )
-            else:
-                train_loss, train_metrics = validate_multihead(
-                    model=model,
-                    heads=heads,
-                    val_loader=train_loader,
-                    device=device,
-                    modality_weights=args.modality_weight_dict,
-                    resolution_weights=resolution_weights_per_modality,
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    compute_pearson=True,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    rank=rank,
-                    world_size=world_size,
-                    encoder_only=encoder_only,
-                    junction_top_k=_junction_top_k,
-                    junction_loss=args.junction_loss,
-                    compute_per_sample=args.metrics_per_sample,
-                )
+            train_loss, train_metrics = validate_multihead(val_loader=train_loader, **_eval_validate_kwargs)
             train_metrics = {f"train_{k}": v for k, v in train_metrics.items()}
 
         # Combine metrics and save
@@ -1783,6 +1718,25 @@ def main() -> None:
                 handler.save_and_exit()
                 break
 
+            # Shared kwargs for training-loop validate_multihead calls
+            _loop_validate_kwargs = dict(
+                model=model, heads=heads, device=device,
+                modality_weights=args.modality_weight_dict,
+                resolution_weights=resolution_weights_per_modality,
+                positional_weight=args.positional_weight,
+                count_weight=args.count_weight,
+                use_amp=use_amp,
+                num_segments=args.num_segments,
+                min_segment_size=args.min_segment_size,
+                compute_pearson=True,
+                rank=rank, world_size=world_size,
+                encoder_only=encoder_only,
+                junction_top_k=_junction_top_k,
+                organism_idx=args.organism_idx,
+                junction_loss=args.junction_loss,
+                compute_per_sample=args.metrics_per_sample,
+            )
+
             # Optional train-set Pearson eval pass
             train_eval_metrics: dict = {}
             if args.eval_train_pearson:
@@ -1800,48 +1754,11 @@ def main() -> None:
                     prefetch_factor=2 if train_loader.num_workers > 0 else None,
                 )
                 _, train_eval_metrics = validate_multihead(
-                    model=model,
-                    heads=heads,
-                    val_loader=train_eval_loader,
-                    device=device,
-                    modality_weights=args.modality_weight_dict,
-                    resolution_weights=resolution_weights_per_modality,
-                    positional_weight=args.positional_weight,
-                    count_weight=args.count_weight,
-                    use_amp=use_amp,
-                    num_segments=args.num_segments,
-                    min_segment_size=args.min_segment_size,
-                    compute_pearson=True,
-                    rank=rank,
-                    world_size=world_size,
-                    encoder_only=encoder_only,
-                    junction_top_k=_junction_top_k,
-                    organism_idx=args.organism_idx,
-                    junction_loss=args.junction_loss,
-                    compute_per_sample=args.metrics_per_sample,
+                    val_loader=train_eval_loader, **_loop_validate_kwargs
                 )
 
-            # Validation (always use multihead since we always have multimodal dataset format now)
             val_loss, val_metrics = validate_multihead(
-                model=model,
-                heads=heads,
-                val_loader=val_loader,
-                device=device,
-                modality_weights=args.modality_weight_dict,
-                resolution_weights=resolution_weights_per_modality,
-                positional_weight=args.positional_weight,
-                count_weight=args.count_weight,
-                use_amp=use_amp,
-                num_segments=args.num_segments,
-                min_segment_size=args.min_segment_size,
-                compute_pearson=True,
-                rank=rank,
-                world_size=world_size,
-                encoder_only=encoder_only,
-                junction_top_k=_junction_top_k,
-                organism_idx=args.organism_idx,
-                junction_loss=args.junction_loss,
-                compute_per_sample=args.metrics_per_sample,
+                val_loader=val_loader, **_loop_validate_kwargs
             )
 
             # Synchronize CUDA to ensure all validation ops complete before next epoch
