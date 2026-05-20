@@ -506,10 +506,11 @@ def _extract_splice_pearson_pairs(
 
     For SpliceSitesUsageHead: returns (pred_flat, true_flat) tuple.
     For SpliceSitesJunctionHead: returns dict with variants:
-        - "full": all valid (donor, acceptor) cells
-        - "nonzero": valid cells with target > 0
-        - "donor_marginal": sums along acceptor axis
-        - "acceptor_marginal": sums along donor axis
+        - "full": all valid (donor, acceptor) cells — log1p Pearson
+        - "nonzero": valid cells with target > 0 — log1p Pearson
+        - "psi5": PSI5 = n(D,A)/Σ_A' n(D,A'), restricted to donors with reads — Pearson
+        - "psi3": PSI3 = n(D,A)/Σ_D' n(D',A), restricted to acceptors with reads — Pearson
+        - "binary_cls": all valid pairs, pred=counts (scores), true=binary nonzero — auPRC
         Each value is a dict with "pred" and "true" keys, or None if empty.
 
     Returns tuple/dict or (None, None) if no valid entries.
@@ -532,16 +533,19 @@ def _extract_splice_pearson_pairs(
         junc_matrix, positions = _get_junction_targets(predictions, targets_dict, device)
         n_s = head._num_tissues
 
-        variants = {"full": {}, "nonzero": {}, "donor_marginal": {}, "acceptor_marginal": {}}
+        variants = {"full": {}, "nonzero": {}, "psi5": {}, "psi3": {}, "binary_cls": {}}
         all_pred_full, all_true_full = [], []
         all_pred_nz, all_true_nz = [], []
-        all_pred_d_marg, all_true_d_marg = [], []
-        all_pred_a_marg, all_true_a_marg = [], []
+        all_pred_psi5, all_true_psi5 = [], []
+        all_pred_psi3, all_true_psi3 = [], []
+        all_pred_bincls, all_true_bincls = [], []
 
-        for strand_idx, (pred_key, tgt_slice, donor_row, accept_row) in enumerate([
+        _EPS = 1e-8
+
+        for pred_key, tgt_slice, donor_row, accept_row in [
             ("pos_counts", (slice(None), slice(None), slice(None), slice(None, n_s)),   0, 1),
             ("neg_counts", (slice(None), slice(None), slice(None), slice(n_s, None)),   2, 3),
-        ]):
+        ]:
             pred_counts = predictions[pred_key]           # (B, D, A, n_s)
             tgt_counts = junc_matrix[tgt_slice]           # (B, D, A, n_s)
             donor_pos  = positions[:, donor_row,  :].long()
@@ -553,42 +557,51 @@ def _extract_splice_pearson_pairs(
 
             # Full variant: all valid pairs
             if pairs_mask4.any():
-                all_pred_full.append(pred_counts[pairs_mask4])
-                all_true_full.append(tgt_counts[pairs_mask4])
+                all_pred_full.append(pred_counts[pairs_mask4].float().cpu())
+                all_true_full.append(tgt_counts[pairs_mask4].float().cpu())
 
             # Nonzero variant: valid pairs with target > 0
             nonzero_mask = pairs_mask4 & (tgt_counts > 0)
             if nonzero_mask.any():
-                all_pred_nz.append(pred_counts[nonzero_mask])
-                all_true_nz.append(tgt_counts[nonzero_mask])
+                all_pred_nz.append(pred_counts[nonzero_mask].float().cpu())
+                all_true_nz.append(tgt_counts[nonzero_mask].float().cpu())
 
-            # Donor marginal: sum over acceptors, mask to donors with any valid acceptor
-            donor_mask = pairs_mask.any(dim=2)  # (B, D)
-            if donor_mask.any():
-                pred_d = pred_counts.sum(dim=2)  # (B, D, n_s)
-                true_d = tgt_counts.sum(dim=2)   # (B, D, n_s)
-                donor_mask_exp = donor_mask.unsqueeze(-1).expand_as(pred_d)
-                all_pred_d_marg.append(pred_d[donor_mask_exp])
-                all_true_d_marg.append(true_d[donor_mask_exp])
+            # PSI5: n(D,A)/Σ_A' n(D,A') — only where donor has reads in ground truth
+            true_d_total = tgt_counts.sum(dim=2, keepdim=True)      # (B, D, 1, n_s)
+            pred_d_total = pred_counts.sum(dim=2, keepdim=True)
+            psi5_valid = pairs_mask4 & (true_d_total > 0).expand_as(pairs_mask4)
+            if psi5_valid.any():
+                pred_psi5 = pred_counts / (pred_d_total + _EPS)
+                true_psi5 = tgt_counts.float() / (true_d_total.float() + _EPS)
+                all_pred_psi5.append(pred_psi5[psi5_valid].float().cpu())
+                all_true_psi5.append(true_psi5[psi5_valid].float().cpu())
 
-            # Acceptor marginal: sum over donors, mask to acceptors with any valid donor
-            accept_mask = pairs_mask.any(dim=1)  # (B, A)
-            if accept_mask.any():
-                pred_a = pred_counts.sum(dim=1)  # (B, A, n_s)
-                true_a = tgt_counts.sum(dim=1)   # (B, A, n_s)
-                accept_mask_exp = accept_mask.unsqueeze(-1).expand_as(pred_a)
-                all_pred_a_marg.append(pred_a[accept_mask_exp])
-                all_true_a_marg.append(true_a[accept_mask_exp])
+            # PSI3: n(D,A)/Σ_D' n(D',A) — only where acceptor has reads in ground truth
+            true_a_total = tgt_counts.sum(dim=1, keepdim=True)      # (B, 1, A, n_s)
+            pred_a_total = pred_counts.sum(dim=1, keepdim=True)
+            psi3_valid = pairs_mask4 & (true_a_total > 0).expand_as(pairs_mask4)
+            if psi3_valid.any():
+                pred_psi3 = pred_counts / (pred_a_total + _EPS)
+                true_psi3 = tgt_counts.float() / (true_a_total.float() + _EPS)
+                all_pred_psi3.append(pred_psi3[psi3_valid].float().cpu())
+                all_true_psi3.append(true_psi3[psi3_valid].float().cpu())
+
+            # binary_cls: predicted counts as scores vs binary existence label — for auPRC
+            if pairs_mask4.any():
+                all_pred_bincls.append(pred_counts[pairs_mask4].float().cpu())
+                all_true_bincls.append((tgt_counts[pairs_mask4] > 0).float().cpu())
 
         # Aggregate variants
         if all_pred_full:
             variants["full"] = {"pred": torch.cat(all_pred_full), "true": torch.cat(all_true_full)}
         if all_pred_nz:
             variants["nonzero"] = {"pred": torch.cat(all_pred_nz), "true": torch.cat(all_true_nz)}
-        if all_pred_d_marg:
-            variants["donor_marginal"] = {"pred": torch.cat(all_pred_d_marg), "true": torch.cat(all_true_d_marg)}
-        if all_pred_a_marg:
-            variants["acceptor_marginal"] = {"pred": torch.cat(all_pred_a_marg), "true": torch.cat(all_true_a_marg)}
+        if all_pred_psi5:
+            variants["psi5"] = {"pred": torch.cat(all_pred_psi5), "true": torch.cat(all_true_psi5)}
+        if all_pred_psi3:
+            variants["psi3"] = {"pred": torch.cat(all_pred_psi3), "true": torch.cat(all_true_psi3)}
+        if all_pred_bincls:
+            variants["binary_cls"] = {"pred": torch.cat(all_pred_bincls), "true": torch.cat(all_true_bincls)}
 
         if not variants["full"]:
             return None, None
@@ -2119,7 +2132,7 @@ def validate_multihead(
     accumulated_pred_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
     accumulated_true_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
 
-    # For splice Pearson R - per variant (full, nonzero, donor_marginal, acceptor_marginal)
+    # For splice Pearson R - per variant (full, nonzero, psi5, psi3) + binary_cls for auPRC
     # For junction head: dict[modality][variant] = {"pred": [], "true": []}
     # For usage head: dict[modality]["full"] = {"pred": [], "true": []}
     accumulated_splice: dict[str, dict[str, dict[str, list[Tensor]]]] = {
@@ -2342,12 +2355,19 @@ def validate_multihead(
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = float("nan")
 
     # Compute splice Pearson R for each variant
+    # Variants that are count-scale (apply log1p before Pearson)
+    _COUNT_VARIANTS = {"full", "nonzero"}
+    # Variants handled separately (auPRC, not Pearson)
+    _AUPRC_VARIANTS = {"binary_cls"}
+
     if compute_pearson:
         for modality in heads:
             head_module = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
             is_junction = isinstance(head_module, SpliceSitesJunctionHead)
 
             for variant_name, variant_data in accumulated_splice[modality].items():
+                if variant_name in _AUPRC_VARIANTS:
+                    continue
                 if not variant_data["pred"]:
                     continue
                 all_pred = torch.cat(variant_data["pred"], dim=0)
@@ -2356,8 +2376,10 @@ def validate_multihead(
                     all_pred = gather_tensors(all_pred, world_size, device)
                     all_true = gather_tensors(all_true, world_size, device)
                 if all_pred.shape[0] > 1:
-                    _pred_for_r = torch.log1p(all_pred) if is_junction else all_pred
-                    _true_for_r = torch.log1p(all_true) if is_junction else all_true
+                    # log1p only for raw count variants; PSI variants are already in [0,1]
+                    use_log1p = is_junction and variant_name in _COUNT_VARIANTS
+                    _pred_for_r = torch.log1p(all_pred) if use_log1p else all_pred
+                    _true_for_r = torch.log1p(all_true) if use_log1p else all_true
                     r = pearson_r(_pred_for_r.unsqueeze(0), _true_for_r.unsqueeze(0), dim=1)
                     metric_key = f"{modality}_pearson_r"
                     if variant_name != "full":
@@ -2371,6 +2393,27 @@ def validate_multihead(
                     all_true = torch.cat(full_true, dim=0)
                     nonzero_frac = (all_true > 0).float().mean().item()
                     metrics[f"{modality}_target_nonzero_frac"] = nonzero_frac
+
+    # Compute junction auPRC (binary classification: true junction vs background)
+    if compute_pearson:
+        from sklearn.metrics import average_precision_score as _avg_prec
+
+        for modality in heads:
+            head_module = heads[modality].module if hasattr(heads[modality], "module") else heads[modality]
+            if not isinstance(head_module, SpliceSitesJunctionHead):
+                continue
+            bincls = accumulated_splice[modality].get("binary_cls", {})
+            if not bincls.get("pred"):
+                continue
+            all_pred = torch.cat(bincls["pred"], dim=0)
+            all_true = torch.cat(bincls["true"], dim=0)
+            if world_size > 1:
+                all_pred = gather_tensors(all_pred, world_size, device)
+                all_true = gather_tensors(all_true, world_size, device)
+            if all_true.sum() > 0 and all_pred.shape[0] > 1:
+                metrics[f"{modality}_auprc_junction"] = _avg_prec(
+                    all_true.numpy(), all_pred.numpy()
+                )
 
     # Compute per-sample Pearson rows (only when compute_per_sample=True)
     if compute_pearson:
