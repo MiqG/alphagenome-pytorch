@@ -643,8 +643,10 @@ class AlphaGenome(nn.Module):
         return self._cast_outputs(outputs)
 
     def _cast_outputs(self, outputs):
-        """Recursively cast all output tensors to output_dtype."""
+        """Recursively cast floating-point output tensors to output_dtype (integers left unchanged)."""
         if torch.is_tensor(outputs):
+            if not outputs.is_floating_point():
+                return outputs
             return self.dtype_policy.cast_to_output(outputs)
         if isinstance(outputs, dict):
             return {k: self._cast_outputs(v) for k, v in outputs.items()}
