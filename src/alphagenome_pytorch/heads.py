@@ -588,36 +588,97 @@ class SpliceSitesJunctionHead(nn.Module):
             pred_counts: (B, D, A, 2*T)
             splice_junction_mask: (B, D, A, 2*T) bool
         """
+        splice_site_logits = self.conv(embeddings_1bp, organism_index)  # (B, H, S)
+
+        def _index_embeddings(embedding, indices):
+            # PyTorch non-contiguous advanced indexing: embedding[batch_idx, :, indices]
+            # returns (B, P, H) because the sliced dim is placed after advanced dims.
+            # Transpose to (B, H, P) so the result matches the (B, H, K) contract
+            # expected by _predict_from_sparse_logits.
+            Bsz = embedding.shape[0]
+            batch_idx = torch.arange(Bsz, device=embedding.device).unsqueeze(1)
+            return embedding[batch_idx, :, indices].transpose(1, 2)  # (B, P, H) → (B, H, P)
+
         assert splice_site_positions.shape[1] == 4
         pos_donor_idx    = splice_site_positions[:, 0, :]
         pos_acceptor_idx = splice_site_positions[:, 1, :]
         neg_donor_idx    = splice_site_positions[:, 2, :]
         neg_acceptor_idx = splice_site_positions[:, 3, :]
 
-        # Project: (B, C, S) → (B, H, S)
-        splice_site_logits = self.conv(embeddings_1bp, organism_index)
+        pos_donor_logits    = _index_embeddings(splice_site_logits, pos_donor_idx)
+        pos_acceptor_logits = _index_embeddings(splice_site_logits, pos_acceptor_idx)
+        neg_donor_logits    = _index_embeddings(splice_site_logits, neg_donor_idx)
+        neg_acceptor_logits = _index_embeddings(splice_site_logits, neg_acceptor_idx)
 
-        def _index_embeddings(embedding, indices):
-            """embedding: (B, H, S), indices: (B, P) → (B, P, H)"""
-            B = embedding.shape[0]
-            batch_idx = torch.arange(B, device=embedding.device).unsqueeze(1)
-            return embedding[batch_idx, :, indices]
+        return self._predict_from_sparse_logits(
+            pos_donor_logits, pos_acceptor_logits,
+            neg_donor_logits, neg_acceptor_logits,
+            splice_site_positions, organism_index,
+        )
 
-        def _apply_rope(embedding, indices, params):
-            x = _index_embeddings(embedding, indices)   # (B, P, H)
-            batch_params = params[organism_index]       # (B, 2, T, H)
-            scale  = batch_params[:, [0], :, :]
-            offset = batch_params[:, [1], :, :]
-            x = scale * x[:, :, None, :] + offset      # (B, P, T, H)
-            return apply_rope(x, indices, max_position=self._max_position_encoding_distance, inplace=True)
+    def _apply_rope_sparse(self, logits_nhk, global_positions, rope_key, organism_index):
+        """Apply scale/offset + RoPE to pre-extracted sparse logits.
 
-        pos_donor_logits    = _apply_rope(splice_site_logits, pos_donor_idx,    self.rope_params["pos_donor"])
-        pos_acceptor_logits = _apply_rope(splice_site_logits, pos_acceptor_idx, self.rope_params["pos_acceptor"])
-        neg_donor_logits    = _apply_rope(splice_site_logits, neg_donor_idx,    self.rope_params["neg_donor"])
-        neg_acceptor_logits = _apply_rope(splice_site_logits, neg_acceptor_idx, self.rope_params["neg_acceptor"])
+        Args:
+            logits_nhk: (B, H, K) — logits already extracted at K positions.
+            global_positions: (B, K) — global sequence coordinates used for RoPE frequencies.
+            rope_key: Key into self.rope_params.
+            organism_index: (B,)
 
-        pos_counts = F.softplus(torch.einsum("bdth,bath->bdat", pos_donor_logits, pos_acceptor_logits))
-        neg_counts = F.softplus(torch.einsum("bdth,bath->bdat", neg_donor_logits, neg_acceptor_logits))
+        Returns:
+            (B, K, T, H) tensor after RoPE.
+        """
+        x = logits_nhk.transpose(1, 2)                      # (B, K, H)
+        batch_params = self.rope_params[rope_key][organism_index]  # (B, 2, T, H)
+        scale  = batch_params[:, [0], :, :]                  # (B, 1, T, H)
+        offset = batch_params[:, [1], :, :]
+        x = scale * x[:, :, None, :] + offset                # (B, K, T, H)
+        return apply_rope(
+            x, global_positions,
+            max_position=self._max_position_encoding_distance,
+            inplace=True,
+        )
+
+    def _predict_from_sparse_logits(
+        self,
+        pos_donor_logits,    # (B, H, K)
+        pos_acceptor_logits, # (B, H, K)
+        neg_donor_logits,    # (B, H, K)
+        neg_acceptor_logits, # (B, H, K)
+        splice_site_positions,  # (B, 4, K) — global positions for RoPE + valid masking
+        organism_index,
+    ):
+        """Compute junction predictions from pre-extracted per-position logits.
+
+        Used by the sequence-parallel training path where each rank runs the 1x1
+        conv locally and the K sparse position logits are gathered across ranks,
+        avoiding a full-sequence all-gather of the 1bp embeddings.
+
+        Args:
+            pos_donor_logits: (B, H, K) — conv output already extracted at each position.
+            pos_acceptor_logits: (B, H, K)
+            neg_donor_logits: (B, H, K)
+            neg_acceptor_logits: (B, H, K)
+            splice_site_positions: (B, 4, K) — global positions; -1 = padding.
+            organism_index: (B,)
+
+        Returns:
+            pred_counts: (B, D, A, 2*T)
+            splice_junction_mask: (B, D, A, 2*T) bool
+        """
+        assert splice_site_positions.shape[1] == 4
+        pos_donor_idx    = splice_site_positions[:, 0, :]
+        pos_acceptor_idx = splice_site_positions[:, 1, :]
+        neg_donor_idx    = splice_site_positions[:, 2, :]
+        neg_acceptor_idx = splice_site_positions[:, 3, :]
+
+        pd = self._apply_rope_sparse(pos_donor_logits,    pos_donor_idx,    "pos_donor",    organism_index)
+        pa = self._apply_rope_sparse(pos_acceptor_logits, pos_acceptor_idx, "pos_acceptor", organism_index)
+        nd = self._apply_rope_sparse(neg_donor_logits,    neg_donor_idx,    "neg_donor",    organism_index)
+        na = self._apply_rope_sparse(neg_acceptor_logits, neg_acceptor_idx, "neg_acceptor", organism_index)
+
+        pos_counts = F.softplus(torch.einsum("bdth,bath->bdat", pd, pa))
+        neg_counts = F.softplus(torch.einsum("bdth,bath->bdat", nd, na))
 
         pos_mask = torch.einsum("bd,ba->bda", pos_donor_idx >= 0, pos_acceptor_idx >= 0)
         neg_mask = torch.einsum("bd,ba->bda", neg_donor_idx >= 0, neg_acceptor_idx >= 0)

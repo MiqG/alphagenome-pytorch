@@ -242,12 +242,17 @@ class SequenceParallelism:
         K_max = max(counts)
         B, C = x_local.shape[:2]
 
-        padded = torch.zeros(B, C, K_max, device=device)
+        padded = torch.zeros(B, C, K_max, device=device, dtype=x_local.dtype)
         padded[..., :K_local] = x_local
 
-        # Gather padded tensors
-        gathered = [torch.zeros_like(padded) for _ in range(world)]
-        dist.all_gather(gathered, padded)
+        # Use differentiable all_gather when gradient is needed (e.g. junction head
+        # conv logits under sequence parallelism); fall back to non-differentiable
+        # dist.all_gather otherwise to avoid the overhead of dist_fn.
+        if torch.is_grad_enabled() and x_local.requires_grad:
+            gathered = list(dist_fn.all_gather(padded))
+        else:
+            gathered = [torch.zeros_like(padded) for _ in range(world)]
+            dist.all_gather(gathered, padded)
 
         # Remove padding and concatenate
         out = []

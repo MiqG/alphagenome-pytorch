@@ -104,6 +104,146 @@ def _top_k_positions_from_logits(logits_ncl: torch.Tensor, top_k: int) -> torch.
     return positions
 
 
+def _gather_sparse_logits(
+    logits_local: torch.Tensor,
+    positions_bk: torch.Tensor,
+    sequence_parallel: Any,
+    global_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Gather 1x1-conv logits at sparse global positions across SP ranks.
+
+    Each rank holds a shard of the 1bp conv output (B, H, S_local). This
+    function collects, for every batch item, the logit vectors at K requested
+    global positions by having each rank contribute the positions that fall
+    within its shard, then all-gathering the results.
+
+    Args:
+        logits_local: (B, H, S_local) — local shard of conv output.
+        positions_bk: (B, K) — global positions; -1 = padding.
+        sequence_parallel: SequenceParallelism instance.
+        global_length: Total (unpadded) sequence length S.
+        device: Target device.
+
+    Returns:
+        (B, H, K) tensor; columns corresponding to -1 positions are zeros.
+    """
+    B, H, K = logits_local.shape[0], logits_local.shape[1], positions_bk.shape[1]
+    result = torch.zeros(B, H, K, device=device, dtype=logits_local.dtype)
+
+    for b in range(B):
+        pos_b = positions_bk[b]           # (K,)
+        valid_mask = pos_b >= 0           # (K,) bool
+        valid_pos = pos_b[valid_mask]     # (K_valid,)
+
+        if valid_pos.numel() == 0:
+            continue
+
+        # Sort so gather_positions returns embeddings in ascending-position order
+        # (each rank owns a contiguous range; rank-order concat = global order
+        # only when positions are sorted).
+        sorted_pos, sort_idx = torch.sort(valid_pos.long())
+        gathered = sequence_parallel.gather_positions(
+            logits_local[b : b + 1],      # (1, H, S_local)
+            overlap=0,                    # overlaps already stripped from emb_1bp
+            global_length=global_length,
+            global_indices=sorted_pos,
+        )                                 # (1, H, K_valid) in sorted-position order
+
+        # Unsort to restore original position ordering, then scatter into result.
+        unsort_idx = torch.argsort(sort_idx)
+        result[b : b + 1, :, valid_mask] = gathered[:, :, unsort_idx]
+
+    return result
+
+
+def _call_splice_junction_head_sp(
+    head,
+    emb_local: torch.Tensor,
+    annotated_positions,
+    organism_idx: torch.Tensor,
+    sequence_parallel: Any,
+    global_length: int,
+    junction_top_k: int | None,
+    cls_head,
+    device: torch.device,
+) -> dict:
+    """Sequence-parallel forward pass for SpliceSitesJunctionHead.
+
+    Avoids the O(B * C * S) memory cost of a full 1bp-embedding all-gather by
+    exploiting the fact that the junction head's first layer is a 1x1 conv
+    (MultiOrganismConv1d): each rank runs the conv locally on its shard, then
+    only the K sparse per-position logits are gathered across ranks.
+
+    Args:
+        head: SpliceSitesJunctionHead (unwrapped from DDP).
+        emb_local: (B, C, S_local) — local 1bp embedding shard (overlaps stripped).
+        annotated_positions: (B, 4, K) global positions from targets_dict, or None
+            when junction_top_k is set (predicted mode).
+        organism_idx: (B,) or (B, 1).
+        sequence_parallel: SequenceParallelism instance.
+        global_length: Total (unpadded) sequence length.
+        junction_top_k: If set, derive positions from classification head (predicted
+            mode); otherwise use annotated_positions (annotated mode).
+        cls_head: SpliceSitesClassificationHead (required when junction_top_k set).
+        device: Target device.
+
+    Returns:
+        Dict compatible with _compute_splice_loss: {pos_counts, neg_counts, positions}.
+    """
+    org = organism_idx[:, 0] if organism_idx.ndim > 1 else organism_idx
+    org = torch.zeros_like(org)
+
+    # ── Predicted mode: derive global positions from classification head ─────
+    if junction_top_k is not None:
+        if cls_head is None:
+            raise ValueError(
+                "junction_top_k requires cls_head for predicted-mode SP forward."
+            )
+        # cls head is also 1x1 conv → run locally, then gather the (B, 5, S) logits.
+        # 5*S floats per sample (~5 MB for S=1M) — cheap compared to 1536*S.
+        cls_logits_local = cls_head.conv(emb_local, org)   # (B, 5, S_local)
+        cls_logits_full  = sequence_parallel.gather_full(
+            cls_logits_local, overlap=0,
+        )                                                   # (B, 5, S)
+        positions = _top_k_positions_from_logits(cls_logits_full, junction_top_k)  # (B, 4, K)
+    else:
+        if annotated_positions is None:
+            return {}
+        positions = annotated_positions.to(device)
+
+    # Clamp -1 padding to 0 (safe dummy index; masked out in loss anyway).
+    positions_clamped = positions.clamp(min=0)
+
+    # ── Apply junction head's 1x1 conv locally ───────────────────────────────
+    logits_local = head.conv(emb_local, org)   # (B, H, S_local)
+
+    # ── Gather sparse logits at the K positions across ranks ─────────────────
+    gathered = []
+    for role in range(4):   # pos_donor, pos_acceptor, neg_donor, neg_acceptor
+        gathered.append(
+            _gather_sparse_logits(
+                logits_local,
+                positions_clamped[:, role, :],   # (B, K)
+                sequence_parallel,
+                global_length,
+                device,
+            )
+        )   # each: (B, H, K)
+
+    # ── Compute predictions using pre-extracted sparse logits ────────────────
+    pred_counts, splice_junction_mask = head._predict_from_sparse_logits(
+        *gathered, positions, org,
+    )
+
+    n_tissues = head._num_tissues
+    return {
+        "pos_counts": pred_counts[..., :n_tissues],
+        "neg_counts": pred_counts[..., n_tissues:],
+        "positions":  positions,
+    }
+
+
 def _call_splice_head(
     head,
     embeddings_dict,
@@ -1880,11 +2020,34 @@ def train_epoch_multihead(
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
                 # Embeddings are NCL (channels-first); splice heads handle channels_last=False internally.
-                predictions = _run_head(
-                    head, head_module, modality, embeddings_dict, organism_idx_tensor,
-                    targets_dict, device, junction_top_k, heads,
-                    embeddings_pair=embeddings_pair,
-                )
+                #
+                # Junction head under sequence parallelism: positions are global but
+                # embeddings_dict[1] is only the local shard.  Use the sparse gather
+                # path to avoid a full O(B*C*S) all-gather of the 1bp embedding.
+                if (
+                    sequence_parallel is not None
+                    and isinstance(head_module, SpliceSitesJunctionHead)
+                    and 1 in embeddings_dict
+                ):
+                    _cls_head = heads.get("splice_site")
+                    _cls_head = _cls_head.module if hasattr(_cls_head, "module") else _cls_head
+                    predictions = _call_splice_junction_head_sp(
+                        head_module,
+                        embeddings_dict[1],
+                        targets_dict.get("junction_positions"),
+                        organism_idx_tensor,
+                        sequence_parallel,
+                        original_length,
+                        junction_top_k,
+                        _cls_head,
+                        device,
+                    )
+                else:
+                    predictions = _run_head(
+                        head, head_module, modality, embeddings_dict, organism_idx_tensor,
+                        targets_dict, device, junction_top_k, heads,
+                        embeddings_pair=embeddings_pair,
+                    )
 
             modality_loss = torch.tensor(0.0, device=device)
 
