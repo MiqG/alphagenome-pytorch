@@ -1950,6 +1950,7 @@ def train_epoch_multihead(
             # Align sequence length so each rank's shard is divisible by 128.
             pad_multiple = world_size * 128 * 16
             seq_len = sequences.shape[1]
+            original_length = seq_len
             padded_len = ((seq_len + pad_multiple - 1) // pad_multiple) * pad_multiple
             if padded_len > seq_len:
                 n_pad = padded_len - seq_len
@@ -1961,7 +1962,6 @@ def train_epoch_multihead(
                         stacklevel=2,
                     )
                 sequences = torch.nn.functional.pad(sequences, (0, 0, 0, n_pad))
-                original_length = seq_len
 
             model_module = model.module if hasattr(model, "module") else model
             model_module.train()
@@ -2052,15 +2052,18 @@ def train_epoch_multihead(
             modality_loss = torch.tensor(0.0, device=device)
 
             if isinstance(head_module, SPLICE_HEAD_TYPES):
-                # In SP mode, slice sequence-length dimension of integer-keyed targets per rank.
+                # In SP mode, slice sequence-length dimension of all sequence-length targets per rank.
                 if sequence_parallel is not None:
                     local_len = next(
                         (tgt.shape[1] // world_size for k, tgt in targets_dict.items() if isinstance(k, int)),
                         None,
                     )
                     t_start = rank * local_len if local_len is not None else 0
+                    full_len = local_len * world_size if local_len is not None else None
                     splice_targets = {
-                        k: (tgt.to(device)[:, t_start:t_start + local_len, :] if isinstance(k, int) else tgt.to(device))
+                        k: (tgt.to(device)[:, t_start:t_start + local_len, :]
+                            if isinstance(tgt, torch.Tensor) and full_len is not None and tgt.ndim >= 2 and tgt.shape[1] == full_len
+                            else (tgt.to(device) if isinstance(tgt, torch.Tensor) else tgt))
                         for k, tgt in targets_dict.items()
                     }
                 else:
@@ -2575,7 +2578,7 @@ def validate_multihead(
                 all_true = gather_tensors(all_true, world_size, device)
             if all_true.sum() > 0 and all_pred.shape[0] > 1:
                 metrics[f"{modality}_auprc_junction"] = _avg_prec(
-                    all_true.numpy(), all_pred.numpy()
+                    all_true.cpu().numpy(), all_pred.cpu().numpy()
                 )
 
     # Compute per-sample Pearson rows (only when compute_per_sample=True)
@@ -2658,8 +2661,8 @@ def validate_multihead(
 
             # Keep only positions where any class is active
             active = all_true.any(dim=-1).reshape(-1)
-            probs_flat = probs.reshape(-1, 5)[active].numpy()
-            true_flat  = all_true.reshape(-1, 5)[active].numpy()
+            probs_flat = probs.reshape(-1, 5)[active].cpu().numpy()
+            true_flat  = all_true.reshape(-1, 5)[active].cpu().numpy()
 
             if true_flat.shape[0] == 0:
                 continue

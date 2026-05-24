@@ -1052,19 +1052,25 @@ def create_dataloaders(
     rank: int,
     is_multimodal: bool = False,
     sequence_parallel_mode: bool = False,
+    seed: int = 42,
 ) -> tuple[DataLoader, DataLoader, DistributedSampler | None, DistributedSampler | None]:
     """Create data loaders with optional distributed samplers.
 
     Args:
         sequence_parallel_mode: If True, use non-distributed sampler (all ranks see same data).
+        seed: RNG seed; in SP mode all ranks use the same seed so shuffle order is identical.
     """
     # In sequence-parallel mode, all ranks must process the same sequence (shards of it)
     if sequence_parallel_mode:
         train_sampler = None
         val_sampler = None
+        # All SP ranks must see the same batch ordering — use a shared fixed-seed generator
+        sp_generator = torch.Generator()
+        sp_generator.manual_seed(seed)
     else:
         train_sampler = DistributedSampler(train_dataset, shuffle=True) if world_size > 1 else None
         val_sampler = DistributedSampler(val_dataset, shuffle=False) if world_size > 1 else None
+        sp_generator = None
 
     # Always use collate_multimodal since we now always use MultimodalDataset
     collate_fn = collate_multimodal
@@ -1074,6 +1080,7 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
+        generator=sp_generator,
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_fn,
@@ -1368,6 +1375,7 @@ def main() -> None:
         rank,
         is_multimodal=True,  # Always multimodal now
         sequence_parallel_mode=args.sequence_parallel,
+        seed=args.seed,
     )
     print_rank0(f"Train batches: {len(train_loader):,}, Val batches: {len(val_loader):,}", rank)
 
@@ -1432,7 +1440,7 @@ def main() -> None:
     # Scheduler
     total_steps = (args.epochs * len(train_loader)) // args.gradient_accumulation_steps
     scheduler = create_lr_scheduler(optimizer, args.warmup_steps, total_steps, schedule=args.lr_schedule)
-    effective_batch_size = args.batch_size * args.gradient_accumulation_steps * world_size
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps * (1 if args.sequence_parallel else world_size)
     print_rank0(f"Gradient accumulation: {args.gradient_accumulation_steps}", rank)
     print_rank0(f"Effective batch size: {effective_batch_size}", rank)
     print_rank0(f"Total optimizer steps: {total_steps:,}", rank)
