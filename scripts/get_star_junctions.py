@@ -29,12 +29,35 @@ from __future__ import annotations
 
 import argparse
 import io
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError:
+    sys.exit(
+        "Error: pandas is required.\n"
+        "Install with:  pip install pandas"
+    )
+
+try:
+    import pysam  # noqa: F401 — checked here so the error surfaces early
+except ImportError:
+    sys.exit(
+        "Error: pysam is required.\n"
+        "Install with:  pip install pysam\n"
+        "  or (conda):  conda install -c bioconda pysam"
+    )
+
+if shutil.which("regtools") is None:
+    sys.exit(
+        "Error: regtools is required but was not found on PATH.\n"
+        "Install with:  conda install -c bioconda regtools\n"
+        "  or see:      https://regtools.readthedocs.io/en/latest/install/"
+    )
 
 
 STRAND_CODE = {"+": 1, "-": 2, ".": 0}
@@ -158,11 +181,6 @@ def _pysam_unique_counts(
 
     Returns {(chrom, intron_start_1based, intron_end_1based): count}.
     """
-    try:
-        import pysam
-    except ImportError as e:
-        raise ImportError("pysam is required") from e
-
     bam = pysam.AlignmentFile(bam_path, "rb")
 
     if not chroms:
