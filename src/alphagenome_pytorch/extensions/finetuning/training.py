@@ -2052,20 +2052,32 @@ def train_epoch_multihead(
             modality_loss = torch.tensor(0.0, device=device)
 
             if isinstance(head_module, SPLICE_HEAD_TYPES):
-                # In SP mode, slice sequence-length dimension of all sequence-length targets per rank.
+                # In SP mode, slice sequence-aligned targets ("probs", "usage") to the local
+                # shard. Sparse junction targets ("junction_matrix", "junction_positions",
+                # "all_junctions") must NOT be sliced — they use global positions and are
+                # handled by _call_splice_junction_head_sp.
                 if sequence_parallel is not None:
-                    local_len = next(
-                        (tgt.shape[1] // world_size for k, tgt in targets_dict.items() if isinstance(k, int)),
+                    _SEQ_KEYS = ("probs", "usage")
+                    full_len = next(
+                        (tgt.shape[1] for k, tgt in targets_dict.items()
+                         if k in _SEQ_KEYS and isinstance(tgt, torch.Tensor) and tgt.ndim >= 2),
                         None,
                     )
-                    t_start = rank * local_len if local_len is not None else 0
-                    full_len = local_len * world_size if local_len is not None else None
-                    splice_targets = {
-                        k: (tgt.to(device)[:, t_start:t_start + local_len, :]
-                            if isinstance(tgt, torch.Tensor) and full_len is not None and tgt.ndim >= 2 and tgt.shape[1] == full_len
-                            else (tgt.to(device) if isinstance(tgt, torch.Tensor) else tgt))
-                        for k, tgt in targets_dict.items()
-                    }
+                    if full_len is not None:
+                        local_len = full_len // world_size
+                        t_start = rank * local_len
+                        splice_targets = {
+                            k: (tgt.to(device)[:, t_start:t_start + local_len, :]
+                                if k in _SEQ_KEYS and isinstance(tgt, torch.Tensor)
+                                and tgt.ndim >= 2 and tgt.shape[1] == full_len
+                                else (tgt.to(device) if isinstance(tgt, torch.Tensor) else tgt))
+                            for k, tgt in targets_dict.items()
+                        }
+                    else:
+                        splice_targets = {
+                            k: (tgt.to(device) if isinstance(tgt, torch.Tensor) else tgt)
+                            for k, tgt in targets_dict.items()
+                        }
                 else:
                     splice_targets = targets_dict
                 modality_loss, splice_components = _compute_splice_loss(
@@ -2073,6 +2085,17 @@ def train_epoch_multihead(
                     num_segments=num_segments,
                     junction_loss=junction_loss,
                 )
+                # In SP mode, SpliceSitesJunctionHead all-gathers logits at every
+                # rank so all ranks compute the identical full junction loss.  After
+                # dist.all_reduce(SUM) the gradients would be world_size× too large
+                # relative to heads that process only their local sequence shard.
+                # Divide here so the effective gradient matches singlegpu / DDP.
+                if (
+                    sequence_parallel is not None
+                    and world_size > 1
+                    and isinstance(head_module, SpliceSitesJunctionHead)
+                ):
+                    modality_loss = modality_loss / world_size
                 for k, v in splice_components.items():
                     loss_components[f"{modality}_{k}"] = v
             else:
@@ -2151,11 +2174,13 @@ def train_epoch_multihead(
                 trainable_params.extend([p for p in head.parameters() if p.requires_grad])
             trainable_params.extend([p for p in model.parameters() if p.requires_grad])
 
-            # SP bypasses DDP's allreduce hook — manually average gradients across ranks.
+            # SP bypasses DDP's allreduce hook — sum gradients across ranks.
+            # Each rank holds complementary sequence shards (not data-parallel copies),
+            # so gradients must be summed (not averaged) to reconstruct the full gradient.
             if sequence_parallel is not None and world_size > 1:
                 for p in trainable_params:
                     if p.grad is not None:
-                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
             optimizer.step()
