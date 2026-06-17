@@ -452,6 +452,7 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--compile", action="store_true", help="Use torch.compile")
     train.add_argument("--seed", type=int, default=None, help="Random seed")
     train.add_argument("--eval-train-pearson", action="store_true", help="Run an eval pass on train set each epoch to compute Pearson R")
+    train.add_argument("--no-val-pearson", action="store_true", default=False, help="Skip Pearson R computation during validation (faster, lower memory; use --eval-only for full metrics)")
     train.add_argument("--metrics-per-sample", action="store_true", default=False, help="Also write per-biological-sample rows to epoch_log.csv (splice_junctions and splice_usage only)")
     train.add_argument("--eval-only", action="store_true", help="Load checkpoint and run validation metrics without training; outputs to eval_only_metrics.json")
 
@@ -1581,7 +1582,7 @@ def main() -> None:
             resolution_weights=resolution_weights_per_modality,
             positional_weight=args.positional_weight,
             count_weight=args.count_weight,
-            compute_pearson=True,
+            compute_pearson=True,  # eval-only mode always computes Pearson
             num_segments=args.num_segments,
             min_segment_size=args.min_segment_size,
             rank=rank, world_size=world_size,
@@ -1736,7 +1737,7 @@ def main() -> None:
                 use_amp=use_amp,
                 num_segments=args.num_segments,
                 min_segment_size=args.min_segment_size,
-                compute_pearson=True,
+                compute_pearson=not args.no_val_pearson,
                 rank=rank, world_size=world_size,
                 encoder_only=encoder_only,
                 junction_top_k=_junction_top_k,
@@ -1751,7 +1752,10 @@ def main() -> None:
                 n_val = len(val_loader.dataset)
                 train_ds = train_loader.dataset
                 n_sample = min(n_val, len(train_ds))
-                subset_indices = torch.randperm(len(train_ds))[:n_sample].tolist()
+                # In SP mode all ranks must process the same batches — use a shared seed.
+                _perm_gen = torch.Generator()
+                _perm_gen.manual_seed(args.seed + epoch)
+                subset_indices = torch.randperm(len(train_ds), generator=_perm_gen)[:n_sample].tolist()
                 train_eval_loader = DataLoader(
                     torch.utils.data.Subset(train_ds, subset_indices),
                     batch_size=train_loader.batch_size,

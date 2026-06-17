@@ -528,24 +528,26 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
     elif isinstance(head, SpliceSitesUsageHead):
         pred = predictions[1]
         target = targets_dict["usage"].to(device)
+        # Match JAX pretraining objective: all positions contribute, non-junction
+        # positions have target clipped from 0 to 1e-7 (pushes predictions toward 0).
+        # JAX ref: heads.py SpliceSitesUsageHead.loss — mask is track-level only.
         if num_segments > 1:
             loss = _partitioned_loss(
                 pred, target,
                 num_partitions=num_segments,
                 loss_fn=lambda p, t: binary_crossentropy_from_logits(
                     y_pred=p,
-                    y_true=t.float(),
-                    mask=(t > 0).any(dim=-1, keepdim=True).expand_as(p),
+                    y_true=t.float().clamp(1e-7, 1.0 - 1e-7),
+                    mask=torch.ones_like(p, dtype=torch.bool),
                 ),
-                mask_fn=lambda t: (t > 0).any(dim=-1, keepdim=True).expand_as(t),
+                mask_fn=lambda t: torch.ones_like(t, dtype=torch.bool),
                 device=device,
             )
         else:
-            mask = (target > 0).any(dim=-1, keepdim=True).expand_as(pred)
             loss = binary_crossentropy_from_logits(
                 y_pred=pred,
-                y_true=target.float(),
-                mask=mask,
+                y_true=target.float().clamp(1e-7, 1.0 - 1e-7),
+                mask=torch.ones_like(pred, dtype=torch.bool),
             )
         return loss, {"usage_loss": loss.item()}
 
@@ -2396,15 +2398,31 @@ def validate_multihead(
                     junction_loss=junction_loss,
                 )
                 if compute_pearson:
-                    # Accumulate logits + one-hot targets for auPRC (classification head only)
+                    # Accumulate logits + one-hot targets for auPRC (classification head only).
+                    # Keep all active (splice-site) positions + an equal-sized random subsample
+                    # of background positions so auPRC includes true negatives without
+                    # accumulating the full (B, S, 5) tensors at 1bp resolution (OOM).
                     if isinstance(head_module, SpliceSitesClassificationHead):
                         if 1 in predictions_scaled and "probs" in targets_dict:
-                            accumulated_cls[modality]["logits"].append(
-                                predictions_scaled[1].float().cpu()
-                            )
-                            accumulated_cls[modality]["true"].append(
-                                targets_dict["probs"].float().cpu()
-                            )
+                            _logits_flat = predictions_scaled[1].float().reshape(-1, 5)  # (B*S, 5)
+                            _true_flat   = targets_dict["probs"].float().reshape(-1, 5)  # (B*S, 5)
+                            _active_flat = _true_flat.any(dim=-1)                        # (B*S,)
+                            n_active = int(_active_flat.sum().item())
+                            parts_logits, parts_true = [], []
+                            if n_active > 0:
+                                parts_logits.append(_logits_flat[_active_flat])
+                                parts_true.append(_true_flat[_active_flat])
+                                # Subsample background at 1:1 ratio with active positions
+                                _bg_idx = (~_active_flat).nonzero(as_tuple=True)[0]
+                                n_bg = _bg_idx.shape[0]
+                                if n_bg > 0:
+                                    n_sample = min(n_active, n_bg)
+                                    perm = torch.randperm(n_bg, device=_logits_flat.device)[:n_sample]
+                                    parts_logits.append(_logits_flat[_bg_idx[perm]])
+                                    parts_true.append(_true_flat[_bg_idx[perm]])
+                            if parts_logits:
+                                accumulated_cls[modality]["logits"].append(torch.cat(parts_logits).cpu())
+                                accumulated_cls[modality]["true"].append(torch.cat(parts_true).cpu())
 
                     result = _extract_splice_pearson_pairs(
                         head_module, predictions_scaled, targets_dict, device
@@ -2680,14 +2698,12 @@ def validate_multihead(
             if not accumulated_cls[modality]["logits"]:
                 continue
 
-            all_logits = torch.cat(accumulated_cls[modality]["logits"], dim=0)  # (N, S, 5)
-            all_true   = torch.cat(accumulated_cls[modality]["true"],   dim=0)  # (N, S, 5)
+            # Tensors contain active positions + subsampled background (already (N, 5) shaped).
+            all_logits = torch.cat(accumulated_cls[modality]["logits"], dim=0)  # (N, 5)
+            all_true   = torch.cat(accumulated_cls[modality]["true"],   dim=0)  # (N, 5)
             probs = F.softmax(all_logits, dim=-1)
-
-            # Keep only positions where any class is active
-            active = all_true.any(dim=-1).reshape(-1)
-            probs_flat = probs.reshape(-1, 5)[active].cpu().numpy()
-            true_flat  = all_true.reshape(-1, 5)[active].cpu().numpy()
+            probs_flat = probs.cpu().numpy()
+            true_flat  = all_true.cpu().numpy()
 
             if true_flat.shape[0] == 0:
                 continue
