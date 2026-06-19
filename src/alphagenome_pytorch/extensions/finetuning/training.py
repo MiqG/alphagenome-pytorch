@@ -478,7 +478,7 @@ def _get_junction_targets(predictions, targets_dict, device):
 
 
 def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: int = 1,
-                         junction_loss: str = "original"):
+                         junction_loss: str = "original", min_alpha_juncs: int = 5):
     """Compute loss for any of the three splice head types.
 
     Args:
@@ -495,6 +495,13 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
             Defaults to 1 (standard global mean, unchanged behaviour).
         junction_loss: Cross-entropy variant for the junction head. "original" matches
             JAX pre-de264f5; "normalized" matches JAX post-de264f5 (ratio CE).
+        min_alpha_juncs: Minimum junction read depth (alpha) for a splice site to
+            contribute to the SSU loss.  Positions with 0 < alpha < min_alpha_juncs
+            are excluded to avoid training on low-confidence SSU estimates.
+            Background positions (alpha == 0) are also excluded so the model only
+            trains on well-supported observations.  Set to 0 to include all positions.
+            Defaults to 5.  Requires 'usage_alpha' key in targets_dict; falls back
+            to ones_like mask when absent.
 
     Returns:
         (loss_tensor, components_dict) where components_dict has keys like
@@ -528,10 +535,22 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
     elif isinstance(head, SpliceSitesUsageHead):
         pred = predictions[1]
         target = targets_dict["usage"].to(device)
-        # Match JAX pretraining objective: all positions contribute, non-junction
-        # positions have target clipped from 0 to 1e-7 (pushes predictions toward 0).
-        # JAX ref: heads.py SpliceSitesUsageHead.loss — mask is track-level only.
-        if num_segments > 1:
+        # Coverage-based mask: only positions with alpha >= min_alpha_juncs contribute.
+        # This avoids the 430:1 class imbalance from including all background positions
+        # while also excluding low-confidence sites (0 < alpha < threshold).
+        # When the alpha mask is active, _partitioned_loss is not used — it would need
+        # the mask to be sliced in sync with pred/target chunks (unsupported by the
+        # current interface), and the imbalance problem that partitioning addresses is
+        # already solved by only training on high-confidence splice sites.
+        if "usage_alpha" in targets_dict and min_alpha_juncs > 0:
+            alpha = targets_dict["usage_alpha"].to(device)
+            usage_mask = (alpha >= min_alpha_juncs)
+            loss = binary_crossentropy_from_logits(
+                y_pred=pred,
+                y_true=target.float().clamp(1e-7, 1.0 - 1e-7),
+                mask=usage_mask,
+            )
+        elif num_segments > 1:
             loss = _partitioned_loss(
                 pred, target,
                 num_partitions=num_segments,
@@ -1841,6 +1860,7 @@ def train_epoch_multihead(
     junction_top_k: int | None = None,
     junction_loss: str = "original",
     sequence_parallel: Any | None = None,
+    min_alpha_juncs: int = 5,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -2086,6 +2106,7 @@ def train_epoch_multihead(
                     head_module, predictions, splice_targets, device,
                     num_segments=num_segments,
                     junction_loss=junction_loss,
+                    min_alpha_juncs=min_alpha_juncs,
                 )
                 # In SP mode, SpliceSitesJunctionHead all-gathers logits at every
                 # rank so all ranks compute the identical full junction loss.  After
@@ -2281,6 +2302,7 @@ def validate_multihead(
     junction_top_k: int | None = None,
     junction_loss: str = "original",
     compute_per_sample: bool = False,
+    min_alpha_juncs: int = 5,
 ) -> tuple[float, dict[str, Any]]:
     """Validate model with multiple modality heads.
 
@@ -2396,6 +2418,7 @@ def validate_multihead(
                     head_module, predictions_scaled, targets_dict, device,
                     num_segments=num_segments,
                     junction_loss=junction_loss,
+                    min_alpha_juncs=min_alpha_juncs,
                 )
                 if compute_pearson:
                     # Accumulate logits + one-hot targets for auPRC (classification head only).

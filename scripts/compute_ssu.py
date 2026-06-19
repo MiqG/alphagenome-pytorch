@@ -267,6 +267,17 @@ def compute_spliser_counts(
     beta1_bam: defaultdict = defaultdict(int)
     beta2_bam: defaultdict = defaultdict(int)
 
+    # strand-agnostic accumulators (AlphaGenome-style: "regardless of strand")
+    donor_alpha_ag_bam:    defaultdict = defaultdict(int)
+    acceptor_alpha_ag_bam: defaultdict = defaultdict(int)
+    beta1_ag_bam:          defaultdict = defaultdict(int)
+
+    # truly unstranded α: find_introns on ALL reads before majority-rule, so
+    # reads with ambiguous strand flags (excluded by _check_strand_from_flag)
+    # also contribute.  β1 reuses beta1_ag_bam (already all-reads).
+    donor_alpha_nostr_bam:    defaultdict = defaultdict(int)
+    acceptor_alpha_nostr_bam: defaultdict = defaultdict(int)
+
     for chrom, chrom_junc in junctions.groupby("chrom"):
         # ── Target index ───────────────────────────────────────────────
         # donor scan pos    = exon_start      (= iv_s,   0-based intron start)
@@ -303,6 +314,18 @@ def compute_spliser_counts(
         # for introns seen on both strands, keep only the dominant strand to prevent
         # antisense-noise reads from polluting the whiteset of the sense strand.
         whiteset: dict[str, set[int]] = {"+": set(), "-": set()}
+
+        # Unstranded introns: all filtered reads, no strand check.
+        # Differs from alpha_ag (which sums majority-rule strand counts) only for
+        # reads whose strand flag is ambiguous — those are excluded by
+        # _check_strand_from_flag and therefore absent from _introns_by_strand.
+        _gen_nostr = (
+            r for r in bam.fetch(chrom)
+            if not r.is_unmapped and not r.is_secondary and not r.is_supplementary
+            and r.mapping_quality >= mapq_min
+        )
+        _introns_nostr: dict = dict(bam.find_introns(_gen_nostr))
+
         _gen_p = (
             r for r in bam.fetch(chrom)
             if not r.is_unmapped and not r.is_secondary and not r.is_supplementary
@@ -350,6 +373,15 @@ def compute_spliser_counts(
             for strand, pos_roles in chrom_target_roles.items()
         }
 
+        # Strand-agnostic target index: union of all positions from both strands.
+        chrom_targets_ag: dict[int, set[str]] = {}
+        for s in ("+", "-"):
+            for pos, roles in chrom_target_roles[s].items():
+                if pos not in chrom_targets_ag:
+                    chrom_targets_ag[pos] = set()
+                chrom_targets_ag[pos].update(roles)
+        targets_ag_sorted = sorted(chrom_targets_ag)
+
         # Alpha from the collapsed intron dict (same majority-rule as whiteset/SpliSER).
         chrom_donor_alpha:    defaultdict = defaultdict(int)
         chrom_acceptor_alpha: defaultdict = defaultdict(int)
@@ -357,6 +389,13 @@ def compute_spliser_counts(
             for (iv_s, iv_e), count in _introns_s.items():
                 chrom_donor_alpha[(iv_s, s)]    += count
                 chrom_acceptor_alpha[(iv_e, s)] += count
+
+        # Unstranded alpha: from _introns_nostr, no strand assignment.
+        chrom_donor_alpha_nostr:    defaultdict = defaultdict(int)
+        chrom_acceptor_alpha_nostr: defaultdict = defaultdict(int)
+        for (iv_s, iv_e), count in _introns_nostr.items():
+            chrom_donor_alpha_nostr[iv_s]    += count
+            chrom_acceptor_alpha_nostr[iv_e] += count
 
         # Single streaming pass for beta counting.
         for read in bam.fetch(chrom):
@@ -430,41 +469,91 @@ def compute_spliser_counts(
                         elif is_in_block:
                             beta1_bam[key] += 1
 
+            # Strand-agnostic beta1: check ALL reads against the merged target set,
+            # regardless of which strand identified the splice site.
+            lo_ag = bisect.bisect_left(targets_ag_sorted, read.reference_start)
+            hi_ag = bisect.bisect_right(targets_ag_sorted, read.reference_end - 1)
+            for target_pos in targets_ag_sorted[lo_ag:hi_ag]:
+                for role in chrom_targets_ag[target_pos]:
+                    if role == "donor":
+                        is_alpha_ag  = any(iv_s == target_pos for iv_s, _ in introns)
+                        is_in_gap_ag = any(iv_s < target_pos < iv_e for iv_s, iv_e in introns)
+                    else:
+                        is_alpha_ag  = any(iv_e == target_pos + 1 for _, iv_e in introns)
+                        is_in_gap_ag = any(iv_s < target_pos < iv_e for iv_s, iv_e in introns)
+                    is_in_block_ag = any(bs < target_pos < be for bs, be in blocks)
+                    if not is_alpha_ag and not is_in_gap_ag and is_in_block_ag:
+                        beta1_ag_bam[(chrom, target_pos, role)] += 1
+
         for (pos, strand), count in chrom_donor_alpha.items():
             donor_alpha_bam[(chrom, pos, strand)] = count
+            donor_alpha_ag_bam[(chrom, pos)] += count
         for (pos, strand), count in chrom_acceptor_alpha.items():
             acceptor_alpha_bam[(chrom, pos, strand)] = count
+            acceptor_alpha_ag_bam[(chrom, pos)] += count
+        for pos, count in chrom_donor_alpha_nostr.items():
+            donor_alpha_nostr_bam[(chrom, pos)] += count
+        for pos, count in chrom_acceptor_alpha_nostr.items():
+            acceptor_alpha_nostr_bam[(chrom, pos)] += count
 
     bam.close()
 
     rows = []
     for (chrom, pos, strand), alpha in donor_alpha_bam.items():
-        b1    = beta1_bam.get((chrom, pos, strand, "donor"), 0)
-        b2    = beta2_bam.get((chrom, pos, strand, "donor"), 0)
-        denom = alpha + b1 + b2
+        b1              = beta1_bam.get((chrom, pos, strand, "donor"), 0)
+        b2              = beta2_bam.get((chrom, pos, strand, "donor"), 0)
+        denom           = alpha + b1 + b2
+        denom_b1        = alpha + b1
+        a_ag            = donor_alpha_ag_bam.get((chrom, pos), 0)
+        b1_ag           = beta1_ag_bam.get((chrom, pos, "donor"), 0)
+        denom_ag        = a_ag + b1_ag
+        a_nostr         = donor_alpha_nostr_bam.get((chrom, pos), 0)
+        denom_nostr     = a_nostr + b1_ag
+        denom_str_nostr = alpha + b1_ag
         rows.append({
-            "chrom":       chrom,
-            "position":    pos,
-            "strand":      strand,
-            "role":        "donor",
-            "alpha_bam":   int(alpha),
-            "beta1_bam":   int(b1),
-            "beta2_bam":   int(b2),
-            "ssu_spliser": alpha / denom if denom > 0 else float("nan"),
+            "chrom":              chrom,
+            "position":           pos,
+            "strand":             strand,
+            "role":               "donor",
+            "alpha_bam":          int(alpha),
+            "beta1_bam":          int(b1),
+            "beta2_bam":          int(b2),
+            "ssu_spliser":        alpha   / denom           if denom           > 0 else float("nan"),
+            "ssu_b1only":         alpha   / denom_b1        if denom_b1        > 0 else float("nan"),
+            "alpha_ag":           int(a_ag),
+            "beta1_ag":           int(b1_ag),
+            "ssu_ag":             a_ag    / denom_ag        if denom_ag        > 0 else float("nan"),
+            "ssu_str_a_nostr_b1": alpha   / denom_str_nostr if denom_str_nostr > 0 else float("nan"),
+            "alpha_nostr":        int(a_nostr),
+            "ssu_nostr":          a_nostr / denom_nostr     if denom_nostr     > 0 else float("nan"),
         })
     for (chrom, pos, strand), alpha in acceptor_alpha_bam.items():
-        b1    = beta1_bam.get((chrom, pos, strand, "acceptor"), 0)
-        b2    = beta2_bam.get((chrom, pos, strand, "acceptor"), 0)
-        denom = alpha + b1 + b2
+        b1              = beta1_bam.get((chrom, pos, strand, "acceptor"), 0)
+        b2              = beta2_bam.get((chrom, pos, strand, "acceptor"), 0)
+        denom           = alpha + b1 + b2
+        denom_b1        = alpha + b1
+        a_ag            = acceptor_alpha_ag_bam.get((chrom, pos), 0)
+        b1_ag           = beta1_ag_bam.get((chrom, pos, "acceptor"), 0)
+        denom_ag        = a_ag + b1_ag
+        a_nostr         = acceptor_alpha_nostr_bam.get((chrom, pos), 0)
+        denom_nostr     = a_nostr + b1_ag
+        denom_str_nostr = alpha + b1_ag
         rows.append({
-            "chrom":       chrom,
-            "position":    pos + 1,
-            "strand":      strand,
-            "role":        "acceptor",
-            "alpha_bam":   int(alpha),
-            "beta1_bam":   int(b1),
-            "beta2_bam":   int(b2),
-            "ssu_spliser": alpha / denom if denom > 0 else float("nan"),
+            "chrom":              chrom,
+            "position":           pos + 1,
+            "strand":             strand,
+            "role":               "acceptor",
+            "alpha_bam":          int(alpha),
+            "beta1_bam":          int(b1),
+            "beta2_bam":          int(b2),
+            "ssu_spliser":        alpha   / denom           if denom           > 0 else float("nan"),
+            "ssu_b1only":         alpha   / denom_b1        if denom_b1        > 0 else float("nan"),
+            "alpha_ag":           int(a_ag),
+            "beta1_ag":           int(b1_ag),
+            "ssu_ag":             a_ag    / denom_ag        if denom_ag        > 0 else float("nan"),
+            "ssu_str_a_nostr_b1": alpha   / denom_str_nostr if denom_str_nostr > 0 else float("nan"),
+            "alpha_nostr":        int(a_nostr),
+            "ssu_nostr":          a_nostr / denom_nostr     if denom_nostr     > 0 else float("nan"),
         })
 
     df = pd.DataFrame(rows)
@@ -583,7 +672,11 @@ def main() -> None:
     if df_spliser is not None and not df_spliser.empty:
         df = df.merge(
             df_spliser[["chrom", "position", "strand", "role",
-                        "alpha_bam", "beta1_bam", "beta2_bam", "ssu_spliser"]],
+                        "alpha_bam", "beta1_bam", "beta2_bam",
+                        "ssu_spliser", "ssu_b1only",
+                        "alpha_ag", "beta1_ag", "ssu_ag",
+                        "ssu_str_a_nostr_b1",
+                        "alpha_nostr", "ssu_nostr"]],
             left_on=["chrom", "exon_pos", "strand", "role"],
             right_on=["chrom", "position", "strand", "role"],
             how="left",
@@ -591,7 +684,11 @@ def main() -> None:
         denom = df["alpha_juncs"] + df["beta1_bam"].fillna(0) + df["beta2_juncs"]
         df["ssu_full"] = (df["alpha_juncs"] / denom).where(denom > 0)
     elif args.bam is not None:
-        for col in ("alpha_bam", "beta1_bam", "beta2_bam", "ssu_spliser", "ssu_full"):
+        for col in ("alpha_bam", "beta1_bam", "beta2_bam",
+                    "ssu_spliser", "ssu_b1only", "ssu_full",
+                    "alpha_ag", "beta1_ag", "ssu_ag",
+                    "ssu_str_a_nostr_b1",
+                    "alpha_nostr", "ssu_nostr"):
             df[col] = float("nan")
 
     n_b2_zero = int((df["beta2_juncs"] == 0).sum())

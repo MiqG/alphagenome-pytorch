@@ -454,6 +454,17 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--eval-train-pearson", action="store_true", help="Run an eval pass on train set each epoch to compute Pearson R")
     train.add_argument("--no-val-pearson", action="store_true", default=False, help="Skip Pearson R computation during validation (faster, lower memory; use --eval-only for full metrics)")
     train.add_argument("--metrics-per-sample", action="store_true", default=False, help="Also write per-biological-sample rows to epoch_log.csv (splice_junctions and splice_usage only)")
+    train.add_argument(
+        "--min-alpha-juncs",
+        type=int,
+        default=5,
+        help=(
+            "Minimum junction read depth (alpha) for a splice site to contribute to the SSU "
+            "loss.  Positions with 0 < alpha < threshold are excluded to avoid training on "
+            "low-confidence SSU estimates; background positions (alpha=0) are also excluded. "
+            "Set to 0 to include all positions (reverts to ones_like mask). Default: 5."
+        ),
+    )
     train.add_argument("--eval-only", action="store_true", help="Load checkpoint and run validation metrics without training; outputs to eval_only_metrics.json")
 
     # Distributed/Sequence Parallel arguments
@@ -1590,6 +1601,7 @@ def main() -> None:
             junction_top_k=_junction_top_k,
             junction_loss=args.junction_loss,
             compute_per_sample=args.metrics_per_sample,
+            min_alpha_juncs=args.min_alpha_juncs,
         )
 
         val_loss, val_metrics = validate_multihead(val_loader=val_loader, **_eval_validate_kwargs)
@@ -1717,6 +1729,7 @@ def main() -> None:
                     organism_idx=args.organism_idx,
                     junction_top_k=_junction_top_k,
                     junction_loss=args.junction_loss,
+                    min_alpha_juncs=args.min_alpha_juncs,
                 )
 
             skip_batches = 0  # Only skip on first resumed epoch
@@ -1744,6 +1757,7 @@ def main() -> None:
                 organism_idx=args.organism_idx,
                 junction_loss=args.junction_loss,
                 compute_per_sample=args.metrics_per_sample,
+                min_alpha_juncs=args.min_alpha_juncs,
             )
 
             # Optional train-set Pearson eval pass

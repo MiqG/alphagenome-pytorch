@@ -1194,21 +1194,31 @@ class SplicingDataset(Dataset):
             cls_arr = self._splice_sites_to_classification_array(cls_sources, chrom, start, seq_len)
 
             usage_tracks = []
+            alpha_tracks = []
             for ssu_df in ssu_dfs:
-                pos_arr, neg_arr = self._ssu_to_arrays_by_strand(ssu_df, chrom, start, seq_len)
+                pos_arr, neg_arr, pos_alpha, neg_alpha = self._ssu_to_arrays_by_strand(
+                    ssu_df, chrom, start, seq_len
+                )
                 usage_tracks.append(pos_arr)
                 usage_tracks.append(neg_arr)
+                alpha_tracks.append(pos_alpha)
+                alpha_tracks.append(neg_alpha)
         else:
             # Fallback: classification from junction sites + optional GTF; usage as SSU approx
             cls_juncs = self._all_juncs + ([self._gtf_juncs] if self._gtf_juncs is not None else [])
             cls_arr = self._junctions_to_classification_array(cls_juncs, chrom, start, seq_len)
 
             usage_tracks = []
+            alpha_tracks = []
             for junc_df in self._all_juncs:
                 pos_arr, neg_arr = self._junctions_to_ssu_approx_arrays_by_strand(junc_df, chrom, start, seq_len)
                 usage_tracks.append(pos_arr)
                 usage_tracks.append(neg_arr)
+                # No alpha available in the junction-only fallback path
+                alpha_tracks.append(np.zeros(seq_len, dtype=np.float32))
+                alpha_tracks.append(np.zeros(seq_len, dtype=np.float32))
         usage_arr = np.stack(usage_tracks, axis=-1)  # (seq_len, 2*n_ssu_files)
+        usage_alpha_arr = np.stack(alpha_tracks, axis=-1)  # (seq_len, 2*n_ssu_files)
 
         # Junction matrix targets (from STAR junction files)
         junc_positions, junc_matrix = self._junctions_to_junction_matrix(
@@ -1240,6 +1250,7 @@ class SplicingDataset(Dataset):
         targets_dict = {
             "probs": torch.from_numpy(cls_arr).float(),
             "usage": torch.from_numpy(usage_arr).float(),
+            "usage_alpha": torch.from_numpy(usage_alpha_arr).float(),
             "junction_positions": torch.from_numpy(junc_positions),
             "junction_matrix": torch.from_numpy(junc_matrix),
             "all_junctions": all_junctions,

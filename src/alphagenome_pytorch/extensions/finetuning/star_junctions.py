@@ -472,8 +472,8 @@ def ssu_to_arrays_by_strand(
     chrom: str,
     start: int,
     seq_len: int,
-) -> "tuple[np.ndarray, np.ndarray]":
-    """Build per-strand SSU value arrays for one sample within a window.
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
+    """Build per-strand SSU value and alpha count arrays for one sample within a window.
 
     Places each site's SSU value (ssu_spliser > ssu_full > ssu_approx) at
     its 0-based relative position; all other positions are 0.
@@ -486,21 +486,34 @@ def ssu_to_arrays_by_strand(
         seq_len: Length of the window in base pairs.
 
     Returns:
-        Tuple (pos_arr, neg_arr), each float32 of shape (seq_len,).
+        Tuple (pos_arr, neg_arr, pos_alpha, neg_alpha), each float32 of shape (seq_len,).
+        pos_alpha / neg_alpha contain the alpha (junction-read) count at each splice site
+        position (0 at background positions).  Use alpha_bam when ssu_spliser is available,
+        otherwise alpha_juncs.
     """
-    pos_arr = np.zeros(seq_len, dtype=np.float32)
-    neg_arr = np.zeros(seq_len, dtype=np.float32)
+    pos_arr   = np.zeros(seq_len, dtype=np.float32)
+    neg_arr   = np.zeros(seq_len, dtype=np.float32)
+    pos_alpha = np.zeros(seq_len, dtype=np.float32)
+    neg_alpha = np.zeros(seq_len, dtype=np.float32)
 
     local = ssu_df.loc[ssu_df["chrom"] == chrom]
     if local.empty:
-        return pos_arr, neg_arr
+        return pos_arr, neg_arr, pos_alpha, neg_alpha
 
     for _col in ("ssu_spliser", "ssu_full", "ssu_approx"):
         if _col in local.columns:
             value_col = _col
             break
     else:
-        return pos_arr, neg_arr
+        return pos_arr, neg_arr, pos_alpha, neg_alpha
+
+    # Select alpha column: alpha_bam for ssu_spliser, alpha_juncs otherwise
+    if value_col == "ssu_spliser" and "alpha_bam" in local.columns:
+        alpha_col = "alpha_bam"
+    elif "alpha_juncs" in local.columns:
+        alpha_col = "alpha_juncs"
+    else:
+        alpha_col = None
 
     for _, site in local.iterrows():
         idx = int(site["position"]) - 1 - start  # 1-based → 0-based relative
@@ -508,12 +521,17 @@ def ssu_to_arrays_by_strand(
             val = float(site[value_col])
             if np.isnan(val):
                 continue
+            alpha_val = float(site[alpha_col]) if alpha_col is not None else 1.0
+            if np.isnan(alpha_val):
+                alpha_val = 0.0
             if site["strand"] == "+":
-                pos_arr[idx] = val
+                pos_arr[idx]   = val
+                pos_alpha[idx] = alpha_val
             elif site["strand"] == "-":
-                neg_arr[idx] = val
+                neg_arr[idx]   = val
+                neg_alpha[idx] = alpha_val
 
-    return pos_arr, neg_arr
+    return pos_arr, neg_arr, pos_alpha, neg_alpha
 
 
 def junctions_to_classification_array(
