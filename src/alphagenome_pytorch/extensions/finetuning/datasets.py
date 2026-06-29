@@ -1185,10 +1185,9 @@ class SplicingDataset(Dataset):
 
             cls_sources = []
             for _ssu_df in ssu_dfs:
-                if "ssu_spliser" in _ssu_df.columns:
-                    cls_sources.append(_ssu_df[_ssu_df["ssu_spliser"].notna()])
-                else:
-                    cls_sources.append(_ssu_df)
+                if "ssu_spliser" not in _ssu_df.columns:
+                    raise ValueError("ssu_df is missing required column ssu_spliser")
+                cls_sources.append(_ssu_df[_ssu_df["ssu_spliser"].notna()])
             if self._gtf_sites is not None:
                 cls_sources.append(self._gtf_sites)
             cls_arr = self._splice_sites_to_classification_array(cls_sources, chrom, start, seq_len)

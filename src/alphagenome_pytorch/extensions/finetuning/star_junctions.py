@@ -410,7 +410,7 @@ def read_ssu_parquet(
 
     Returns:
         DataFrame with columns: chrom, position (1-based exonic), strand, role,
-        ssu_approx, and optionally ssu_full.
+        ssu_spliser and alpha_bam.
     """
     import pyarrow.parquet as pq
     filters = [
@@ -475,21 +475,19 @@ def ssu_to_arrays_by_strand(
 ) -> "tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
     """Build per-strand SSU value and alpha count arrays for one sample within a window.
 
-    Places each site's SSU value (ssu_spliser > ssu_full > ssu_approx) at
-    its 0-based relative position; all other positions are 0.
+    Places each site's ssu_spliser value at its 0-based relative position;
+    all other positions are 0.
 
     Args:
         ssu_df: SSU DataFrame already filtered to the window, with columns:
-            chrom, position (1-based exonic), strand, ssu_approx, optionally ssu_full / ssu_spliser.
+            chrom, position (1-based exonic), strand, ssu_spliser, alpha_bam.
         chrom: Chromosome name of the window.
         start: 0-based genomic start of the window.
         seq_len: Length of the window in base pairs.
 
     Returns:
         Tuple (pos_arr, neg_arr, pos_alpha, neg_alpha), each float32 of shape (seq_len,).
-        pos_alpha / neg_alpha contain the alpha (junction-read) count at each splice site
-        position (0 at background positions).  Use alpha_bam when ssu_spliser is available,
-        otherwise alpha_juncs.
+        pos_alpha / neg_alpha contain alpha_bam at each splice site position (0 elsewhere).
     """
     pos_arr   = np.zeros(seq_len, dtype=np.float32)
     neg_arr   = np.zeros(seq_len, dtype=np.float32)
@@ -500,20 +498,11 @@ def ssu_to_arrays_by_strand(
     if local.empty:
         return pos_arr, neg_arr, pos_alpha, neg_alpha
 
-    for _col in ("ssu_spliser", "ssu_full", "ssu_approx"):
-        if _col in local.columns:
-            value_col = _col
-            break
-    else:
-        return pos_arr, neg_arr, pos_alpha, neg_alpha
+    if "ssu_spliser" not in local.columns:
+        raise ValueError("ssu_df is missing required column ssu_spliser")
 
-    # Select alpha column: alpha_bam for ssu_spliser, alpha_juncs otherwise
-    if value_col == "ssu_spliser" and "alpha_bam" in local.columns:
-        alpha_col = "alpha_bam"
-    elif "alpha_juncs" in local.columns:
-        alpha_col = "alpha_juncs"
-    else:
-        alpha_col = None
+    value_col = "ssu_spliser"
+    alpha_col = "alpha_bam" if "alpha_bam" in local.columns else None
 
     for _, site in local.iterrows():
         idx = int(site["position"]) - 1 - start  # 1-based → 0-based relative
