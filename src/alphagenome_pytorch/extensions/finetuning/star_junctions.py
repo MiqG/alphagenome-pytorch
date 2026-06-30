@@ -488,13 +488,13 @@ def ssu_to_arrays_by_strand(
     Returns:
         Tuple (pos_arr, neg_arr, pos_alpha, neg_alpha), each float32 of shape (seq_len,).
         pos_alpha / neg_alpha contain the alpha (junction-read) count at each splice site
-        position (0 at background positions).  Use alpha_bam when ssu_spliser is available,
-        otherwise alpha_juncs.
+        position (-1 at background positions as a sentinel for "not a splice site").
+        Use alpha_bam when ssu_spliser is available, otherwise alpha_juncs.
     """
     pos_arr   = np.zeros(seq_len, dtype=np.float32)
     neg_arr   = np.zeros(seq_len, dtype=np.float32)
-    pos_alpha = np.zeros(seq_len, dtype=np.float32)
-    neg_alpha = np.zeros(seq_len, dtype=np.float32)
+    pos_alpha = np.full(seq_len, -1.0, dtype=np.float32)
+    neg_alpha = np.full(seq_len, -1.0, dtype=np.float32)
 
     local = ssu_df.loc[ssu_df["chrom"] == chrom]
     if local.empty:

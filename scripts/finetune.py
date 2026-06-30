@@ -460,9 +460,9 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help=(
             "Minimum junction read depth (alpha) for a splice site to contribute to the SSU "
-            "loss.  Positions with 0 < alpha < threshold are excluded to avoid training on "
-            "low-confidence SSU estimates; background positions (alpha=0) are also excluded. "
-            "Set to 0 to include all positions (reverts to ones_like mask). Default: 5."
+            "loss.  Positions with 0 <= alpha < threshold are excluded to avoid training on "
+            "low-confidence SSU estimates; background positions (alpha=-1) are kept with "
+            "target=0 to anchor the head. Set to 0 to include all positions. Default: 5."
         ),
     )
     train.add_argument("--eval-only", action="store_true", help="Load checkpoint and run validation metrics without training; outputs to eval_only_metrics.json")

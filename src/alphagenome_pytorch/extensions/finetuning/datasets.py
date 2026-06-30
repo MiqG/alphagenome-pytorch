@@ -1214,9 +1214,9 @@ class SplicingDataset(Dataset):
                 pos_arr, neg_arr = self._junctions_to_ssu_approx_arrays_by_strand(junc_df, chrom, start, seq_len)
                 usage_tracks.append(pos_arr)
                 usage_tracks.append(neg_arr)
-                # No alpha available in the junction-only fallback path
-                alpha_tracks.append(np.zeros(seq_len, dtype=np.float32))
-                alpha_tracks.append(np.zeros(seq_len, dtype=np.float32))
+                # No alpha available in the junction-only fallback path; -1 = background
+                alpha_tracks.append(np.full(seq_len, -1.0, dtype=np.float32))
+                alpha_tracks.append(np.full(seq_len, -1.0, dtype=np.float32))
         usage_arr = np.stack(usage_tracks, axis=-1)  # (seq_len, 2*n_ssu_files)
         usage_alpha_arr = np.stack(alpha_tracks, axis=-1)  # (seq_len, 2*n_ssu_files)
 

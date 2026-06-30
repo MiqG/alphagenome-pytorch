@@ -535,16 +535,16 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
     elif isinstance(head, SpliceSitesUsageHead):
         pred = predictions[1]
         target = targets_dict["usage"].to(device)
-        # Coverage-based mask: only positions with alpha >= min_alpha_juncs contribute.
-        # This avoids the 430:1 class imbalance from including all background positions
-        # while also excluding low-confidence sites (0 < alpha < threshold).
+        # Coverage-based mask: exclude only low-confidence splice sites (0 <= alpha < threshold).
+        # Background positions (alpha == -1) are kept — they anchor the head to predict 0
+        # at non-splice sites and provide the contrastive signal for the sparse SSU distribution.
+        # alpha == -1 is the sentinel for "not a splice site"; actual splice sites have alpha >= 0.
         # When the alpha mask is active, _partitioned_loss is not used — it would need
         # the mask to be sliced in sync with pred/target chunks (unsupported by the
-        # current interface), and the imbalance problem that partitioning addresses is
-        # already solved by only training on high-confidence splice sites.
+        # current interface).
         if "usage_alpha" in targets_dict and min_alpha_juncs > 0:
             alpha = targets_dict["usage_alpha"].to(device)
-            usage_mask = (alpha >= min_alpha_juncs)
+            usage_mask = (alpha < 0) | (alpha >= min_alpha_juncs)
             loss = binary_crossentropy_from_logits(
                 y_pred=pred,
                 y_true=target.float().clamp(1e-7, 1.0 - 1e-7),
@@ -661,11 +661,13 @@ def _extract_usage_pearson_per_sample(predictions, targets_dict, device):
 
 
 def _extract_splice_pearson_pairs(
-    head, predictions, targets_dict, device
+    head, predictions, targets_dict, device, min_alpha_juncs: int = 0
 ):
     """Extract flat (N,) pred and true tensors over valid positions for Pearson R.
 
-    For SpliceSitesUsageHead: returns (pred_flat, true_flat) tuple.
+    For SpliceSitesUsageHead: returns a dict with variant "full" (all target>0 positions)
+        and, when min_alpha_juncs>0 and "usage_alpha" is present, variant "alpha"
+        (positions with alpha >= min_alpha_juncs only — the high-confidence subset).
     For SpliceSitesJunctionHead: returns dict with variants:
         - "full": all valid (donor, acceptor) cells — log1p Pearson
         - "nonzero": valid cells with target > 0 — log1p Pearson
@@ -674,7 +676,7 @@ def _extract_splice_pearson_pairs(
         - "binary_cls": all valid pairs, pred=counts (scores), true=binary nonzero — auPRC
         Each value is a dict with "pred" and "true" keys, or None if empty.
 
-    Returns tuple/dict or (None, None) if no valid entries.
+    Returns dict or (None, None) if no valid entries.
     """
     if isinstance(head, SpliceSitesUsageHead):
         if 1 not in predictions:
@@ -684,9 +686,16 @@ def _extract_splice_pearson_pairs(
         mask = (target > 0).any(dim=-1)                # (B, S)
         if not mask.any():
             return None, None
-        pred_flat = pred[mask].reshape(-1)
-        true_flat = target[mask].reshape(-1)
-        return pred_flat, true_flat
+        variants = {"full": (pred[mask].reshape(-1), target[mask].reshape(-1))}
+        if min_alpha_juncs > 0 and "usage_alpha" in targets_dict:
+            alpha = targets_dict["usage_alpha"].to(device)   # (B, S) or (B, S, n_samples)
+            alpha_cond = alpha >= min_alpha_juncs
+            if alpha_cond.dim() > 2:
+                alpha_cond = alpha_cond.any(dim=-1)          # (B, S)
+            alpha_mask = mask & alpha_cond
+            if alpha_mask.any():
+                variants["alpha"] = (pred[alpha_mask].reshape(-1), target[alpha_mask].reshape(-1))
+        return variants
 
     elif isinstance(head, SpliceSitesJunctionHead):
         if "junction_matrix" not in targets_dict or "pos_counts" not in predictions:
@@ -2448,7 +2457,8 @@ def validate_multihead(
                                 accumulated_cls[modality]["true"].append(torch.cat(parts_true).cpu())
 
                     result = _extract_splice_pearson_pairs(
-                        head_module, predictions_scaled, targets_dict, device
+                        head_module, predictions_scaled, targets_dict, device,
+                        min_alpha_juncs=min_alpha_juncs,
                     )
                     if result is not None and result != (None, None):
                         # For junction head: result is a dict of variants
@@ -2476,12 +2486,14 @@ def validate_multihead(
                                                 p, t = data[variant]
                                                 accumulated_junc_ps_pearson[modality][s][variant]["pred"].append(p)
                                                 accumulated_junc_ps_pearson[modality][s][variant]["true"].append(t)
-                        # For usage head: result is (pred_flat, true_flat) tuple
+                        # For usage head: result is a dict of variants (always includes "full",
+                        # optionally "alpha" when min_alpha_juncs > 0)
                         else:
-                            _splice_pred, _splice_true = result
-                            if _splice_pred is not None:
-                                accumulated_splice[modality]["full"]["pred"].append(_splice_pred.float().cpu())
-                                accumulated_splice[modality]["full"]["true"].append(_splice_true.float().cpu())
+                            for variant_name, (vp, vt) in result.items():
+                                if variant_name not in accumulated_splice[modality]:
+                                    accumulated_splice[modality][variant_name] = {"pred": [], "true": []}
+                                accumulated_splice[modality][variant_name]["pred"].append(vp.float().cpu())
+                                accumulated_splice[modality][variant_name]["true"].append(vt.float().cpu())
                             if compute_per_sample:
                                 ps_usage = _extract_usage_pearson_per_sample(
                                     predictions_scaled, targets_dict, device
