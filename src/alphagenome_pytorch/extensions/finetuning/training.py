@@ -1945,6 +1945,13 @@ def train_epoch_multihead(
         if batch_idx < skip_batches:
             continue
 
+        # Kept current so an async preemption signal (which can fire between any
+        # two batches, not just on save_every_steps boundaries) always saves an
+        # accurate resume position instead of the stale value from the last
+        # periodic checkpoint.
+        if save_state is not None:
+            save_state["batch_idx"] = batch_idx
+
         is_profiling = do_profile and batch_idx < profile_batches
 
         if is_profiling and batch_idx > 0:
