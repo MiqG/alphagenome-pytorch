@@ -1273,7 +1273,12 @@ def create_model(
 
     # Wrap with DDP if multi-GPU
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
         print_rank0("Model wrapped with DistributedDataParallel", rank)
 
     # Get head references from GPU model
@@ -1730,15 +1735,20 @@ def main() -> None:
                     junction_top_k=_junction_top_k,
                     junction_loss=args.junction_loss,
                     min_alpha_juncs=args.min_alpha_juncs,
+                    handler=handler,
                 )
 
             skip_batches = 0  # Only skip on first resumed epoch
-            _save_state["batch_idx"] = 0
 
             if handler.preempted:
                 print_rank0("Preemption flag set - saving and exiting.", rank)
                 handler.save_and_exit()
                 break
+
+            # Only clear once we know the epoch actually finished (not preempted
+            # mid-epoch) -- otherwise this wipes out the accurate resume position
+            # train_epoch_multihead just recorded when it broke out early.
+            _save_state["batch_idx"] = 0
 
             # Shared kwargs for training-loop validate_multihead calls
             _loop_validate_kwargs = dict(

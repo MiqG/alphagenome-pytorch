@@ -1870,6 +1870,7 @@ def train_epoch_multihead(
     junction_loss: str = "original",
     sequence_parallel: Any | None = None,
     min_alpha_juncs: int = 5,
+    handler: Any | None = None,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1951,6 +1952,15 @@ def train_epoch_multihead(
         # periodic checkpoint.
         if save_state is not None:
             save_state["batch_idx"] = batch_idx
+
+        # Break as soon as a preemption signal is seen instead of only at
+        # epoch boundaries. The signal handler's own save runs in a background
+        # thread concurrently with this loop, which can race and capture a
+        # stale batch_idx/model state; stopping here promptly shrinks that
+        # race window and lets the caller's post-loop save_and_exit() (which
+        # joins the background thread) capture a consistent, current state.
+        if handler is not None and handler.preempted:
+            break
 
         is_profiling = do_profile and batch_idx < profile_batches
 
