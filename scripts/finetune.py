@@ -60,6 +60,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import sys
 import time
@@ -1483,6 +1484,10 @@ def main() -> None:
         best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
         wandb_run_id = ckpt.get("wandb_run_id")
         print_rank0(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
+        # ckpt holds a full CPU copy of model_state_dict/optimizer_state_dict;
+        # its values have already been loaded into model/optimizer, so drop it
+        # before DataLoader workers fork to avoid duplicating it 40x.
+        del ckpt
 
     # Config for logging
     config = {
@@ -1644,6 +1649,13 @@ def main() -> None:
         args.mode == "lora" and args.lora_rank == 0
     )
     encoder_only = args.mode == "encoder-only"
+
+    # Model/optimizer/checkpoint setup is done; DataLoader workers fork on the
+    # first batch fetch below. Freeze the pre-fork heap so the cyclic GC in
+    # each forked worker stops re-scanning (and copy-on-write duplicating)
+    # this process's tensors every collection cycle.
+    gc.collect()
+    gc.freeze()
 
     try:
         for epoch in range(start_epoch, args.epochs + 1):
