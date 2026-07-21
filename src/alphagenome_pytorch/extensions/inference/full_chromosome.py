@@ -34,10 +34,13 @@ from typing import Literal
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 from alphagenome_pytorch.genome import GenomeSequenceSource
 from alphagenome_pytorch.utils.sequence import sequence_to_onehot
+
+#: Chromosomes predicted when none are named: the main assembly, chr1..22 + chrX.
+#: Excludes chrY, chrM and scaffolds. Names not present in the FASTA are dropped.
+DEFAULT_CHROMOSOMES = [f"chr{i}" for i in range(1, 23)] + ["chrX"]
 
 # Lazy imports
 pyBigWig = None
@@ -290,6 +293,10 @@ def _iter_tile_predictions(
     n_batches = (len(tiles) + config.batch_size - 1) // config.batch_size
     iterator = range(0, len(tiles), config.batch_size)
     if show_progress:
+        # Local import so this module stays importable with only core deps
+        # (e.g. for HEAD_CONFIGS during CLI parser build). tqdm ships with the
+        # inference extra, which is present whenever predictions actually run.
+        from tqdm import tqdm
         iterator = tqdm(iterator, total=n_batches, desc=f"Predicting {chrom}")
 
     for batch_start in iterator:
@@ -501,7 +508,7 @@ def predict_full_chromosomes_to_bigwig(
 
     # Load genome
     if chromosomes is None:
-        chromosomes = [f"chr{i}" for i in range(1, 23)] + ["chrX"]
+        chromosomes = list(DEFAULT_CHROMOSOMES)
 
     genome = GenomeSequenceProvider(
         fasta_path,
@@ -624,7 +631,7 @@ def predict_full_chromosomes_to_anndata(
 
     config = config or TilingConfig()
     if chromosomes is None:
-        chromosomes = [f"chr{i}" for i in range(1, 23)] + ["chrX"]
+        chromosomes = list(DEFAULT_CHROMOSOMES)
 
     # `fasta_path` / `annotation_path` accept prebuilt objects too (handy for tests
     # and for reusing an already-loaded genome / annotation).

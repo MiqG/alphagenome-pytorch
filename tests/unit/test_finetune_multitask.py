@@ -1,4 +1,4 @@
-"""Unit tests for multimodal support in scripts/finetune.py."""
+"""Unit tests for multimodal support in the finetuning entry point."""
 
 from __future__ import annotations
 
@@ -9,18 +9,15 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-# Import script module symbols directly (tests run from repository root)
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
-
-import finetune as finetune_module  # noqa: E402
-from finetune import (  # noqa: E402
+from alphagenome_pytorch.extensions.finetuning import runner as finetune_module
+from alphagenome_pytorch.extensions.finetuning.args import parse_args
+from alphagenome_pytorch.extensions.finetuning.runner import (
     MultimodalDataset,
     collate_multimodal,
     load_track_metadata_for_finetune,
-    parse_args,
     unwrap_training_model,
 )
-from alphagenome_pytorch.extensions.finetuning.training import (  # noqa: E402
+from alphagenome_pytorch.extensions.finetuning.training import (
     _compute_multinomial_resolution,
 )
 
@@ -233,6 +230,48 @@ class TestParseArgsStrandPairs:
         args = parse_args()
         assert args.modality_strand_pairs["rna_seq"] == [(0, 1), (2, 3)]
         assert args.modality_strand_pairs["atac"] is None
+
+    def test_config_strand_accepts_string_and_list_forms(self, monkeypatch, tmp_path):
+        """modalities.<head>.strand may be a compact/separated string or a YAML list."""
+        yaml = pytest.importorskip("yaml")
+
+        def _strands_for(strand_spec):
+            config = {
+                "modalities": {
+                    "rna_seq": {
+                        "bigwig": ["rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw"],
+                        "strand": strand_spec,
+                    },
+                }
+            }
+            config_path = tmp_path / "train.yaml"
+            config_path.write_text(yaml.safe_dump(config))
+            monkeypatch.setattr(
+                sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+            )
+            return parse_args().modality_strands["rna_seq"]
+
+        assert _strands_for("+-+-") == "+-+-"                    # compact string
+        assert _strands_for("+,-,+,-") == "+-+-"                 # separated string
+        assert _strands_for(["+", "-", "+", "-"]) == "+-+-"      # YAML list
+
+    def test_config_strand_list_wrong_length_rejected(self, monkeypatch, tmp_path):
+        yaml = pytest.importorskip("yaml")
+        config = {
+            "modalities": {
+                "rna_seq": {
+                    "bigwig": ["rp1.bw", "rm1.bw", "rp2.bw", "rm2.bw"],
+                    "strand": ["+", "-"],  # 2 chars, 4 bigwigs
+                },
+            }
+        }
+        config_path = tmp_path / "train.yaml"
+        config_path.write_text(yaml.safe_dump(config))
+        monkeypatch.setattr(
+            sys, "argv", _required_cli_args() + ["--config", str(config_path)]
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
 
     def test_cli_overrides_config_strand_pairs(self, monkeypatch, tmp_path):
         yaml = pytest.importorskip("yaml")
