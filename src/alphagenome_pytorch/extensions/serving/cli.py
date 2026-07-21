@@ -412,6 +412,7 @@ def _build_catalog_router(args: argparse.Namespace):
             label=catalog.base.label,
             metadata_catalog=base_metadata_catalog,
             scorer=base_scorer,
+            runtime=runtime,
         ))
 
     for spec in catalog.adapters:
@@ -429,17 +430,36 @@ def _build_catalog_router(args: argparse.Namespace):
         # still overrides (via _resolve_finetuned_metadata_catalog).
         header = _read_delta_export_header(bundle_paths.adapter_safetensors)
         entry_catalog = _resolve_finetuned_metadata_catalog(args, header)
+        entry_track_names = header.get("track_names")
         organism_ctx = resolve_finetuned_organism(
             organism_indices=header.get("organism_indices"),
             checkpoint_organism=header.get("organism"),
             track_metadata=header.get("track_metadata"),
             num_organisms=model.num_organisms,
         )
-        # The scorer references the shared base model; it is only invoked while
-        # this entry is the active (locked-in) selection, so scoring runs against
-        # the adapter-attached model with this bundle's metadata.
+        if organism_ctx.default_organism_index is None:
+            raise SystemExit(
+                f"agt serve: adapter {spec.id!r} was fine-tuned on multiple "
+                f"organisms {list(organism_ctx.organism_indices or [])}; "
+                "multi-organism serving is not supported. Serve a "
+                "single-organism bundle instead."
+            )
+        # One runtime per entry, shared by its service adapter AND its scorer so
+        # the predict and score paths resolve organism/metadata identically —
+        # in particular an organism-omitted request defaults to this bundle's
+        # organism (e.g. mouse), not human. Reuse the base runtime's sequence
+        # source (no second FASTA open) but carry this bundle's own metadata,
+        # track names, and default organism.
+        entry_runtime = AlphaGenomePredictionRuntime(
+            model=model,
+            sequence_source=runtime.sequence_source,
+            metadata_catalog=entry_catalog,
+            track_names=entry_track_names,
+            device=args.device,
+            default_organism=organism_ctx.default_organism_index,
+        )
         entry_scorer = _make_variant_scorer(
-            runtime=runtime,
+            runtime=entry_runtime,
             model=model,
             args=args,
             metadata_catalog=entry_catalog,
@@ -450,9 +470,10 @@ def _build_catalog_router(args: argparse.Namespace):
             bundle_paths=bundle_paths,
             manifest=manifest,
             metadata_catalog=entry_catalog,
-            track_names=header.get("track_names"),
+            track_names=entry_track_names,
             scorer=entry_scorer,
             default_organism=organism_ctx.default_organism_index,
+            runtime=entry_runtime,
         ))
 
     if not entries:

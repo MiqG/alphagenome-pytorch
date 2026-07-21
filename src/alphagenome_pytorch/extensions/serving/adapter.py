@@ -293,7 +293,7 @@ class LocalDnaModelAdapter:
         self,
         sequence: str,
         *,
-        organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        organism: Any = None,
         requested_outputs: Iterable[Any],
         ontology_terms: Iterable[Any] | None = None,
         interval: genome.Interval | None = None,
@@ -321,7 +321,7 @@ class LocalDnaModelAdapter:
         self,
         interval: genome.Interval,
         *,
-        organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        organism: Any = None,
         requested_outputs: Iterable[Any],
         ontology_terms: Iterable[Any] | None = None,
     ) -> dna_output.Output:
@@ -340,7 +340,7 @@ class LocalDnaModelAdapter:
         interval: genome.Interval,
         variant: genome.Variant,
         *,
-        organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        organism: Any = None,
         requested_outputs: Iterable[Any],
         ontology_terms: Iterable[Any] | None = None,
     ) -> dna_output.VariantOutput:
@@ -396,7 +396,7 @@ class LocalDnaModelAdapter:
         *,
         interval: genome.Interval,
         target_interval: genome.Interval,
-        organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        organism: Any = None,
         requested_output: str,
         resolution: int,
         track_indices: Sequence[int],
@@ -533,7 +533,7 @@ class LocalDnaModelAdapter:
 
     def output_metadata(
         self,
-        organism: Any = dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        organism: Any = None,
     ) -> dna_output.OutputMetadata:
         organism_index = self.runtime.resolve_organism_index(organism)
 

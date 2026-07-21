@@ -259,3 +259,71 @@ def test_url_body_model_id_mismatch_is_400(two_model_server):
     status, payload = _post(host, port, '/v1/models/alpha/predict_sequence', body)
     assert status == 400
     assert 'mismatch' in payload['error'].lower()
+
+
+# ---------------------------------------------------------------------------
+# Organism defaulting: a mouse entry must serve mouse when the request omits
+# organism (transport passes None so the entry runtime's default applies).
+# ---------------------------------------------------------------------------
+
+
+class _RecordingRuntime(FakeRuntime):
+    """FakeRuntime that records the organism index each predict resolved."""
+
+    def __init__(self, default_index: int) -> None:
+        super().__init__()
+        self.default_organism_index = default_index
+        self.seen_organism: list[Any] = []
+
+    def predict(self, sequence: str, organism=None, **kw):
+        self.seen_organism.append(organism)
+        return super().predict(sequence, organism=organism, **kw)
+
+
+def _mouse_entry_server(monkeypatch, default_index: int):
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+    rt = _RecordingRuntime(default_index=default_index)
+    entry = ServedModelEntry(
+        id='mouse-atac', label='Mouse ATAC', kind='adapter',
+        base_model_hash='sha256:demo', runtime=rt, default_organism=default_index,
+    )
+    base = nn.Module()
+    base.heads = nn.ModuleDict()  # type: ignore[attr-defined]
+    router = ServedModelRouter(base_model=base, runtime=rt, entries=[entry])
+    server = serve_rest(router, host='127.0.0.1', port=0, wait=False)
+    return server, rt
+
+
+def test_organism_omitted_defaults_to_entry_organism(monkeypatch):
+    """A mouse entry (default_organism=1) must resolve to mouse when the REST
+    body omits organism — proving the transport passes None, not HOMO_SAPIENS."""
+    server, rt = _mouse_entry_server(monkeypatch, default_index=1)
+    host, port = server.server_address
+    try:
+        status, _ = _post(host, port, '/v1/predict_sequence', {
+            'sequence': 'A' * SEQUENCE_LENGTH_16KB,
+            'requested_outputs': ['DNASE'],
+            # NB: no 'organism' — must fall back to the entry default (mouse=1).
+        })
+        assert status == 200
+        assert rt.seen_organism == [1]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_explicit_organism_overrides_entry_default(monkeypatch):
+    """An explicit organism in the body still wins over the entry default."""
+    server, rt = _mouse_entry_server(monkeypatch, default_index=1)
+    host, port = server.server_address
+    try:
+        status, _ = _post(host, port, '/v1/predict_sequence', {
+            'sequence': 'A' * SEQUENCE_LENGTH_16KB,
+            'organism': 'HOMO_SAPIENS',
+            'requested_outputs': ['DNASE'],
+        })
+        assert status == 200
+        assert rt.seen_organism == [0]  # explicit human wins
+    finally:
+        server.shutdown()
+        server.server_close()
