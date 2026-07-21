@@ -26,6 +26,7 @@ metadata explicitly (no default fallback). Constraints:
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,6 +120,7 @@ class ServedModelEntry:
     metadata_catalog: Any | None = None
     track_names: Any | None = None
     scorer: Any | None = None
+    default_organism: int | None = None
     manifest: Manifest | None = None
 
     def is_base(self) -> bool:
@@ -153,6 +155,7 @@ def build_adapter_entry(
     metadata_catalog: Any | None = None,
     track_names: Any | None = None,
     scorer: Any | None = None,
+    default_organism: int | None = None,
 ) -> ServedModelEntry:
     """Build a :class:`ServedModelEntry` for an adapter bundle.
 
@@ -214,6 +217,21 @@ def build_adapter_entry(
                 "transfer_config.new_heads is the source of truth."
             )
 
+    # prepare_for_transfer builds some adapter params (e.g. IA3 ``scale``) and
+    # the new head modules on CPU regardless of the base device, and these
+    # detached modules never ride along in a later ``base_model.to(device)``.
+    # Align them to the base device now so CUDA catalog inference does not fail
+    # with a device mismatch when the entry is attached.
+    try:
+        device = next(base_model.parameters()).device
+    except StopIteration:
+        device = None
+    if device is not None:
+        for att in attachments:
+            att.wrapper.to(device)
+        for hmod in head_modules.values():
+            hmod.to(device)
+
     # Detach: restore base_model to clean state.
     for att in attachments:
         setattr(att.parent, att.attr_name, _wrapped_target(att.wrapper))
@@ -231,6 +249,7 @@ def build_adapter_entry(
         metadata_catalog=metadata_catalog,
         track_names=track_names,
         scorer=scorer,
+        default_organism=default_organism,
         manifest=manifest,
     )
 
@@ -243,6 +262,7 @@ def build_base_entry(
     metadata_catalog: Any | None = None,
     track_names: Any | None = None,
     scorer: Any | None = None,
+    default_organism: int | None = None,
 ) -> ServedModelEntry:
     """Build a :class:`ServedModelEntry` for the bare base model."""
     from alphagenome_pytorch.extensions.finetuning.checkpointing import (
@@ -258,6 +278,7 @@ def build_base_entry(
         metadata_catalog=metadata_catalog,
         track_names=track_names,
         scorer=scorer,
+        default_organism=default_organism,
         manifest=None,
     )
 
@@ -273,14 +294,20 @@ def _default_adapter_factory(
     """Default adapter factory: a fresh runtime bound to the live base model."""
     from alphagenome_pytorch.prediction import AlphaGenomePredictionRuntime
 
-    entry_runtime = AlphaGenomePredictionRuntime(
+    runtime_kwargs: dict[str, Any] = dict(
         model=router.base_model,
         sequence_source=getattr(router.runtime, "sequence_source", None),
         metadata_catalog=entry.metadata_catalog
-        or getattr(router.runtime, "metadata_catalog", None),
+        if entry.metadata_catalog is not None
+        else getattr(router.runtime, "metadata_catalog", None),
         track_names=entry.track_names,
         device=getattr(router.runtime, "device", None),
     )
+    # Only forward a resolved default organism — mixed/unknown stays absent so
+    # the runtime keeps its own default rather than silently forcing organism 0.
+    if entry.default_organism is not None:
+        runtime_kwargs["default_organism"] = entry.default_organism
+    entry_runtime = AlphaGenomePredictionRuntime(**runtime_kwargs)
     return LocalDnaModelAdapter(entry_runtime, scorer=entry.scorer)
 
 
@@ -383,7 +410,10 @@ class ServedModelRouter:
     def select(self, model_id: str) -> LocalDnaModelAdapter:
         """Activate ``model_id`` on the shared base and return a service adapter.
 
-        Serialized: callers must hold the result while making prediction calls.
+        Low-level: swaps the entry onto the shared base and returns an adapter,
+        but the lock is released on return. Prefer :meth:`acquire`, which holds
+        the lock across the model call so a concurrent request cannot re-swap
+        the shared base mid-forward.
         """
         with self._lock:
             if model_id not in self._entries:
@@ -394,6 +424,25 @@ class ServedModelRouter:
                 self._active_id = model_id
             entry = self._entries[model_id]
             return self._adapter_factory(self, entry)
+
+    @contextlib.contextmanager
+    def acquire(self, model_id: str):
+        """Hold the router lock across the adapter swap *and* the model call.
+
+        Catalog mode serves one request at a time on the shared base model:
+        the entry is swapped in and must stay resident until the caller finishes
+        its prediction/scoring/attribution call. Usage::
+
+            with router.acquire(model_id) as adapter:
+                output = adapter.predict_sequence(...)
+
+        The lock is a reentrant lock, so :meth:`select` re-acquiring inside is
+        fine. Callers should keep only the model computation inside the ``with``
+        block (serialization/streaming can happen after release, since outputs
+        are materialized and no longer reference the swappable module tree).
+        """
+        with self._lock:
+            yield self.select(model_id)
 
     # ---- swap mechanics --------------------------------------------------
 

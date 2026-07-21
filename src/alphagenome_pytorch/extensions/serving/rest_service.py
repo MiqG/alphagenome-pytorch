@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import json
 import logging
@@ -413,31 +414,31 @@ class _ServingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _resolve_adapter(
+    @contextlib.contextmanager
+    def _acquire_adapter(
         self,
         body: dict[str, Any] | None = None,
         scoped_model_id: str | None = None,
-    ) -> LocalDnaModelAdapter:
-        """Return the per-request adapter, raising on ambiguity / unknown id."""
+    ):
+        """Yield the per-request adapter, holding the router lock in catalog mode.
+
+        The lock is held for the whole ``with`` body so the shared base model
+        cannot be re-swapped by a concurrent request while this one runs its
+        model call. Singleton mode needs no lock. Raises on ambiguity / unknown
+        id / URL-vs-body mismatch (surfaced by ``_write_router_error``).
+        """
         if self.router is None:
-            return self.adapter  # singleton mode
-        from alphagenome_pytorch.extensions.serving.router import (
-            AmbiguousModelError,
-            ModelNotFoundError,
-        )
+            yield self.adapter  # singleton mode
+            return
         body_id = (body or {}).get('model_id')
         if scoped_model_id and body_id and scoped_model_id != body_id:
             raise ValueError(
                 f"model_id mismatch: URL={scoped_model_id!r} body={body_id!r}"
             )
         requested = scoped_model_id or body_id
-        try:
-            resolved = self.router.resolve_model_id(requested)
-        except AmbiguousModelError:
-            raise
-        except ModelNotFoundError:
-            raise
-        return self.router.select(resolved)
+        resolved = self.router.resolve_model_id(requested)
+        with self.router.acquire(resolved) as adapter:
+            yield adapter
 
     def _scoped_model_id(self, path: str) -> tuple[str | None, str]:
         """Parse the request path into ``(model_id, route_suffix)``.
@@ -476,15 +477,15 @@ class _ServingHandler(BaseHTTPRequestHandler):
             scoped_id, rest = self._scoped_model_id(path)
             if scoped_id is not None and rest == '/metadata':
                 organism = self._parse_query_value('organism')
-                adapter = self._resolve_adapter(scoped_model_id=scoped_id)
-                metadata = adapter.output_metadata(organism=organism)
+                with self._acquire_adapter(scoped_model_id=scoped_id) as adapter:
+                    metadata = adapter.output_metadata(organism=organism)
                 self._write_json({'metadata': _serialize_output_metadata(metadata)})
                 return
 
             if path.startswith('/v1/output_metadata'):
                 organism = self._parse_query_value('organism')
-                adapter = self._resolve_adapter()
-                metadata = adapter.output_metadata(organism=organism)
+                with self._acquire_adapter() as adapter:
+                    metadata = adapter.output_metadata(organism=organism)
                 self._write_json({'metadata': _serialize_output_metadata(metadata)})
                 return
             self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)
@@ -497,110 +498,111 @@ class _ServingHandler(BaseHTTPRequestHandler):
             path = self.path.split('?', 1)[0]
 
             scoped_id, route = self._scoped_model_id(path)
-            adapter = self._resolve_adapter(body=body, scoped_model_id=scoped_id)
-
-            if route == '/predict_sequence':
-                output = adapter.predict_sequence(
-                    sequence=body['sequence'],
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                    requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
-                    ontology_terms=body.get('ontology_terms'),
-                )
-                self._write_json({'output': _serialize_output(output)})
-                return
-
-            if route == '/predict_interval':
-                output = adapter.predict_interval(
-                    interval=_interval_from_payload(body['interval']),
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                    requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
-                    ontology_terms=body.get('ontology_terms'),
-                )
-                self._write_json({'output': _serialize_output(output)})
-                return
-
-            if route == '/predict_variant':
-                output = adapter.predict_variant(
-                    interval=_interval_from_payload(body['interval']),
-                    variant=_variant_from_payload(body['variant']),
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                    requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
-                    ontology_terms=body.get('ontology_terms'),
-                )
-                self._write_json({'output': _serialize_variant_output(output)})
-                return
-
-            if route == '/score_variant':
-                scores = adapter.score_variant(
-                    interval=_interval_from_payload(body['interval']),
-                    variant=_variant_from_payload(body['variant']),
-                    variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                )
-                self._write_json({'scores': [_serialize_anndata(s) for s in scores]})
-                return
-
-            if route == '/score_variants':
-                intervals_payload = body['intervals']
-                variants_payload = body['variants']
-                if isinstance(intervals_payload, dict):
-                    intervals: genome.Interval | list[genome.Interval] = _interval_from_payload(intervals_payload)
-                else:
-                    intervals = [_interval_from_payload(i) for i in intervals_payload]
-                variants = [_variant_from_payload(v) for v in variants_payload]
-                scores = adapter.score_variants(
-                    intervals=intervals,
-                    variants=variants,
-                    variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                    progress_bar=False,
-                    max_workers=int(body.get('max_workers', 5)),
-                )
-                self._write_json(
-                    {'scores': [[_serialize_anndata(s) for s in group] for group in scores]}
-                )
-                return
-
-            if route == '/score_ism_variants':
-                interval_variant_payload = body.get('interval_variant')
-                scores = adapter.score_ism_variants(
-                    interval=_interval_from_payload(body['interval']),
-                    ism_interval=_interval_from_payload(body['ism_interval']),
-                    variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                    interval_variant=_variant_from_payload(interval_variant_payload)
-                    if interval_variant_payload
-                    else None,
-                    progress_bar=False,
-                    max_workers=int(body.get('max_workers', 5)),
-                )
-                self._write_json(
-                    {'scores': [[_serialize_anndata(s) for s in group] for group in scores]}
-                )
-                return
-
-            if route == '/explain_interval':
-                try:
-                    result = adapter.explain_interval(
-                        interval=_interval_from_payload(body['interval']),
-                        target_interval=_interval_from_payload(body['target_interval']),
+            # Hold the router lock across the whole dispatch in catalog mode so a
+            # concurrent request cannot swap the shared base model mid-forward.
+            with self._acquire_adapter(body=body, scoped_model_id=scoped_id) as adapter:
+                if route == '/predict_sequence':
+                    output = adapter.predict_sequence(
+                        sequence=body['sequence'],
                         organism=body.get('organism', 'HOMO_SAPIENS'),
-                        requested_output=body['requested_output'],
-                        resolution=int(body.get('resolution', 128)),
-                        track_indices=[int(i) for i in body['track_indices']],
-                        method=body['method'],
-                        reduction=body.get('reduction', 'sum'),
-                        include_raw_gradient=bool(body.get('include_raw_gradient', False)),
-                        strand_averaged=bool(body.get('strand_averaged', False)),
-                        batch_size=int(body.get('batch_size', 8)),
+                        requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
+                        ontology_terms=body.get('ontology_terms'),
                     )
-                except UnsupportedMethodError as exc:
-                    self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                    self._write_json({'output': _serialize_output(output)})
                     return
-                self._write_json({'attribution': _serialize_attribution(result)})
-                return
 
-            self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)
+                if route == '/predict_interval':
+                    output = adapter.predict_interval(
+                        interval=_interval_from_payload(body['interval']),
+                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
+                        ontology_terms=body.get('ontology_terms'),
+                    )
+                    self._write_json({'output': _serialize_output(output)})
+                    return
+
+                if route == '/predict_variant':
+                    output = adapter.predict_variant(
+                        interval=_interval_from_payload(body['interval']),
+                        variant=_variant_from_payload(body['variant']),
+                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
+                        ontology_terms=body.get('ontology_terms'),
+                    )
+                    self._write_json({'output': _serialize_variant_output(output)})
+                    return
+
+                if route == '/score_variant':
+                    scores = adapter.score_variant(
+                        interval=_interval_from_payload(body['interval']),
+                        variant=_variant_from_payload(body['variant']),
+                        variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
+                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                    )
+                    self._write_json({'scores': [_serialize_anndata(s) for s in scores]})
+                    return
+
+                if route == '/score_variants':
+                    intervals_payload = body['intervals']
+                    variants_payload = body['variants']
+                    if isinstance(intervals_payload, dict):
+                        intervals: genome.Interval | list[genome.Interval] = _interval_from_payload(intervals_payload)
+                    else:
+                        intervals = [_interval_from_payload(i) for i in intervals_payload]
+                    variants = [_variant_from_payload(v) for v in variants_payload]
+                    scores = adapter.score_variants(
+                        intervals=intervals,
+                        variants=variants,
+                        variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
+                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        progress_bar=False,
+                        max_workers=int(body.get('max_workers', 5)),
+                    )
+                    self._write_json(
+                        {'scores': [[_serialize_anndata(s) for s in group] for group in scores]}
+                    )
+                    return
+
+                if route == '/score_ism_variants':
+                    interval_variant_payload = body.get('interval_variant')
+                    scores = adapter.score_ism_variants(
+                        interval=_interval_from_payload(body['interval']),
+                        ism_interval=_interval_from_payload(body['ism_interval']),
+                        variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
+                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        interval_variant=_variant_from_payload(interval_variant_payload)
+                        if interval_variant_payload
+                        else None,
+                        progress_bar=False,
+                        max_workers=int(body.get('max_workers', 5)),
+                    )
+                    self._write_json(
+                        {'scores': [[_serialize_anndata(s) for s in group] for group in scores]}
+                    )
+                    return
+
+                if route == '/explain_interval':
+                    try:
+                        result = adapter.explain_interval(
+                            interval=_interval_from_payload(body['interval']),
+                            target_interval=_interval_from_payload(body['target_interval']),
+                            organism=body.get('organism', 'HOMO_SAPIENS'),
+                            requested_output=body['requested_output'],
+                            resolution=int(body.get('resolution', 128)),
+                            track_indices=[int(i) for i in body['track_indices']],
+                            method=body['method'],
+                            reduction=body.get('reduction', 'sum'),
+                            include_raw_gradient=bool(body.get('include_raw_gradient', False)),
+                            strand_averaged=bool(body.get('strand_averaged', False)),
+                            batch_size=int(body.get('batch_size', 8)),
+                        )
+                    except UnsupportedMethodError as exc:
+                        self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    self._write_json({'attribution': _serialize_attribution(result)})
+                    return
+
+                self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)
         except NotImplementedError as exc:
             self._write_json({'error': str(exc)}, status=HTTPStatus.NOT_IMPLEMENTED)
         except Exception as exc:

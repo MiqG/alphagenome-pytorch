@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import itertools
 import logging
@@ -261,10 +262,19 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
         self.bytes_per_chunk = bytes_per_chunk
         self.compression_type = compression_type
 
-    def _adapter_for(self, context) -> LocalDnaModelAdapter:
-        """Return the per-request adapter, enforcing catalog-mode metadata rules."""
+    @contextlib.contextmanager
+    def _acquire(self, context):
+        """Yield the per-request adapter, holding the router lock in catalog mode.
+
+        Enforces catalog-mode metadata rules (``FAILED_PRECONDITION`` when the
+        ``alphagenome-model-id`` header is missing, ``NOT_FOUND`` for unknown
+        ids) and keeps the shared base model swapped in for the duration of the
+        ``with`` body so a concurrent RPC cannot re-swap it mid-forward. Keep
+        only the model computation inside the block; stream after release.
+        """
         if self.router is None:
-            return self.adapter
+            yield self.adapter
+            return
         from alphagenome_pytorch.extensions.serving.router import (
             ModelNotFoundError,
         )
@@ -287,18 +297,19 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
                 grpc.StatusCode.NOT_FOUND,
                 f"Unknown model id: {model_id!r}. Available: {self.router.model_ids}",
             )
-        return self.router.select(resolved)
+        with self.router.acquire(resolved) as adapter:
+            yield adapter
 
     def PredictSequence(self, request_iterator, context):
         try:
             request = _first_request(request_iterator, 'PredictSequence')
-            adapter = self._adapter_for(context)
-            output = adapter.predict_sequence(
-                sequence=request.sequence,
-                organism=request.organism,
-                requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
-                ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
-            )
+            with self._acquire(context) as adapter:
+                output = adapter.predict_sequence(
+                    sequence=request.sequence,
+                    organism=request.organism,
+                    requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
+                    ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
+                )
             yield from _iter_output_payloads(
                 output,
                 response_cls=dna_model_service_pb2.PredictSequenceResponse,
@@ -312,14 +323,14 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
     def PredictInterval(self, request_iterator, context):
         try:
             request = _first_request(request_iterator, 'PredictInterval')
-            adapter = self._adapter_for(context)
             interval = genome.Interval.from_proto(request.interval)
-            output = adapter.predict_interval(
-                interval=interval,
-                organism=request.organism,
-                requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
-                ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
-            )
+            with self._acquire(context) as adapter:
+                output = adapter.predict_interval(
+                    interval=interval,
+                    organism=request.organism,
+                    requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
+                    ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
+                )
             yield from _iter_output_payloads(
                 output,
                 response_cls=dna_model_service_pb2.PredictIntervalResponse,
@@ -333,16 +344,16 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
     def PredictVariant(self, request_iterator, context):
         try:
             request = _first_request(request_iterator, 'PredictVariant')
-            adapter = self._adapter_for(context)
             interval = genome.Interval.from_proto(request.interval)
             variant = genome.Variant.from_proto(request.variant)
-            output = adapter.predict_variant(
-                interval=interval,
-                variant=variant,
-                organism=request.organism,
-                requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
-                ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
-            )
+            with self._acquire(context) as adapter:
+                output = adapter.predict_variant(
+                    interval=interval,
+                    variant=variant,
+                    organism=request.organism,
+                    requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
+                    ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
+                )
             yield from _iter_output_payloads(
                 output.reference,
                 response_cls=dna_model_service_pb2.PredictVariantResponse,
@@ -367,15 +378,15 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
     def ScoreVariant(self, request_iterator, context):
         try:
             request = _first_request(request_iterator, 'ScoreVariant')
-            adapter = self._adapter_for(context)
             interval = genome.Interval.from_proto(request.interval)
             variant = genome.Variant.from_proto(request.variant)
-            scores = adapter.score_variant(
-                interval=interval,
-                variant=variant,
-                variant_scorers=list(request.variant_scorers),
-                organism=request.organism,
-            )
+            with self._acquire(context) as adapter:
+                scores = adapter.score_variant(
+                    interval=interval,
+                    variant=variant,
+                    variant_scorers=list(request.variant_scorers),
+                    organism=request.organism,
+                )
             for score in scores:
                 score_output, chunks = _anndata_to_score_variant_output(
                     score,
@@ -391,7 +402,6 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
     def ScoreIsmVariant(self, request_iterator, context):
         try:
             request = _first_request(request_iterator, 'ScoreIsmVariant')
-            adapter = self._adapter_for(context)
             interval = genome.Interval.from_proto(request.interval)
             ism_interval = genome.Interval.from_proto(request.ism_interval)
             interval_variant = (
@@ -399,13 +409,14 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
                 if request.HasField('interval_variant')
                 else None
             )
-            scores_nested = adapter.score_ism_variants(
-                interval=interval,
-                ism_interval=ism_interval,
-                variant_scorers=list(request.variant_scorers),
-                organism=request.organism,
-                interval_variant=interval_variant,
-            )
+            with self._acquire(context) as adapter:
+                scores_nested = adapter.score_ism_variants(
+                    interval=interval,
+                    ism_interval=ism_interval,
+                    variant_scorers=list(request.variant_scorers),
+                    organism=request.organism,
+                    interval_variant=interval_variant,
+                )
             for score in itertools.chain.from_iterable(scores_nested):
                 score_output, chunks = _anndata_to_score_variant_output(
                     score,
@@ -420,8 +431,8 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
 
     def GetMetadata(self, request, context):
         try:
-            adapter = self._adapter_for(context)
-            metadata = adapter.output_metadata(request.organism)
+            with self._acquire(context) as adapter:
+                metadata = adapter.output_metadata(request.organism)
             output_metadata = []
             for output_type in dna_output.OutputType:
                 data = metadata.get(output_type)

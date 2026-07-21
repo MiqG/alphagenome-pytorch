@@ -296,6 +296,13 @@ def _convert_delta_checkpoint_to_export(src: Path, dest: Path) -> dict[str, Any]
         metadata["track_names"] = json.dumps(ckpt_meta["track_names"])
     if "track_metadata" in ckpt_meta:
         metadata["track_metadata"] = json.dumps(ckpt_meta["track_metadata"])
+    # Carry organism provenance through so a served bundle does not silently
+    # fall back to human (index 0) — the canonical delta format embeds both and
+    # ``_read_delta_export_header`` reads them back.
+    if ckpt_meta.get("organism") is not None:
+        metadata["organism"] = json.dumps(ckpt_meta["organism"])
+    if ckpt_meta.get("organism_indices") is not None:
+        metadata["organism_indices"] = json.dumps(ckpt_meta["organism_indices"])
 
     save_file(
         {k: v.contiguous().cpu() for k, v in weights.items()},

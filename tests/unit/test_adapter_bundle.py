@@ -501,3 +501,151 @@ class TestModelCard:
         assert "WTC11 ATAC LoRA" in card
         assert "sha256:abc" in card
         assert "atac" in card
+
+
+# ---------------------------------------------------------------------------
+# Organism provenance survives export (regression: mouse must not fall back to
+# human), and catalog adapters land on the base device.
+# ---------------------------------------------------------------------------
+
+
+class TestExportOrganismProvenance:
+    """`agt adapters export` must carry organism provenance through so a served
+    mouse fine-tune resolves to mouse, not human."""
+
+    def _write_mouse_delta(self, tmp_path: Path) -> Path:
+        model = _make_lora_model()
+        cfg = _lora_config()
+        p = tmp_path / "mouse.delta.pth"
+        save_delta_checkpoint(
+            p, model, cfg,
+            base_model_hash="sha256:mouse-base",
+            epoch=1, val_loss=0.1,
+            organism="mouse",
+            organism_indices=[1],
+            track_metadata=[
+                {"head": "atac", "track_name": "m", "organism": 1, "is_padding": False}
+            ],
+        )
+        return p
+
+    def test_export_reload_keeps_default_organism_mouse(self, tmp_path: Path) -> None:
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            _read_delta_export_header,
+            resolve_finetuned_organism,
+        )
+
+        src = self._write_mouse_delta(tmp_path)
+        out = tmp_path / "bundle"
+        # Export WITHOUT --organism: provenance must come from the checkpoint.
+        rc = adapters_cli.run(_make_export_args(
+            checkpoint=str(src), out=str(out), bundle_id="mouse-atac",
+        ))
+        assert rc == 0
+
+        paths = BundlePaths.resolve(out)
+        header = _read_delta_export_header(paths.adapter_safetensors)
+        assert header.get("organism") == "mouse"
+        assert header.get("organism_indices") == [1]
+
+        # Reload → resolved default organism is still mouse (index 1), not human.
+        ctx = resolve_finetuned_organism(
+            organism_indices=header.get("organism_indices"),
+            checkpoint_organism=header.get("organism"),
+            track_metadata=header.get("track_metadata"),
+            num_organisms=2,
+        )
+        assert ctx.default_organism_index == 1
+
+
+class TestCatalogAdapterDevicePlacement:
+    """build_adapter_entry must leave the captured adapter/head modules on the
+    base model's device — prepare_for_transfer can create some on CPU, and
+    detached entries never ride along in a later base_model.to(device)."""
+
+    def _base(self, device: str) -> nn.Module:
+        base = nn.Module()
+        base.q_proj = nn.Linear(16, 16)
+        base.heads = nn.ModuleDict()
+        return base.to(device)
+
+    def _build_entry(self, tmp_path: Path, device: str):
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            compute_base_model_hash,
+        )
+        from alphagenome_pytorch.extensions.serving.router import (
+            build_adapter_entry,
+        )
+
+        base = self._base(device)
+        delta = tmp_path / "src.delta.pth"
+        save_delta_checkpoint(
+            delta, _make_lora_model(), _lora_config(),
+            base_model_hash=compute_base_model_hash(base),
+            epoch=1, val_loss=0.1,
+        )
+        out = tmp_path / "bundle"
+        assert adapters_cli.run(_make_export_args(
+            checkpoint=str(delta), out=str(out), bundle_id="d",
+        )) == 0
+        paths = BundlePaths.resolve(out)
+        return build_adapter_entry(
+            base_model=base, bundle_paths=paths, manifest=Manifest.load(paths.manifest),
+        )
+
+    def _assert_all_on(self, entry, dev_type: str) -> None:
+        moved = 0
+        for att in entry.adapter_attachments:
+            for p in att.wrapper.parameters():
+                assert p.device.type == dev_type
+                moved += 1
+        for hmod in entry.head_modules.values():
+            for p in hmod.parameters():
+                assert p.device.type == dev_type
+        assert moved > 0  # the LoRA wrapper contributed params
+
+    def test_cpu_placement(self, tmp_path: Path) -> None:
+        entry = self._build_entry(tmp_path, "cpu")
+        self._assert_all_on(entry, "cpu")
+
+    def test_carries_per_entry_serving_fields(self, tmp_path: Path) -> None:
+        """The catalog builder relies on build_adapter_entry storing each
+        bundle's own scorer / metadata catalog / track names / organism."""
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            compute_base_model_hash,
+        )
+        from alphagenome_pytorch.extensions.serving.router import (
+            build_adapter_entry,
+        )
+
+        base = self._base("cpu")
+        delta = tmp_path / "src.delta.pth"
+        save_delta_checkpoint(
+            delta, _make_lora_model(), _lora_config(),
+            base_model_hash=compute_base_model_hash(base),
+        )
+        out = tmp_path / "bundle"
+        assert adapters_cli.run(_make_export_args(
+            checkpoint=str(delta), out=str(out), bundle_id="d",
+        )) == 0
+        paths = BundlePaths.resolve(out)
+
+        sentinel_scorer = object()
+        sentinel_catalog = object()
+        entry = build_adapter_entry(
+            base_model=base, bundle_paths=paths,
+            manifest=Manifest.load(paths.manifest),
+            metadata_catalog=sentinel_catalog,
+            track_names={"atac": ["t0"]},
+            scorer=sentinel_scorer,
+            default_organism=1,
+        )
+        assert entry.scorer is sentinel_scorer
+        assert entry.metadata_catalog is sentinel_catalog
+        assert entry.track_names == {"atac": ["t0"]}
+        assert entry.default_organism == 1
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_placement(self, tmp_path: Path) -> None:
+        entry = self._build_entry(tmp_path, "cuda")
+        self._assert_all_on(entry, "cuda")

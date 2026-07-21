@@ -227,6 +227,106 @@ class TestSwapMechanics:
 
 
 # ---------------------------------------------------------------------------
+# Request-scoped locking (acquire)
+# ---------------------------------------------------------------------------
+
+
+class TestAcquireLocking:
+    """``acquire`` must hold the lock across the swap *and* the model call so a
+    concurrent request cannot re-swap the shared base model mid-forward."""
+
+    def _router(self) -> ServedModelRouter:
+        m = _TinyModel()
+        e1 = _make_entry(m, id="a", kind="adapter")
+        e2 = _make_entry(m, id="b", kind="adapter")
+        return ServedModelRouter(
+            base_model=m, runtime=_stub_runtime(), entries=[e1, e2],
+            adapter_factory=lambda router, entry: entry.id,
+        )
+
+    def test_acquire_yields_active_adapter(self) -> None:
+        r = self._router()
+        with r.acquire("a") as adapter:
+            assert adapter == "a"
+            assert r.active_id == "a"
+
+    def test_acquire_blocks_second_thread_until_release(self) -> None:
+        import threading
+
+        r = self._router()
+        a_held = threading.Event()
+        release_a = threading.Event()
+        b_entered = threading.Event()
+        active_while_a_held: list[str | None] = []
+
+        def hold_a() -> None:
+            with r.acquire("a"):
+                a_held.set()
+                # Block inside the critical section, simulating a long forward.
+                release_a.wait(timeout=5)
+                # Record what B managed to do while we held the lock.
+                active_while_a_held.append(r.active_id)
+
+        def take_b() -> None:
+            a_held.wait(timeout=5)
+            with r.acquire("b"):
+                b_entered.set()
+
+        t1 = threading.Thread(target=hold_a)
+        t2 = threading.Thread(target=take_b)
+        t1.start()
+        assert a_held.wait(timeout=5)
+        t2.start()
+
+        # B is blocked on the router lock: it must not swap in while A holds it.
+        assert not b_entered.wait(timeout=0.5)
+        assert r.active_id == "a"
+
+        # Release A; B can now proceed and become active.
+        release_a.set()
+        assert b_entered.wait(timeout=5)
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        assert r.active_id == "b"
+        # While A held the lock, the active model never changed to B.
+        assert active_while_a_held == ["a"]
+
+    def test_default_factory_forwards_resolved_default_organism(
+        self, monkeypatch
+    ) -> None:
+        """The default factory must pass a resolved ``entry.default_organism`` to
+        the per-request runtime (so a mouse bundle does not default to human),
+        and omit it when unresolved (mixed/None)."""
+        import alphagenome_pytorch.prediction as prediction_mod
+        from alphagenome_pytorch.extensions.serving.router import (
+            _default_adapter_factory,
+        )
+
+        captured: dict[str, Any] = {}
+
+        class _FakeRuntime:
+            def __init__(self, **kwargs: Any) -> None:
+                captured.clear()
+                captured.update(kwargs)
+
+        monkeypatch.setattr(
+            prediction_mod, "AlphaGenomePredictionRuntime", _FakeRuntime
+        )
+
+        m = _TinyModel()
+        mouse = _make_entry(m, id="mouse", kind="adapter")
+        mouse.default_organism = 1
+        r = ServedModelRouter(base_model=m, runtime=_stub_runtime(), entries=[mouse])
+        _default_adapter_factory(r, mouse)
+        assert captured.get("default_organism") == 1
+
+        human_default_absent = _make_entry(m, id="mixed", kind="adapter")
+        human_default_absent.default_organism = None
+        _default_adapter_factory(r, human_default_absent)
+        assert "default_organism" not in captured
+
+
+# ---------------------------------------------------------------------------
 # Catalog file parsing
 # ---------------------------------------------------------------------------
 
