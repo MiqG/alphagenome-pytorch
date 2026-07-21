@@ -370,6 +370,10 @@ def _build_catalog_router(args: argparse.Namespace):
         BundlePaths,
         Manifest,
     )
+    from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        _read_delta_export_header,
+        resolve_finetuned_organism,
+    )
     from alphagenome_pytorch.extensions.serving.router import (
         ServedModelRouter,
         build_adapter_entry,
@@ -418,12 +422,37 @@ def _build_catalog_router(args: argparse.Namespace):
         # Override the manifest id with the catalog's spec id so users can
         # alias bundles in their catalog file without rebuilding them.
         manifest.id = spec.id
+
+        # Each served adapter describes itself: read its embedded delta header so
+        # the entry gets its OWN track metadata, track names, organism default,
+        # and variant scorer — not the base model's. An explicit --track-metadata
+        # still overrides (via _resolve_finetuned_metadata_catalog).
+        header = _read_delta_export_header(bundle_paths.adapter_safetensors)
+        entry_catalog = _resolve_finetuned_metadata_catalog(args, header)
+        organism_ctx = resolve_finetuned_organism(
+            organism_indices=header.get("organism_indices"),
+            checkpoint_organism=header.get("organism"),
+            track_metadata=header.get("track_metadata"),
+            num_organisms=model.num_organisms,
+        )
+        # The scorer references the shared base model; it is only invoked while
+        # this entry is the active (locked-in) selection, so scoring runs against
+        # the adapter-attached model with this bundle's metadata.
+        entry_scorer = _make_variant_scorer(
+            runtime=runtime,
+            model=model,
+            args=args,
+            metadata_catalog=entry_catalog,
+        )
         # NB: build_adapter_entry mutates `model` and detaches before returning.
         entries.append(build_adapter_entry(
             base_model=model,
             bundle_paths=bundle_paths,
             manifest=manifest,
-            metadata_catalog=base_metadata_catalog,
+            metadata_catalog=entry_catalog,
+            track_names=header.get("track_names"),
+            scorer=entry_scorer,
+            default_organism=organism_ctx.default_organism_index,
         ))
 
     if not entries:
