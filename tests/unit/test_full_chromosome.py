@@ -192,9 +192,9 @@ class TestSequenceToOnehot:
         np.testing.assert_array_equal(upper, lower)
 
     def test_n_encoding(self):
-        """N bases should be encoded as uniform [0.25, 0.25, 0.25, 0.25]."""
+        """N bases should be encoded as all-zeros (matching the JAX reference)."""
         onehot = _sequence_to_onehot("N")
-        expected = np.array([[0.25, 0.25, 0.25, 0.25]], dtype=np.float32)
+        expected = np.array([[0, 0, 0, 0]], dtype=np.uint8)
         np.testing.assert_array_equal(onehot, expected)
 
     def test_mixed_sequence(self):
@@ -203,13 +203,13 @@ class TestSequenceToOnehot:
         # A
         np.testing.assert_array_equal(onehot[0], [1, 0, 0, 0])
         # N
-        np.testing.assert_array_equal(onehot[2], [0.25, 0.25, 0.25, 0.25])
+        np.testing.assert_array_equal(onehot[2], [0, 0, 0, 0])
         # T
         np.testing.assert_array_equal(onehot[4], [0, 0, 0, 1])
 
     def test_output_dtype(self):
         onehot = _sequence_to_onehot("ACGT")
-        assert onehot.dtype == np.float32
+        assert onehot.dtype == np.uint8
 
     def test_empty_sequence(self):
         onehot = _sequence_to_onehot("")
@@ -272,11 +272,10 @@ class TestStitchingWithMockModel:
         class _FakeSource:
             chrom_sizes = {'chr1': chrom_len}
 
-            def fetch_onehot(self, chrom, start, end, *, pad=True, ambiguous='uniform'):
-                del ambiguous
+            def fetch_onehot(self, chrom, start, end, *, pad=True):
                 length = end - start
                 if pad:
-                    result = np.full((length, 4), 0.25, dtype=np.float32)
+                    result = np.zeros((length, 4), dtype=genome_array.dtype)
                     valid_start = max(0, start)
                     valid_end = min(self.chrom_sizes.get(chrom, 0), end)
                     if valid_start < valid_end:
@@ -343,6 +342,113 @@ class TestStitchingWithMockModel:
         assert preds.shape == (expected_len, 1)
         # Check no zeros in the interior (would indicate gaps in stitching)
         assert np.all(preds[1:-1, 0] > 0)
+
+    def test_gene_counts_anndata_across_tiles(self):
+        """Whole-chromosome gene counts reconstruct a gene that spans two tiles."""
+        import pandas as pd
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            predict_full_chromosomes_to_anndata,
+            GenomeSequenceProvider,
+        )
+        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+        chrom_len = 131072 * 2  # two 131072bp tiles at crop_bp=0
+        config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
+        model = self._MockModel(resolution=128, n_tracks=1)  # all-A genome -> every bin == 1.0
+        provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
+
+        # geneX: exon [256,640) -> bins [2,5) in tile 0 (3 bins).
+        # geneY: exon [130944,131328) straddles the tile-0/tile-1 boundary at 131072
+        #        -> 1 bin in tile 0 + 2 bins in tile 1 (3 bins total).
+        rows = [
+            dict(Feature="gene", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+            dict(Feature="exon", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+            dict(Feature="gene", Chromosome="chr1", Start=130944, End=131328, Strand="+",
+                 gene_id="ENSY", gene_name="Y", gene_type="protein_coding"),
+            dict(Feature="exon", Chromosome="chr1", Start=130944, End=131328, Strand="+",
+                 gene_id="ENSY", gene_name="Y", gene_type="protein_coding"),
+        ]
+        ann = GeneAnnotation(pd.DataFrame(rows))
+
+        gc = predict_full_chromosomes_to_anndata(
+            model, provider, ann, "atac",
+            chromosomes=["chr1"], config=config, track_indices=[0],
+            over="exons", reduce="sum", device="cpu", show_progress=False,
+        )
+
+        counts = {gid: gc.counts[0, i, 0].item()
+                  for i, gid in enumerate(gc.gene_metadata["gene_id"])}
+        assert counts["ENSX"] == pytest.approx(3.0)  # 3 exon bins, all-A -> 1.0 each
+        assert counts["ENSY"] == pytest.approx(3.0)  # reconstructed across the tile seam
+
+    def test_gene_counts_anndata_requires_exon_rows(self):
+        """over='exons' with a gene-only annotation errors up front, not after inference."""
+        import pandas as pd
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            predict_full_chromosomes_to_anndata,
+            GenomeSequenceProvider,
+        )
+        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+        chrom_len = 131072
+        config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
+        model = self._MockModel(resolution=128, n_tracks=1)
+        provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
+        # Gene-only annotation: no exon rows.
+        ann = GeneAnnotation(pd.DataFrame([
+            dict(Feature="gene", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+        ]))
+
+        kwargs = dict(chromosomes=["chr1"], config=config, track_indices=[0],
+                      device="cpu", show_progress=False)
+        with pytest.raises(ValueError, match="exon rows"):
+            predict_full_chromosomes_to_anndata(model, provider, ann, "atac",
+                                                over="exons", **kwargs)
+        # gene_body works with the same gene-only annotation.
+        gc = predict_full_chromosomes_to_anndata(model, provider, ann, "atac",
+                                                 over="gene_body", **kwargs)
+        assert list(gc.gene_metadata["gene_id"]) == ["ENSX"]
+
+    def test_gene_counts_anndata_write_path(self, tmp_path):
+        """End-to-end: write .h5ad and read it back; check orientation + metadata."""
+        import pandas as pd
+        anndata = pytest.importorskip("anndata")
+        from alphagenome_pytorch.extensions.inference.full_chromosome import (
+            predict_full_chromosomes_to_anndata,
+            GenomeSequenceProvider,
+        )
+        from alphagenome_pytorch.variant_scoring.annotations import GeneAnnotation
+
+        chrom_len = 131072
+        config = TilingConfig(crop_bp=0, resolution=128, batch_size=1)
+        model = self._MockModel(resolution=128, n_tracks=2)  # track 0 == 1.0, track 1 == 0.0
+        provider = self._build_in_memory_provider(GenomeSequenceProvider, chrom_len)
+        rows = [
+            dict(Feature="gene", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),
+            dict(Feature="exon", Chromosome="chr1", Start=256, End=640, Strand="+",
+                 gene_id="ENSX", gene_name="X", gene_type="protein_coding"),  # bins [2,5)
+        ]
+        ann = GeneAnnotation(pd.DataFrame(rows))
+
+        out = tmp_path / "gene_counts.h5ad"
+        predict_full_chromosomes_to_anndata(
+            model, provider, ann, "atac",
+            output_path=str(out), chromosomes=["chr1"], config=config,
+            track_indices=[0, 1], track_names=["t0", "t1"],
+            over="exons", reduce="sum", device="cpu", show_progress=False,
+        )
+
+        assert out.exists()
+        adata = anndata.read_h5ad(str(out))
+        assert adata.shape == (2, 1)                       # obs=tracks, var=genes
+        assert list(adata.var_names) == ["ENSX"]
+        assert list(adata.obs["track_name"]) == ["t0", "t1"]
+        assert float(adata.X[0, 0]) == pytest.approx(3.0)  # track 0: 3 exon bins x 1.0
+        assert float(adata.X[1, 0]) == pytest.approx(0.0)  # track 1: mock is 0
 
 
 @pytest.mark.unit

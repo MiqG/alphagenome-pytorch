@@ -193,11 +193,21 @@ def _resolve_finetuned_metadata_catalog(
                 'the embedded catalog.',
                 args.track_metadata,
             )
-        return TrackMetadataCatalog.from_file(args.track_metadata)
+        # Delegate to the shared loader (logs 'Loaded track metadata from %s').
+        # include_bundled=False: fine-tuned heads may be custom, so don't fall
+        # back to bundled pretrained metadata.
+        return _load_metadata_catalog(args, include_bundled=False)
 
     if embedded_rows:
+        catalog = TrackMetadataCatalog.from_rows(embedded_rows)
+        if catalog.is_empty():
+            LOGGER.warning(
+                'Fine-tuned checkpoint embedded an empty track-metadata '
+                'catalog; serving sparse track names instead.'
+            )
+            return None
         LOGGER.info('Using track metadata embedded in the fine-tuned checkpoint.')
-        return TrackMetadataCatalog.from_rows(embedded_rows)
+        return catalog
 
     return None
 
@@ -250,6 +260,24 @@ def _resolve_checkpoint_arg(checkpoint: str) -> str:
     return str(paths.adapter_safetensors)
 
 
+def _finetuned_default_organism(meta: dict) -> int:
+    """Default organism index for a fine-tuned model, from the resolved metadata.
+
+    Consumes the ``default_organism_index`` the canonical loader already resolved
+    (checkpoint provenance + embedded catalog) — this must not re-run resolution.
+    A mixed checkpoint has no single default (``None``); since mixed-organism serving
+    is not yet supported, that fails at server construction rather than silently
+    defaulting to human.
+    """
+    default = meta.get("default_organism_index")
+    if default is None:
+        raise ValueError(
+            "This checkpoint has no single default organism. "
+            "Mixed-organism serving is not yet supported."
+        )
+    return default
+
+
 def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
     """Construct a serving adapter from a fine-tuned checkpoint."""
     from alphagenome_pytorch.extensions.finetuning.checkpointing import (
@@ -281,6 +309,7 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         metadata_catalog=metadata_catalog,
         track_names=meta.get('track_names'),
         device=args.device,
+        default_organism=_finetuned_default_organism(meta),
     )
     scorer = _make_variant_scorer(
         runtime=runtime,

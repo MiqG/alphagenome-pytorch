@@ -593,6 +593,7 @@ class TestExportAndLoadDeltaWeights:
         from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
 
         model = nn.Module()
+        model.num_organisms = 2
         model.q_proj = LoRA(nn.Linear(64, 64), rank=4)
         model.heads = nn.ModuleDict({
             "my_head": nn.Linear(64, 10),
@@ -695,11 +696,13 @@ class TestExportAndLoadDeltaWeights:
             export_delta_weights(
                 model, config, path, format="pth",
                 track_names=track_names, track_metadata=track_metadata,
+                organism="mouse",
             )
 
             header = _read_delta_export_header(path)
             assert header["track_names"] == track_names
             assert header["track_metadata"] == track_metadata
+            assert header["organism"] == "mouse"
             assert load_delta_config(path).mode == "lora"
 
     def test_export_embeds_track_names_and_metadata_safetensors(self):
@@ -718,11 +721,39 @@ class TestExportAndLoadDeltaWeights:
             export_delta_weights(
                 model, config, path, format="safetensors",
                 track_names=track_names, track_metadata=track_metadata,
+                organism="mouse",
             )
 
             header = _read_delta_export_header(path)
             assert header["track_names"] == track_names
             assert header["track_metadata"] == track_metadata
+            assert header["organism"] == "mouse"
+
+    def test_export_organism_indices_roundtrip(self):
+        """organism_indices=[0, 1] survives both .pth and safetensors headers."""
+        model, config = self._make_lora_model_and_config()
+        for fmt, ext in [("pth", ".pth"), ("safetensors", ".safetensors")]:
+            if fmt == "safetensors":
+                pytest.importorskip("safetensors")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / f"delta{ext}"
+                export_delta_weights(
+                    model, config, path, format=fmt, organism_indices=[0, 1],
+                )
+                header = _read_delta_export_header(path)
+                assert header["organism_indices"] == [0, 1]
+
+    def test_export_rejects_scalar_not_in_plural(self):
+        """A conflicting organism/organism_indices export fails before writing."""
+        model, config = self._make_lora_model_and_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "delta.pth"
+            with pytest.raises(ValueError):
+                export_delta_weights(
+                    model, config, path, format="pth",
+                    organism="mouse", organism_indices=[0],
+                )
+            assert not path.exists()
 
     def test_export_without_metadata_is_backwards_compatible(self):
         """Old call sites without track_names/track_metadata still work."""
@@ -746,6 +777,7 @@ class TestIsDeltaWeightsExport:
     def _make_lora_model_and_config(self):
         from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
         model = nn.Module()
+        model.num_organisms = 2
         model.q_proj = LoRA(nn.Linear(64, 64), rank=4)
         model.heads = nn.ModuleDict({"my_head": nn.Linear(64, 10)})
         config = TransferConfig(
@@ -792,6 +824,50 @@ class TestIsDeltaWeightsExport:
             torch.save({"random_key": [1, 2, 3]}, path)
             assert is_delta_weights_export(path) is False
 
+    def test_rejects_full_checkpoint_with_transfer_config(self):
+        """A full checkpoint that embeds transfer_config (LoRA finetune) but has
+        no top-level ``weights`` key must NOT be misclassified as an export."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "full_with_cfg.pth"
+            torch.save({
+                "model_state_dict": {},
+                "transfer_config": {"mode": "lora"},
+                "epoch": 1,
+            }, path)
+            assert is_delta_weights_export(path) is False
+
+    def test_rejects_corrupt_non_torch_file(self):
+        """A non-torch (unpicklable) file returns False instead of raising."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "garbage.pth"
+            path.write_bytes(b"not a torch checkpoint at all")
+            assert is_delta_weights_export(path) is False
+
+    def test_rejects_corrupt_safetensors(self):
+        """A corrupt .safetensors file returns False instead of raising."""
+        pytest.importorskip("safetensors")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "broken.safetensors"
+            path.write_bytes(b"\x00\x01\x02 not safetensors")
+            assert is_delta_weights_export(path) is False
+
+    def test_safetensors_export_is_not_a_delta_checkpoint(self):
+        """Regression: is_delta_checkpoint must not crash on a .safetensors file.
+
+        ``load_finetuned_model`` probes ``is_delta_checkpoint`` first; before the
+        fix it ran an unguarded ``torch.load`` that raised ``UnpicklingError`` on
+        safetensors, so the export path was never reached."""
+        pytest.importorskip("safetensors")
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            is_delta_checkpoint,
+        )
+        model, config = self._make_lora_model_and_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "delta.safetensors"
+            export_delta_weights(model, config, path, format="safetensors")
+            assert is_delta_checkpoint(path) is False
+            assert is_delta_weights_export(path) is True
+
 
 class TestSaveDeltaCheckpointEmbedsTrackMetadata:
     """save_delta_checkpoint should round-trip track_metadata via load_delta_checkpoint."""
@@ -799,6 +875,7 @@ class TestSaveDeltaCheckpointEmbedsTrackMetadata:
     def test_track_metadata_round_trips(self):
         from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
         model = nn.Module()
+        model.num_organisms = 2
         model.q_proj = LoRA(nn.Linear(64, 64), rank=4)
         model.heads = nn.ModuleDict({"my_head": nn.Linear(64, 10)})
         config = TransferConfig(
@@ -961,6 +1038,8 @@ class TestLoadFinetunedModelNullTransferConfig:
         from alphagenome_pytorch.extensions.finetuning import transfer as tr_mod
 
         class _Stub(nn.Module):
+            num_organisms = 2
+
             def __init__(self, *_, **__):
                 super().__init__()
                 self.heads = nn.ModuleDict()
@@ -1032,3 +1111,104 @@ class TestLoadFinetunedModelNullTransferConfig:
             load_finetuned_model(
                 ckpt_path, "unused.pth", device="cpu", merge=False,
             )
+
+
+class TestLoadFinetunedModelDeltaStripsNativeHeads:
+    """A .delta.pth reload must drop the base model's untrained native heads."""
+
+    def test_delta_reload_strips_pretrained_native_heads(self, tmp_path, monkeypatch):
+        """Parity with the exported-delta and full-checkpoint paths: after reload
+        only the fine-tuned head remains, not the randomly-initialised native
+        heads that a fresh AlphaGenome starts with.
+        """
+        import alphagenome_pytorch as agp
+        from alphagenome_pytorch.extensions.finetuning import transfer as tr_mod
+        from alphagenome_pytorch.extensions.finetuning import checkpointing as ck_mod
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            load_finetuned_model,
+        )
+
+        class _StubWithNativeHeads(nn.Module):
+            num_organisms = 2
+
+            def __init__(self, *_, **__):
+                super().__init__()
+                # A fresh AlphaGenome ships with these pretrained heads.
+                self.heads = nn.ModuleDict({
+                    "atac": nn.Linear(1, 1),
+                    "dnase": nn.Linear(1, 1),
+                })
+
+        def _fake_load_delta(_ckpt_path, model, **_kwargs):
+            # Stand in for load_delta_checkpoint: reconstruct only the new head.
+            model.heads["my_head"] = nn.Linear(1, 1)
+            cfg = TransferConfig(
+                mode="lora",
+                new_heads={"my_head": {"modality": "atac", "num_tracks": 1}},
+            )
+            return cfg, {"modality": "atac", "organism": "mouse"}
+
+        monkeypatch.setattr(agp, "AlphaGenome", lambda **_: _StubWithNativeHeads())
+        monkeypatch.setattr(tr_mod, "load_trunk", lambda m, *_, **__: m)
+        monkeypatch.setattr(ck_mod, "load_delta_checkpoint", _fake_load_delta)
+        # remove_all_heads is intentionally left real — it is the code under test.
+
+        ckpt_path = tmp_path / "model.delta.pth"
+        torch.save({"delta_checkpoint_version": 1}, ckpt_path)
+
+        model, meta = load_finetuned_model(
+            ckpt_path, "unused.pth", device="cpu", merge=False,
+        )
+
+        assert set(model.heads.keys()) == {"my_head"}, set(model.heads.keys())
+        assert meta["default_organism_index"] == 1  # organism context still attached
+
+
+class TestLoadFinetunedModelExportedDelta:
+    """End-to-end load_finetuned_model over the exported-delta sharing formats."""
+
+    def _make_lora_model_and_config(self):
+        from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
+        model = nn.Module()
+        model.num_organisms = 2
+        model.q_proj = LoRA(nn.Linear(64, 64), rank=4)
+        model.heads = nn.ModuleDict({"my_head": nn.Linear(64, 10)})
+        config = TransferConfig(
+            mode="lora", lora_rank=4, lora_targets=["q_proj"],
+            new_heads={"my_head": {"modality": "atac", "num_tracks": 10}},
+        )
+        return model, config
+
+    @pytest.mark.parametrize("fmt,ext", [("safetensors", ".safetensors"),
+                                         ("pth", ".pth")])
+    def test_load_exported_delta_does_not_crash_and_returns_metadata(
+        self, fmt, ext, tmp_path, monkeypatch,
+    ):
+        """Regression for the safetensors crash: load_finetuned_model must route
+        an exported delta (.safetensors or .pth) through Path A2 and surface its
+        embedded track_metadata, rather than raising UnpicklingError."""
+        if fmt == "safetensors":
+            pytest.importorskip("safetensors")
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            load_finetuned_model,
+        )
+        TestLoadFinetunedModelNullTransferConfig._stub_heavy_deps(monkeypatch)
+
+        model, config = self._make_lora_model_and_config()
+        track_names = {"my_head": [f"bw_{i}" for i in range(10)]}
+        track_metadata = [
+            {"output_name": "my_head", "track_name": f"bw_{i}", "biosample_name": "K562"}
+            for i in range(10)
+        ]
+        export_path = tmp_path / f"shared{ext}"
+        export_delta_weights(
+            model, config, export_path, format=fmt,
+            track_names=track_names, track_metadata=track_metadata,
+        )
+
+        _model, meta = load_finetuned_model(
+            export_path, "unused.pth", device="cpu", merge=False,
+        )
+        assert meta["head_names"] == ["my_head"]
+        assert meta["track_names"] == track_names
+        assert meta["track_metadata"] == track_metadata

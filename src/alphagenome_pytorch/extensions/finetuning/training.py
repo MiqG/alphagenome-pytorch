@@ -10,7 +10,6 @@ import math
 import time
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +23,15 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from tqdm import tqdm
 
+from alphagenome_pytorch import losses
 from alphagenome_pytorch.losses import multinomial_loss
+# Re-exported so existing `from ...training import ModalityConfig, MODALITY_CONFIGS`
+# imports keep working; the definitions now live in the dependency-light
+# `modalities` module the flag layer reads.
+from alphagenome_pytorch.extensions.finetuning.modalities import (
+    ModalityConfig,
+    MODALITY_CONFIGS,
+)
 
 # Number of segments for multinomial loss computation.
 # AlphaGenome divides sequences into 8 equal segments for numerical stability.
@@ -61,79 +68,6 @@ def collate_genomic(
         targets_dict[res] = torch.stack([item[1][res] for item in batch])
 
     return sequences, targets_dict
-
-
-@dataclass
-class ModalityConfig:
-    """Configuration for a fine-tuning modality.
-
-    Attributes:
-        name: Modality name ('rnaseq' or 'atac').
-        resolutions: Tuple of output resolutions (e.g., (1, 128) or (128,)).
-        default_resolution_weights: Default weights for each resolution.
-        embedding_dim: Embedding dimension for ATAC (None for RNA-seq).
-        positions_arg: CLI argument name for positions ('positions' or 'peaks').
-    """
-
-    name: str
-    resolutions: tuple[int, ...]
-    default_resolution_weights: dict[int, float]
-    embedding_dim: int | None
-    positions_arg: str
-
-
-# Registry of modality configurations
-MODALITY_CONFIGS: dict[str, ModalityConfig] = {
-    "rna_seq": ModalityConfig(
-        name="rna_seq",
-        resolutions=(1, 128),
-        default_resolution_weights={1: 1.0, 128: 1.0},
-        embedding_dim=3072,
-        positions_arg="positions",
-    ),
-    "atac": ModalityConfig(
-        name="atac",
-        resolutions=(1, 128),
-        default_resolution_weights={1: 1.0, 128: 1.0},
-        embedding_dim=3072,
-        positions_arg="positions",
-    ),
-    "dnase": ModalityConfig(
-        name="dnase",
-        resolutions=(1, 128),
-        default_resolution_weights={1: 1.0, 128: 1.0},
-        embedding_dim=3072,
-        positions_arg="positions",
-    ),
-    "procap": ModalityConfig(
-        name="procap",
-        resolutions=(1, 128),
-        default_resolution_weights={1: 1.0, 128: 1.0},
-        embedding_dim=3072,
-        positions_arg="positions",
-    ),
-    "cage": ModalityConfig(
-        name="cage",
-        resolutions=(1, 128),
-        default_resolution_weights={1: 1.0, 128: 1.0},
-        embedding_dim=3072,
-        positions_arg="positions",
-    ),
-    "chip_tf": ModalityConfig(
-        name="chip_tf",
-        resolutions=(128,),
-        default_resolution_weights={128: 1.0},
-        embedding_dim=3072,
-        positions_arg="positions",
-    ),
-    "chip_histone": ModalityConfig(
-        name="chip_histone",
-        resolutions=(128,),
-        default_resolution_weights={128: 1.0},
-        embedding_dim=3072,
-        positions_arg="positions",
-    ),
-}
 
 
 def create_lr_scheduler(
@@ -187,11 +121,24 @@ def compute_finetuning_loss(
     positional_weight: float,
     device: torch.device,
     channels_last: bool = True,
+    *,
+    gene_mask: Tensor | None = None,
+    gene_loss_weight: float = 0.0,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_mask: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute combined loss across resolutions.
 
     Uses dynamic multinomial_resolution = seq_len // 8 for consistent loss
     granularity across different sequence lengths.
+
+    Optionally adds the cross-track gene LFC term (Decima-style; see
+    `losses.gene_lfc_loss`) at 1bp resolution when:
+      - `gene_loss_weight > 0`
+      - `gene_mask` and `strand_channel_mask` are both provided
+      - `predictions` / `targets` contain key `1`
+    The gene LFC contribution is `resolution_weights[1] * gene_loss_weight *
+    gene_lfc_term` so it scales with the existing 1bp resolution weight.
 
     Args:
         predictions: Dict mapping resolution to prediction tensors.
@@ -200,6 +147,15 @@ def compute_finetuning_loss(
         positional_weight: Weight for positional component of multinomial loss.
         device: Torch device.
         channels_last: If True, assumes (B, S, C). If False, assumes (B, C, S).
+        gene_mask: Optional `[B, S, 2, G]` gene-body mask for the gene LFC
+            term. Ignored if `gene_loss_weight <= 0`.
+        gene_loss_weight: Outer weight on the gene LFC term (paper: 0.1).
+            Default 0.0 disables the term entirely (no behavioral change vs.
+            the pre-B3.2 loss path).
+        gene_cross_track_weight: Inner weight on the multinomial component
+            of the gene LFC term (paper default: 5.0).
+        strand_channel_mask: Optional `[2, 1, C]` track strand-compatibility
+            mask, required when `gene_loss_weight > 0`.
 
     Returns:
         Tuple of (total_loss, loss_dict) where loss_dict contains per-resolution
@@ -246,8 +202,49 @@ def compute_finetuning_loss(
             channels_last=channels_last,
         )
 
-        total_loss = total_loss + weight * res_loss_dict["loss"]
-        loss_dict[f"loss_{res}bp"] = res_loss_dict["loss"]
+        res_loss = res_loss_dict["loss"]
+
+        # Add gene LFC term at 1bp resolution when enabled. Mirrors upstream
+        # which only threads gene_mask through the resolution=1 head path.
+        if res == 1 and gene_loss_weight > 0:
+            # Fail loud on a wiring error: when the gene term is enabled, the
+            # dataset always yields a (possibly all-zero) gene_mask tensor and
+            # strand_channel_mask is required. A None here means a dependency
+            # was never threaded through, so silently skipping would train
+            # without the intended term.
+            missing_args = []
+            if gene_mask is None:
+                missing_args.append("gene_mask")
+            if strand_channel_mask is None:
+                missing_args.append("strand_channel_mask")
+            if missing_args:
+                raise ValueError(
+                    "gene_loss_weight > 0 requires "
+                    f"{', '.join(missing_args)} to be provided for the gene "
+                    "LFC loss at 1bp resolution."
+                )
+            # gene_lfc_loss expects channels-last; transpose if needed.
+            if channels_last:
+                pred_nlc, target_nlc, mask_nlc = pred, target, mask
+            else:
+                pred_nlc = pred.transpose(-1, -2).contiguous()
+                target_nlc = target.transpose(-1, -2).contiguous()
+                mask_nlc = mask.transpose(-1, -2).contiguous()
+            gene_loss, gene_aux = losses.gene_lfc_loss(
+                predictions=pred_nlc,
+                targets=target_nlc,
+                targets_mask=mask_nlc,
+                gene_mask=gene_mask,
+                strand_channel_mask=strand_channel_mask,
+                gene_cross_track_weight=gene_cross_track_weight,
+            )
+            res_loss = res_loss + gene_loss_weight * gene_loss
+            loss_dict["loss_gene_lfc"] = gene_loss
+            loss_dict["loss_gene_total_count"] = gene_aux["gene_loss_total_count"]
+            loss_dict["loss_gene_positional"] = gene_aux["gene_loss_positional"]
+
+        total_loss = total_loss + weight * res_loss
+        loss_dict[f"loss_{res}bp"] = res_loss
 
     loss_dict["loss"] = total_loss
     return total_loss, loss_dict
@@ -267,6 +264,11 @@ def train_epoch(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     resolutions: tuple[int, ...] | None = None,
+    *,
+    gene_loss_weight: float = 0.0,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_mask: Tensor | None = None,
+    organism: int = 0,
 ) -> float:
     """Train for one epoch.
 
@@ -288,6 +290,14 @@ def train_epoch(
         resolutions: Tuple of resolutions to train on (e.g., (1,), (128,), or (1, 128)).
             If None, inferred from resolution_weights keys. Training on 1bp resolution
             requires significantly more memory than 128bp.
+        gene_loss_weight: Outer weight on the gene LFC term (paper: 0.1 for
+            RNA-seq). Default 0.0 disables. Requires `train_loader` to yield
+            3-tuples (sequence, targets, gene_mask) and `strand_channel_mask`
+            to be set.
+        gene_cross_track_weight: Inner multinomial weight inside the gene LFC
+            term (paper default: 5.0).
+        strand_channel_mask: `[2, 1, C]` track strand-compatibility mask,
+            required when gene_loss_weight > 0.
 
     Returns:
         Average training loss for the epoch.
@@ -304,6 +314,11 @@ def train_epoch(
     if invalid := (set(resolutions) - {1, 128}):
         raise ValueError(f"Invalid resolutions {invalid}, must be 1 or 128")
 
+    if gene_loss_weight > 0 and strand_channel_mask is None:
+        raise ValueError(
+            "gene_loss_weight > 0 requires strand_channel_mask to be set."
+        )
+
     # Set up autocast context (bfloat16 on CUDA, no-op on CPU)
     if use_amp and device.type == "cuda":
         amp_context = autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -311,12 +326,20 @@ def train_epoch(
         amp_context = nullcontext()
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
-    for batch_idx, (sequences, targets_dict) in enumerate(pbar):
+    for batch_idx, batch_data in enumerate(pbar):
+        # Dataset returns a 3-tuple when gene_mask is configured, else 2-tuple.
+        if len(batch_data) == 3:
+            sequences, targets_dict, gene_mask = batch_data
+            gene_mask = gene_mask.to(device)
+        else:
+            sequences, targets_dict = batch_data
+            gene_mask = None
         sequences = sequences.to(device)
         targets_dict = {k: v.to(device) for k, v in targets_dict.items() if k in resolutions}
 
-        # Organism index (assume human)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        # Organism index for this fine-tune (0=human, 1=mouse); the forward
+        # uses the matching organism embedding + head slot.
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         with amp_context:
             # Forward through trunk
@@ -344,6 +367,10 @@ def train_epoch(
                 positional_weight=positional_weight,
                 device=device,
                 channels_last=True,
+                gene_mask=gene_mask,
+                gene_loss_weight=gene_loss_weight,
+                gene_cross_track_weight=gene_cross_track_weight,
+                strand_channel_mask=strand_channel_mask,
             )
 
         # Scale loss for gradient accumulation
@@ -385,6 +412,7 @@ def validate(
     positional_weight: float,
     use_amp: bool = True,
     resolutions: tuple[int, ...] | None = None,
+    organism: int = 0,
 ) -> float:
     """Validate the model.
 
@@ -424,7 +452,7 @@ def validate(
         for sequences, targets_dict in tqdm(val_loader, desc="Validation"):
             sequences = sequences.to(device)
             targets_dict = {k: v.to(device) for k, v in targets_dict.items() if k in resolutions}
-            organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+            organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
             with amp_context:
                 outputs = model(sequences, organism_idx, return_embeddings=True, channels_last=False)
@@ -556,6 +584,89 @@ def _cuda_sync(device: torch.device) -> None:
         torch.cuda.synchronize()
 
 
+def _unpack_batch(batch_data) -> tuple:
+    """Unpack a ``collate_multimodal`` batch into ``(sequences, targets, extras)``.
+
+    ``collate_multimodal`` yields a 2-tuple ``(sequences, modality_targets)`` or a
+    3-tuple with a trailing ``extras`` dict (``{"gene_mask", "coords"}``). This
+    normalizes both to a 3-tuple with ``extras`` defaulting to an empty dict.
+    """
+    if len(batch_data) == 3:
+        sequences, modality_targets, extras = batch_data
+    else:
+        sequences, modality_targets = batch_data
+        extras = {}
+    return sequences, modality_targets, extras
+
+
+def _accumulate_gene_expr_windows(
+    windows: list,
+    *,
+    pred_unscaled: Tensor,
+    targets: Tensor,
+    coords: list,
+    annotation: Any,
+    track_strands: list[str] | None,
+    window_cache: dict | None = None,
+) -> None:
+    """Append per-window ``(gene_ids, pred[G,C], obs[G,C])`` for the val metric.
+
+    For each window in the batch, build exon masks (≥50%-exon rule, strand-matched
+    to ``track_strands``) and aggregate log-mean exon coverage for the predicted
+    and observed RNA-seq signal. Windows with no qualifying gene are skipped.
+    ``window_cache`` (a plain dict reused across batches and epochs) memoizes the
+    per-window annotation lookup so it runs once per unique window, and lets the
+    pred and obs calls of a window share it.
+    """
+    from alphagenome_pytorch.aggregation import gene_expression_values
+
+    batch_size = pred_unscaled.shape[0]
+    for b in range(batch_size):
+        interval = tuple(coords[b])
+        pred_vals, gene_ids, _ = gene_expression_values(
+            pred_unscaled[b], annotation, interval,
+            log="log1p", track_strands=track_strands, window_cache=window_cache,
+        )
+        if pred_vals.numel() == 0:
+            continue
+        obs_vals, _, _ = gene_expression_values(
+            targets[b], annotation, interval,
+            log="log1p", track_strands=track_strands, window_cache=window_cache,
+        )
+        windows.append((gene_ids, pred_vals.float().cpu(), obs_vals.float().cpu()))
+
+
+def _gene_expr_metrics(
+    gene_expr_windows: list,
+    *,
+    modality: str,
+    world_size: int = 1,
+) -> dict[str, float]:
+    """Reduce accumulated per-window ``(gene_ids, pred, obs)`` to gene-expression correlations.
+
+    Gathers windows across ranks (DDP), deduplicates genes, and returns the three
+    correlation flavors plus the gene count under ``{modality}_gene_log_expr_*``
+    keys. Pure given ``gene_expr_windows`` (the ``world_size == 1`` path needs no
+    distributed context), so it is unit-testable without a model.
+    """
+    from alphagenome_pytorch.aggregation import combine_gene_expression
+
+    all_windows = gene_expr_windows
+    if world_size > 1:
+        gathered: list = [None] * world_size
+        dist.all_gather_object(gathered, gene_expr_windows)
+        all_windows = [w for part in gathered if part for w in part]
+
+    ge = combine_gene_expression(all_windows)
+    prefix = f"{modality}_gene_log_expr_pearson"
+    return {
+        f"{prefix}_across_genes": ge["across_genes"],
+        f"{prefix}_across_genes_norm": ge["across_genes_norm"],
+        f"{prefix}_across_tracks_norm": ge["across_tracks_norm"],
+        f"{modality}_gene_log_expr_n_genes": ge["n_genes"],
+    }
+
+
 def _compute_multinomial_resolution(
     seq_len: int,
     num_segments: int = NUM_SEGMENTS,
@@ -603,6 +714,7 @@ def train_epoch_ddp(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    organism: int = 0,
 ) -> float:
     """Train for one epoch with DDP and profiling support.
 
@@ -690,7 +802,7 @@ def train_epoch_ddp(
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         if is_profiling:
             _cuda_sync(device)
@@ -919,6 +1031,7 @@ def validate_ddp(
     rank: int = 0,
     world_size: int = 1,
     encoder_only: bool = False,
+    organism: int = 0,
 ) -> tuple[float, dict[str, Any]]:
     """Validate the model with DDP support and Pearson R metrics.
 
@@ -977,7 +1090,7 @@ def validate_ddp(
     with torch.no_grad():
         for sequences, targets_dict in pbar:
             sequences = sequences.to(device)
-            organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+            organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
             resolutions = tuple(resolution_weights.keys())
 
             if encoder_only:
@@ -1139,6 +1252,11 @@ def train_epoch_multihead(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    *,
+    gene_loss_weights: dict[str, float] | None = None,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_masks: dict[str, Tensor] | None = None,
+    organism: int = 0,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1208,7 +1326,15 @@ def train_epoch_multihead(
     running_loss = 0.0
     accumulated_batches = 0
 
-    for batch_idx, (sequences, modality_targets) in enumerate(pbar):
+    gene_loss_weights = gene_loss_weights or {}
+
+    for batch_idx, batch_data in enumerate(pbar):
+        # collate_multimodal yields an optional extras dict (gene_mask/coords).
+        sequences, modality_targets, extras = _unpack_batch(batch_data)
+        gene_mask = extras.get("gene_mask")
+        if gene_mask is not None:
+            gene_mask = gene_mask.to(device)
+
         is_profiling = do_profile and batch_idx < profile_batches
 
         if is_profiling and batch_idx > 0:
@@ -1221,7 +1347,7 @@ def train_epoch_multihead(
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         if is_profiling:
             _cuda_sync(device)
@@ -1320,6 +1446,32 @@ def train_epoch_multihead(
                 )
 
                 res_loss = loss_dict["loss"] * weight
+
+                # Optional gene LFC term (Decima-style cross-track loss).
+                # Only applies at 1bp resolution to the head whose modality
+                # has a non-zero entry in `gene_loss_weights`. Mirrors
+                # upstream which threads gene_mask only through res=1.
+                gene_w = gene_loss_weights.get(modality, 0.0)
+                if (
+                    res == 1
+                    and gene_w > 0
+                    and gene_mask is not None
+                    and strand_channel_masks is not None
+                    and modality in strand_channel_masks
+                ):
+                    gene_loss, gene_aux = losses.gene_lfc_loss(
+                        predictions=pred,
+                        targets=targets,
+                        targets_mask=mask,
+                        gene_mask=gene_mask,
+                        strand_channel_mask=strand_channel_masks[modality],
+                        gene_cross_track_weight=gene_cross_track_weight,
+                    )
+                    res_loss = res_loss + weight * gene_w * gene_loss
+                    loss_components[f"{modality}_gene_lfc"] = gene_loss.item()
+                    loss_components[f"{modality}_gene_total_count"] = gene_aux["gene_loss_total_count"].item()
+                    loss_components[f"{modality}_gene_positional"] = gene_aux["gene_loss_positional"].item()
+
                 modality_loss = modality_loss + res_loss
                 loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
                 loss_components[f"{modality}_loss_{res}bp_count"] = loss_dict["loss_total"].item()
@@ -1454,6 +1606,12 @@ def validate_multihead(
     rank: int = 0,
     world_size: int = 1,
     encoder_only: bool = False,
+    organism: int = 0,
+    gene_annotation: Any = None,
+    gene_expr_track_strands: list[str] | None = None,
+    gene_expr_modality: str = "rna_seq",
+    gene_expr_resolution: int | None = None,
+    gene_expr_window_cache: dict | None = None,
 ) -> tuple[float, dict[str, Any]]:
     """Validate model with multiple modality heads.
 
@@ -1474,6 +1632,28 @@ def validate_multihead(
         world_size: Total number of processes.
         encoder_only: If True, run only the CNN encoder and pass raw encoder output
             (B, S//128, 1536) to all heads as resolution 128.
+        gene_annotation: Optional ``GeneAnnotation`` (with exon rows) enabling the
+            gene-expression validation metric for
+            ``gene_expr_modality``. When set (and ``compute_pearson``), per-window
+            log-mean exon coverage is aggregated for predictions and observed
+            targets, deduplicated across windows, and three Pearson correlations
+            are emitted: ``{modality}_gene_log_expr_pearson_{across_genes,
+            across_genes_norm, across_tracks_norm}``.
+        gene_expr_track_strands: Per-track strand chars (``'+'/'-'/'.'``) for
+            ``gene_expr_modality``, used for sense-strand matching. Required for a
+            correct metric when tracks are stranded.
+        gene_expr_modality: Modality the gene-expression metric applies to
+            (default ``"rna_seq"``).
+        gene_expr_resolution: Resolution of the head output the metric reads.
+            Defaults to 128 under ``encoder_only`` (those heads emit 128bp only)
+            and 1 otherwise. The metric itself is resolution-agnostic — it
+            derives bin size from the interval width — so this only selects
+            *which* head output to consume. It must be a resolution the head
+            actually emits, or no windows accumulate and the metric is NaN.
+        gene_expr_window_cache: Optional dict reused across epochs to memoize the
+            per-window exon-mask lookup (the only pandas-heavy step). Create once
+            in the training driver and pass it every epoch so each validation
+            window's gene selection is built exactly once for the whole run.
 
     Returns:
         Tuple of (avg_total_loss, metrics_dict).
@@ -1498,15 +1678,41 @@ def validate_multihead(
     accumulated_pred_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
     accumulated_true_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
 
+    # For the exon-based gene-expression metric: per-window (gene_ids, pred, obs).
+    gene_expr_enabled = (
+        gene_annotation is not None
+        and compute_pearson
+        and gene_expr_modality in heads
+    )
+    # Encoder-only heads emit 128bp only, so the 1bp default would match no
+    # output and the metric would silently report NaN every epoch.
+    if gene_expr_resolution is None:
+        gene_expr_resolution = 128 if encoder_only else 1
+    if gene_expr_enabled:
+        # The metric only reads the head output at `gene_expr_resolution`. If the
+        # modality never emits it, no window ever accumulates and every epoch
+        # reports n_genes=0 with NaN correlations and no error. Fail instead.
+        available = sorted(resolution_weights.get(gene_expr_modality, {}))
+        if gene_expr_resolution not in available:
+            raise ValueError(
+                f"gene-expression metric requested at {gene_expr_resolution}bp, but "
+                f"'{gene_expr_modality}' emits {available or 'no resolutions'}"
+                + (" (encoder_only forces 128bp)" if encoder_only else "")
+                + ". Pass gene_expr_resolution matching an emitted resolution."
+            )
+    gene_expr_windows: list[tuple[list[str], Tensor, Tensor]] = []
+
     if is_main_process(rank):
         pbar = tqdm(val_loader, desc="Validation")
     else:
         pbar = val_loader
 
     with torch.no_grad():
-        for sequences, modality_targets in pbar:
+        for batch_data in pbar:
+            sequences, modality_targets, extras = _unpack_batch(batch_data)
+            coords = extras.get("coords")
             sequences = sequences.to(device)
-            organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+            organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
             # Collect all resolutions
             all_resolutions = set()
@@ -1589,6 +1795,23 @@ def validate_multihead(
                         accumulated_pred_counts[modality][res].append(pred_unscaled.sum(dim=1).float().cpu())
                         accumulated_true_counts[modality][res].append(targets.sum(dim=1).float().cpu())
 
+                        # Exon-based gene-expression metric.
+                        if (
+                            gene_expr_enabled
+                            and modality == gene_expr_modality
+                            and res == gene_expr_resolution
+                            and coords is not None
+                        ):
+                            _accumulate_gene_expr_windows(
+                                gene_expr_windows,
+                                pred_unscaled=pred_unscaled,
+                                targets=targets,
+                                coords=coords,
+                                annotation=gene_annotation,
+                                track_strands=gene_expr_track_strands,
+                                window_cache=gene_expr_window_cache,
+                            )
+
                 weighted_modality_loss = modality_loss * modality_weight
                 loss = loss + weighted_modality_loss
                 modality_loss_accum[modality] += modality_loss.item()
@@ -1639,6 +1862,13 @@ def validate_multihead(
                     else:
                         metrics[f"{modality}_{res}bp_count_pearson_r"] = float("nan")
 
+    # Exon-based gene-expression metric: gather per-window
+    # (gene_ids, pred, obs) across ranks, dedup genes, and emit three Pearsons.
+    if gene_expr_enabled:
+        metrics.update(_gene_expr_metrics(
+            gene_expr_windows, modality=gene_expr_modality, world_size=world_size,
+        ))
+
     return avg_loss, metrics
 
 
@@ -1668,6 +1898,11 @@ def train_epoch_sequence_parallel(
     profile_batches: int = 0,
     log_fn: Any | None = None,
     encoder_only: bool = False,
+    *,
+    gene_loss_weights: dict[str, float] | None = None,
+    gene_cross_track_weight: float = 5.0,
+    strand_channel_masks: dict[str, Tensor] | None = None,
+    organism: int = 0,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with sequence parallelism.
 
@@ -1741,9 +1976,16 @@ def train_epoch_sequence_parallel(
     else:
         pbar = train_loader
 
-    for batch_idx, (sequences, modality_targets) in enumerate(pbar):
+    gene_loss_weights = gene_loss_weights or {}
+
+    for batch_idx, batch_data in enumerate(pbar):
+        # collate_multimodal yields an optional extras dict (gene_mask/coords).
+        sequences, modality_targets, extras = _unpack_batch(batch_data)
+        gene_mask = extras.get("gene_mask")
+        if gene_mask is not None:
+            gene_mask = gene_mask.to(device)
         sequences = sequences.to(device)
-        organism_idx = torch.zeros(sequences.shape[0], dtype=torch.long, device=device)
+        organism_idx = torch.full((sequences.shape[0],), organism, dtype=torch.long, device=device)
 
         # Align sequence length to world_size * 128 for sequence parallelism.
         # This ensures each rank's base shard size is divisible by 128, so the
@@ -1862,6 +2104,38 @@ def train_epoch_sequence_parallel(
                 )
 
                 res_loss = loss_dict["loss"] * weight
+
+                # Optional gene LFC term (Decima-style cross-track loss) for
+                # the rna_seq head at 1bp resolution. Slice gene_mask along
+                # S to match this rank's local shard, exactly as we sliced
+                # targets above.
+                gene_w = gene_loss_weights.get(modality, 0.0)
+                if (
+                    res == 1
+                    and gene_w > 0
+                    and gene_mask is not None
+                    and strand_channel_masks is not None
+                    and modality in strand_channel_masks
+                ):
+                    g_full_len = gene_mask.shape[1]
+                    g_local_len = g_full_len // world_size
+                    g_start = rank * g_local_len
+                    local_gene_mask = gene_mask[
+                        :, g_start:g_start + g_local_len, :, :
+                    ]
+                    gene_loss, gene_aux = losses.gene_lfc_loss(
+                        predictions=pred,
+                        targets=targets,
+                        targets_mask=mask,
+                        gene_mask=local_gene_mask,
+                        strand_channel_mask=strand_channel_masks[modality],
+                        gene_cross_track_weight=gene_cross_track_weight,
+                    )
+                    res_loss = res_loss + weight * gene_w * gene_loss
+                    loss_components[f"{modality}_gene_lfc"] = gene_loss.item()
+                    loss_components[f"{modality}_gene_total_count"] = gene_aux["gene_loss_total_count"].item()
+                    loss_components[f"{modality}_gene_positional"] = gene_aux["gene_loss_positional"].item()
+
                 modality_loss = modality_loss + res_loss
                 loss_components[f"{modality}_loss_{res}bp"] = res_loss.item()
 
