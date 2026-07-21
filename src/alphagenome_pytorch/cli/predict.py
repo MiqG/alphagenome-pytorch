@@ -66,14 +66,51 @@ def register(subparsers: argparse._SubParsersAction) -> None:
                    help="Batch size for inference")
     p.add_argument("--window-size", type=int, default=131072,
                    help="Model input window size (default: 131072)")
-    p.add_argument("--organism", type=int, default=0, choices=[0, 1],
-                   help="Organism: 0=human, 1=mouse")
+    p.add_argument("--organism", type=int, default=None, choices=[0, 1],
+                   help="Organism: 0=human, 1=mouse. Default: 0 for a pretrained model; "
+                        "for a fine-tuned checkpoint, the organism it was trained on "
+                        "(from checkpoint metadata). Pass explicitly to override.")
     p.add_argument("--device", type=str, default="cuda", help="PyTorch device")
     p.add_argument("--dtype-policy", type=str, default="full_float32",
                    choices=["full_float32", "mixed_precision"],
                    help="Dtype policy")
     p.add_argument("--compile", action="store_true",
                    help="Use torch.compile for faster inference")
+
+    # Gene-count / AnnData output (aggregate signal into a per-gene x per-track table)
+    gene_out = p.add_argument_group("Gene-count AnnData output (--chromosomes mode)")
+    gene_out.add_argument("--anndata", type=str, default=None,
+                          help="Write a per-gene x per-track AnnData with this filename in "
+                               "--output, by summing whole-chromosome signal over each gene's "
+                               "exons (or body), instead of BigWig. Requires --annotation.")
+    gene_out.add_argument("--annotation", type=str, default=None,
+                          help="GTF/parquet gene annotation for --anndata. Needs exon rows "
+                               "when --aggregate-over exons (the default).")
+    gene_out.add_argument("--aggregate-over", choices=["exons", "gene-body"], default="exons",
+                          help="Aggregate signal over each gene's exons (default) or its "
+                               "full gene body.")
+    gene_out.add_argument("--aggregate-func", choices=["sum", "mean", "log-mean"], default="sum",
+                          help="AnnData X value: raw sum / counts (default), mean coverage per "
+                               "base, or log1p of it (log-mean exon expression). The per-base "
+                               "means account for 128bp predictions being bin sums, so they are "
+                               "comparable across --resolution; at 128bp they stay approximate, "
+                               "since a bin an exon only partly covers is summed whole.")
+    gene_out.add_argument("--gene-strand", choices=["all", "match"], default="all",
+                          help="Strand handling for the gene x track matrix. 'all' (default) "
+                               "fills every cell, so each gene is also scored by tracks reading "
+                               "the opposite strand -- that signal is antisense, not the gene's "
+                               "own expression. 'match' sets those cells to NaN, leaving each "
+                               "gene scored only by tracks on its strand; unstranded ('.') "
+                               "tracks match everything. NaN rather than 0 so the cells drop out "
+                               "of downstream means and correlations instead of averaging in as "
+                               "zeros. Track strands are taken from metadata (built-in for "
+                               "pretrained heads, the checkpoint for finetuned ones); override "
+                               "with --track-strands when metadata is unavailable.")
+    gene_out.add_argument("--track-strands", type=str, default=None,
+                          help="Override per-track strands for --gene-strand match: strand "
+                               "chars ('+','-','.'), one per output track, compact ('+-+-') or "
+                               "separated ('+,-,+,-'). Normally inferred from metadata; needed "
+                               "only for custom/legacy heads without embedded strand info.")
 
     # Finetuned model options
     ft = p.add_argument_group("Finetuned model (optional)")
@@ -93,6 +130,78 @@ def _parse_csv_ints(s: str | None) -> list[int] | None:
 
 def _parse_csv_strs(s: str | None) -> list[str] | None:
     return [t.strip() for t in s.split(",")] if s else None
+
+
+def _parse_track_strands(s: str | None) -> list[str] | None:
+    """Parse --track-strands into one char per track.
+
+    Accepts compact ('+-+-') or separated ('+,-,+,-' / '+ - + -') form.
+    """
+    if not s:
+        return None
+    strands = [c for c in s if c not in ", \t"]
+    invalid = sorted({c for c in strands if c not in "+-."})
+    if invalid:
+        raise ValueError(
+            f"--track-strands has invalid characters {invalid}; use only + - ."
+        )
+    return strands
+
+
+def _strands_from_builtin(head: str, organism: int) -> list[str] | None:
+    """Per-track strands for a native head from the bundled metadata catalog.
+
+    Returns a full-head list in track order, or None if the head is absent from
+    the built-in catalog or any track lacks a strand.
+    """
+    from alphagenome_pytorch.named_outputs import TrackMetadataCatalog
+    try:
+        catalog = TrackMetadataCatalog.load_builtin(organism)
+        tracks = catalog.get_tracks(head, organism=organism, strict=True)
+    except (KeyError, FileNotFoundError):
+        return None
+    strands = [t.get("strand") for t in tracks]
+    if not strands or any(s is None for s in strands):
+        return None
+    return [str(s) for s in strands]
+
+
+def _strands_from_checkpoint(track_metadata, head: str) -> list[str] | None:
+    """Per-track strands for *head* from a checkpoint's embedded track_metadata.
+
+    Embedded rows come from ``TrackMetadataCatalog.to_rows()``, which keys the
+    head as ``output_name``; ``output_type`` is accepted as a fallback for rows
+    written in the parquet's column naming.
+    """
+    if not track_metadata:
+        return None
+
+    def _head_of(row) -> str:
+        return str(row.get("output_name") or row.get("output_type") or "")
+
+    rows = [r for r in track_metadata if _head_of(r).lower() == head.lower()]
+    if not rows or any(r.get("strand") is None for r in rows):
+        return None
+    rows = sorted(rows, key=lambda r: r.get("track_index", 0))
+    return [str(r["strand"]) for r in rows]
+
+
+def _resolve_track_strands(head, organism, track_indices, *,
+                           checkpoint_meta=None, from_checkpoint=False):
+    """Infer per-output-track strands from metadata, narrowed by --tracks.
+
+    Full-head strands come from the checkpoint (finetuned) or the built-in
+    catalog (pretrained), then are subset to the selected tracks so they line up
+    with the aggregated prediction columns. Returns None when no strand metadata
+    is available (caller then requires an explicit --track-strands).
+    """
+    full = (_strands_from_checkpoint(checkpoint_meta, head) if from_checkpoint
+            else _strands_from_builtin(head, organism))
+    if full is None:
+        return None
+    if track_indices is not None:
+        full = [full[i] for i in track_indices]
+    return full
 
 
 def _load_model(args, dtype_policy, json_mode):
@@ -128,14 +237,36 @@ def _load_model(args, dtype_policy, json_mode):
             track_names_from_ckpt = (
                 ckpt_names.get(args.head) if isinstance(ckpt_names, dict) else ckpt_names
             )
-        return model, track_names_from_ckpt
+        return model, track_names_from_ckpt, meta.get("track_metadata")
 
     if not json_mode:
         print(f"Loading model from {args.model}...")
     model = AlphaGenome.from_pretrained(
         args.model, device=args.device, dtype_policy=dtype_policy,
     )
-    return model, None
+    return model, None, None
+
+
+def _effective_organism(model, requested: int | None) -> tuple[int, str]:
+    """Resolve the organism index to forward at, plus its source, for logging.
+
+    For a fine-tuned checkpoint the model carries a ``finetuned_organism_context``:
+    an explicit ``--organism`` wins, else the checkpoint's default. For a pretrained
+    model there is no context, so an explicit value wins, else human (0).
+    """
+    context = getattr(model, "finetuned_organism_context", None)
+    if context is not None:
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            select_organism_index,
+        )
+        index = select_organism_index(
+            context, explicit=requested, num_organisms=model.num_organisms,
+        )
+        source = "explicit" if requested is not None else context.source
+        return index, source
+    return (requested if requested is not None else 0), (
+        "explicit" if requested is not None else "default"
+    )
 
 
 def _describe_handling(info, json_mode: bool, quiet: bool) -> None:
@@ -172,6 +303,7 @@ def run(args: argparse.Namespace) -> int:
         TilingConfig,
         parse_bed,
         parse_locus,
+        predict_full_chromosomes_to_anndata,
         predict_full_chromosomes_to_bigwig,
         predict_region_auto,
         predict_sequence_auto,
@@ -184,6 +316,10 @@ def run(args: argparse.Namespace) -> int:
     # Validate paths
     if not Path(args.model).exists():
         raise FileNotFoundError(f"Model file not found: {args.model}")
+    if args.checkpoint and not Path(args.checkpoint).exists():
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    if args.transfer_config and not Path(args.transfer_config).exists():
+        raise FileNotFoundError(f"Transfer config not found: {args.transfer_config}")
 
     # Determine the effective input mode.
     mode_flags = {
@@ -218,8 +354,51 @@ def run(args: argparse.Namespace) -> int:
         if not Path(args.fasta).exists():
             raise FileNotFoundError(f"FASTA file not found: {args.fasta}")
 
+    # Gene-count AnnData output. Validated before the model load so a missing
+    # annotation or extra fails in seconds rather than after loading weights.
+    if args.anndata:
+        if effective_mode != "chromosomes":
+            raise ValueError(
+                f"--anndata cannot be combined with --{effective_mode}; it aggregates "
+                "whole-chromosome predictions, so use it with --chromosomes."
+            )
+        if not args.annotation:
+            raise ValueError("--anndata requires --annotation (a GTF/parquet with exon rows)")
+        if not Path(args.annotation).exists():
+            raise FileNotFoundError(f"Annotation not found: {args.annotation}")
+        import importlib.util
+        engine = (
+            "pyranges"
+            if Path(args.annotation).suffix.lower() in (".gtf", ".gff", ".gff3")
+            else "pyarrow"
+        )
+        missing = [m for m in ("pandas", "anndata", engine)
+                   if importlib.util.find_spec(m) is None]
+        if missing:
+            raise ImportError(
+                f"--anndata needs {', '.join(missing)} (not installed). Install with: "
+                "pip install 'alphagenome-pytorch[inference-anndata]'"
+            )
+
     track_indices = _parse_csv_ints(args.tracks)
     track_names = _parse_csv_strs(args.track_names)
+    track_strands = _parse_track_strands(args.track_strands)
+
+    # --gene-strand match needs a strand per track. An explicit --track-strands
+    # wins; otherwise infer from metadata. For a pretrained model that's the
+    # built-in catalog, resolvable now so we can fail fast before loading
+    # weights; a finetuned checkpoint's strands are resolved after it loads.
+    strands_needed = bool(args.anndata) and args.gene_strand == "match"
+    if strands_needed and track_strands is None and not args.checkpoint:
+        # Pre-load (pretrained/native) strand lookup: no model yet, so an omitted
+        # --organism means human here.
+        native_default = args.organism if args.organism is not None else 0
+        track_strands = _resolve_track_strands(args.head, native_default, track_indices)
+        if track_strands is None:
+            raise ValueError(
+                f"--gene-strand match needs per-track strands for head '{args.head}', "
+                "but the built-in metadata has none; pass --track-strands."
+            )
 
     dtype_policy = (
         DtypePolicy.mixed_precision()
@@ -227,9 +406,37 @@ def run(args: argparse.Namespace) -> int:
         else DtypePolicy.full_float32()
     )
 
-    model, track_names_from_ckpt = _load_model(args, dtype_policy, json_mode)
+    model, track_names_from_ckpt, track_metadata_from_ckpt = _load_model(
+        args, dtype_policy, json_mode
+    )
     if track_names is None and track_names_from_ckpt is not None:
         track_names = track_names_from_ckpt
+        # Checkpoint names cover the full head; subset to the selected tracks.
+        # (An explicit --track-names already describes only the selected tracks.)
+        # Without this, writers zip the full name list against the narrowed
+        # prediction array and index past its end.
+        if track_indices is not None:
+            track_names = [track_names[i] for i in track_indices]
+
+    # Resolve the organism to forward at now that the model (and its fine-tune
+    # organism context, if any) is loaded. Used for all forwards and metadata below.
+    organism_index, organism_source = _effective_organism(model, args.organism)
+    if not json_mode and not getattr(args, "quiet", False):
+        _org_name = "mouse" if organism_index == 1 else "human"
+        print(f"  Organism: {_org_name} ({organism_index}), source: {organism_source}")
+
+    # Finetuned checkpoint strands are only known now that meta is loaded.
+    if strands_needed and track_strands is None and args.checkpoint:
+        track_strands = _resolve_track_strands(
+            args.head, organism_index, track_indices,
+            checkpoint_meta=track_metadata_from_ckpt, from_checkpoint=True,
+        )
+        if track_strands is None:
+            raise ValueError(
+                f"--gene-strand match needs per-track strands for head '{args.head}', "
+                "but the checkpoint embeds no strand metadata; pass --track-strands "
+                "(or retrain so the checkpoint records strands)."
+            )
     model.eval()
 
     inner_model = getattr(model, "_orig_mod", model)
@@ -255,6 +462,45 @@ def run(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------ dispatch
     if effective_mode == "chromosomes":
         chromosomes = _parse_csv_strs(args.chromosomes)
+
+        if args.anndata:
+            out_path = output_dir / args.anndata
+            predict_full_chromosomes_to_anndata(
+                model=model,
+                fasta_path=args.fasta,
+                annotation_path=args.annotation,
+                head=args.head,
+                output_path=str(out_path),
+                chromosomes=chromosomes,
+                config=config,
+                track_indices=track_indices,
+                track_names=track_names,
+                track_strands=track_strands,
+                over="exons" if args.aggregate_over == "exons" else "gene_body",
+                reduce="sum" if args.aggregate_func == "sum" else "mean",
+                log=args.aggregate_func == "log-mean",
+                strand=None if args.gene_strand == "all" else args.gene_strand,
+                organism_index=organism_index,
+                device=args.device,
+                show_progress=show_progress,
+            )
+            if json_mode:
+                emit_json({
+                    "output_files": [{
+                        "path": str(out_path),
+                        "head": args.head,
+                        "format": "anndata",
+                        "aggregate_over": args.aggregate_over,
+                        "aggregate_func": args.aggregate_func,
+                        "resolution_bp": args.resolution,
+                        "handling": "tiled",
+                    }],
+                    "warnings": [],
+                })
+            else:
+                print(f"\nDone! Wrote gene-count AnnData to {out_path}")
+            return 0
+
         results = predict_full_chromosomes_to_bigwig(
             model=model,
             fasta_path=args.fasta,
@@ -264,7 +510,7 @@ def run(args: argparse.Namespace) -> int:
             config=config,
             track_indices=track_indices,
             track_names=track_names,
-            organism_index=args.organism,
+            organism_index=organism_index,
             device=args.device,
             show_progress=show_progress,
         )
@@ -297,7 +543,7 @@ def run(args: argparse.Namespace) -> int:
             head=args.head, config=config,
             tile=args.tile,
             track_indices=track_indices,
-            organism_index=args.organism,
+            organism_index=organism_index,
             device=args.device,
         )
         _describe_handling(info, json_mode, args.quiet)
@@ -353,7 +599,7 @@ def run(args: argparse.Namespace) -> int:
                 tile=args.tile,
                 name=r.name,
                 track_indices=track_indices,
-                organism_index=args.organism,
+                organism_index=organism_index,
                 device=args.device,
             )
             _describe_handling(info, json_mode, args.quiet)
@@ -414,7 +660,7 @@ def run(args: argparse.Namespace) -> int:
                 head=args.head, config=config,
                 tile=args.tile,
                 track_indices=track_indices,
-                organism_index=args.organism,
+                organism_index=organism_index,
                 device=args.device,
             )
             _describe_handling(info, json_mode, args.quiet)

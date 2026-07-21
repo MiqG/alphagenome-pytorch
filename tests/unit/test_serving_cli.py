@@ -69,7 +69,7 @@ def _stub_model():
 
 def test_checkpoint_path_creates_scoring_adapter():
     """``--checkpoint`` builds a ``LocalDnaModelAdapter`` with scoring enabled."""
-    fake_meta = {'track_names': {'dnase': ['t0', 't1']}}
+    fake_meta = {'track_names': {'dnase': ['t0', 't1']}, 'default_organism_index': 0}
 
     with (
         patch(
@@ -100,6 +100,7 @@ def test_checkpoint_uses_embedded_track_metadata():
     fake_meta = {
         'track_names': {'dnase': ['t0', 't1']},
         'track_metadata': embedded_rows,
+        'default_organism_index': 0,
     }
 
     with (
@@ -137,6 +138,7 @@ def test_checkpoint_cli_track_metadata_overrides_embedded(tmp_path, caplog):
         'track_metadata': [
             {"output_name": "dnase", "track_name": "from_embedded", "biosample_name": "K562"},
         ],
+        'default_organism_index': 0,
     }
 
     with (
@@ -166,7 +168,8 @@ def test_checkpoint_cli_track_metadata_overrides_embedded(tmp_path, caplog):
 
 def test_checkpoint_without_metadata_yields_no_catalog():
     """Bare checkpoints (no embedded metadata, no --track-metadata) leave the catalog unset."""
-    fake_meta = {'track_names': {'dnase': ['t0']}, 'track_metadata': None}
+    fake_meta = {'track_names': {'dnase': ['t0']}, 'track_metadata': None,
+                 'default_organism_index': 0}
 
     with (
         patch(
@@ -181,6 +184,19 @@ def test_checkpoint_without_metadata_yields_no_catalog():
         adapter = _build_adapter(_checkpoint_args())
 
     assert adapter.runtime.metadata_catalog is None
+
+
+def test_default_organism_uses_resolved_default_index():
+    """Serving consumes the loader-resolved ``default_organism_index`` (no re-resolution)."""
+    import pytest
+
+    from alphagenome_pytorch.extensions.serving.cli import _finetuned_default_organism
+
+    assert _finetuned_default_organism({'default_organism_index': 1}) == 1
+    assert _finetuned_default_organism({'default_organism_index': 0}) == 0
+    # A mixed checkpoint has no single default -> fail clearly at construction.
+    with pytest.raises(ValueError):
+        _finetuned_default_organism({'default_organism_index': None})
 
 
 def test_weights_path_creates_scoring_adapter():
