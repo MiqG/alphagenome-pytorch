@@ -325,6 +325,33 @@ class TestAcquireLocking:
         _default_adapter_factory(r, human_default_absent)
         assert "default_organism" not in captured
 
+    def test_default_factory_shares_entry_runtime_with_scorer(self) -> None:
+        """When an entry carries a pre-built runtime, the service adapter and its
+        scorer must share it — so predict and score resolve organism/metadata
+        identically (a mouse entry defaults to mouse on both paths)."""
+        from types import SimpleNamespace
+
+        from tests.unit.serving_fakes import FakeRuntime
+
+        m = _TinyModel()
+        rt = FakeRuntime()
+        rt.default_organism_index = 1  # mouse
+        catalog = object()
+        rt.metadata_catalog = catalog
+        scorer = SimpleNamespace(runtime=rt)  # scorer bound to the same runtime
+
+        entry = _make_entry(m, id="mouse")
+        entry.runtime = rt
+        entry.scorer = scorer
+        entry.metadata_catalog = catalog
+
+        r = ServedModelRouter(base_model=m, runtime=_stub_runtime(), entries=[entry])
+        adapter = r.select("mouse")  # exercises the default factory
+
+        assert adapter.runtime is adapter.scorer.runtime
+        assert adapter.runtime.metadata_catalog is entry.metadata_catalog
+        assert adapter.runtime.resolve_organism_index(None) == 1
+
 
 # ---------------------------------------------------------------------------
 # Catalog file parsing

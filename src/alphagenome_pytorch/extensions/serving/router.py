@@ -121,6 +121,9 @@ class ServedModelEntry:
     track_names: Any | None = None
     scorer: Any | None = None
     default_organism: int | None = None
+    # Pre-built runtime shared by this entry's service adapter and its scorer so
+    # organism/metadata resolution is identical across predict and score paths.
+    runtime: Any | None = None
     manifest: Manifest | None = None
 
     def is_base(self) -> bool:
@@ -156,6 +159,7 @@ def build_adapter_entry(
     track_names: Any | None = None,
     scorer: Any | None = None,
     default_organism: int | None = None,
+    runtime: Any | None = None,
 ) -> ServedModelEntry:
     """Build a :class:`ServedModelEntry` for an adapter bundle.
 
@@ -250,6 +254,7 @@ def build_adapter_entry(
         track_names=track_names,
         scorer=scorer,
         default_organism=default_organism,
+        runtime=runtime,
         manifest=manifest,
     )
 
@@ -263,6 +268,7 @@ def build_base_entry(
     track_names: Any | None = None,
     scorer: Any | None = None,
     default_organism: int | None = None,
+    runtime: Any | None = None,
 ) -> ServedModelEntry:
     """Build a :class:`ServedModelEntry` for the bare base model."""
     from alphagenome_pytorch.extensions.finetuning.checkpointing import (
@@ -279,6 +285,7 @@ def build_base_entry(
         track_names=track_names,
         scorer=scorer,
         default_organism=default_organism,
+        runtime=runtime,
         manifest=None,
     )
 
@@ -291,7 +298,16 @@ def build_base_entry(
 def _default_adapter_factory(
     router: "ServedModelRouter", entry: ServedModelEntry
 ) -> LocalDnaModelAdapter:
-    """Default adapter factory: a fresh runtime bound to the live base model."""
+    """Default adapter factory.
+
+    Prefers the entry's pre-built ``runtime`` (shared with ``entry.scorer`` so
+    the predict and score paths resolve organism/metadata identically). Falls
+    back to constructing a fresh runtime from the router's base runtime for
+    hand-built entries that carry no runtime (e.g. tests).
+    """
+    if entry.runtime is not None:
+        return LocalDnaModelAdapter(entry.runtime, scorer=entry.scorer)
+
     from alphagenome_pytorch.prediction import AlphaGenomePredictionRuntime
 
     runtime_kwargs: dict[str, Any] = dict(

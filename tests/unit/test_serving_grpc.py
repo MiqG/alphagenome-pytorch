@@ -106,3 +106,23 @@ def test_metadata_rpc(grpc_server):
     assert len(responses) == 1
     by_type = {m.output_type for m in responses[0].output_metadata}
     assert dna_output.OutputType.DNASE.to_proto() in by_type
+
+
+def test_organism_or_none_maps_unspecified_to_none():
+    """gRPC omitting organism sends ORGANISM_UNSPECIFIED (0); it must become None
+    so the runtime's embedded default (e.g. a mouse bundle) is consulted."""
+    from alphagenome.protos import dna_model_pb2
+
+    from alphagenome_pytorch.extensions.serving.grpc_service import (
+        _organism_or_none,
+    )
+
+    assert _organism_or_none(dna_model_pb2.ORGANISM_UNSPECIFIED) is None
+    assert (
+        _organism_or_none(dna_model_pb2.ORGANISM_MUS_MUSCULUS)
+        == dna_model_pb2.ORGANISM_MUS_MUSCULUS
+    )
+    assert (
+        _organism_or_none(dna_model_pb2.ORGANISM_HOMO_SAPIENS)
+        == dna_model_pb2.ORGANISM_HOMO_SAPIENS
+    )

@@ -233,6 +233,18 @@ def _iter_output_payloads(
 _MODEL_ID_METADATA_KEY = "alphagenome-model-id"
 
 
+def _organism_or_none(organism: Any) -> Any:
+    """Map the proto ``ORGANISM_UNSPECIFIED`` sentinel to ``None``.
+
+    A gRPC request that omits organism carries ``ORGANISM_UNSPECIFIED`` (0);
+    forwarding it as-is would resolve to human. Returning ``None`` lets the
+    runtime consult its embedded default (e.g. a mouse bundle's organism).
+    """
+    if organism == dna_model_pb2.ORGANISM_UNSPECIFIED:
+        return None
+    return organism
+
+
 class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
     """gRPC implementation of notebook-critical DNA model methods.
 
@@ -306,7 +318,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
             with self._acquire(context) as adapter:
                 output = adapter.predict_sequence(
                     sequence=request.sequence,
-                    organism=request.organism,
+                    organism=_organism_or_none(request.organism),
                     requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
                     ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
                 )
@@ -327,7 +339,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
             with self._acquire(context) as adapter:
                 output = adapter.predict_interval(
                     interval=interval,
-                    organism=request.organism,
+                    organism=_organism_or_none(request.organism),
                     requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
                     ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
                 )
@@ -350,7 +362,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
                 output = adapter.predict_variant(
                     interval=interval,
                     variant=variant,
-                    organism=request.organism,
+                    organism=_organism_or_none(request.organism),
                     requested_outputs=[_normalize_output_type(v) for v in request.requested_outputs],
                     ontology_terms=_normalize_ontology_terms_from_proto(request.ontology_terms),
                 )
@@ -385,7 +397,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
                     interval=interval,
                     variant=variant,
                     variant_scorers=list(request.variant_scorers),
-                    organism=request.organism,
+                    organism=_organism_or_none(request.organism),
                 )
             for score in scores:
                 score_output, chunks = _anndata_to_score_variant_output(
@@ -414,7 +426,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
                     interval=interval,
                     ism_interval=ism_interval,
                     variant_scorers=list(request.variant_scorers),
-                    organism=request.organism,
+                    organism=_organism_or_none(request.organism),
                     interval_variant=interval_variant,
                 )
             for score in itertools.chain.from_iterable(scores_nested):
@@ -432,7 +444,7 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
     def GetMetadata(self, request, context):
         try:
             with self._acquire(context) as adapter:
-                metadata = adapter.output_metadata(request.organism)
+                metadata = adapter.output_metadata(_organism_or_none(request.organism))
             output_metadata = []
             for output_type in dna_output.OutputType:
                 data = metadata.get(output_type)

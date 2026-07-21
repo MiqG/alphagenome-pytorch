@@ -504,7 +504,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 if route == '/predict_sequence':
                     output = adapter.predict_sequence(
                         sequence=body['sequence'],
-                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        organism=body.get('organism'),
                         requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
                         ontology_terms=body.get('ontology_terms'),
                     )
@@ -514,7 +514,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                 if route == '/predict_interval':
                     output = adapter.predict_interval(
                         interval=_interval_from_payload(body['interval']),
-                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        organism=body.get('organism'),
                         requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
                         ontology_terms=body.get('ontology_terms'),
                     )
@@ -525,7 +525,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                     output = adapter.predict_variant(
                         interval=_interval_from_payload(body['interval']),
                         variant=_variant_from_payload(body['variant']),
-                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        organism=body.get('organism'),
                         requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
                         ontology_terms=body.get('ontology_terms'),
                     )
@@ -537,7 +537,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                         interval=_interval_from_payload(body['interval']),
                         variant=_variant_from_payload(body['variant']),
                         variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
-                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        organism=body.get('organism'),
                     )
                     self._write_json({'scores': [_serialize_anndata(s) for s in scores]})
                     return
@@ -554,7 +554,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                         intervals=intervals,
                         variants=variants,
                         variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
-                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        organism=body.get('organism'),
                         progress_bar=False,
                         max_workers=int(body.get('max_workers', 5)),
                     )
@@ -569,7 +569,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                         interval=_interval_from_payload(body['interval']),
                         ism_interval=_interval_from_payload(body['ism_interval']),
                         variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
-                        organism=body.get('organism', 'HOMO_SAPIENS'),
+                        organism=body.get('organism'),
                         interval_variant=_variant_from_payload(interval_variant_payload)
                         if interval_variant_payload
                         else None,
@@ -586,7 +586,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
                         result = adapter.explain_interval(
                             interval=_interval_from_payload(body['interval']),
                             target_interval=_interval_from_payload(body['target_interval']),
-                            organism=body.get('organism', 'HOMO_SAPIENS'),
+                            organism=body.get('organism'),
                             requested_output=body['requested_output'],
                             resolution=int(body.get('resolution', 128)),
                             track_indices=[int(i) for i in body['track_indices']],
