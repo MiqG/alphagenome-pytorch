@@ -289,15 +289,34 @@ Adapter bundle exported by `agt adapters export`.
 | Base model hash | `{base_model_hash}` |
 | alphagenome-pytorch version | `{ag_version}` |
 
-## Loading
+## Usage
+
+Install the CLI (`pip install 'alphagenome-pytorch[hf]'`), then fetch this
+bundle and run it against a base model.
+
+Download the bundle from this repo (prints its local path):
 
 ```bash
-agt serve --weights base.safetensors --checkpoint ./{adapter_filename}
+BUNDLE=$(agt adapters pull hf://<org>/<repo>)
 ```
 
-The bundle's `alphagenome_adapter.json` describes the adapter for display and
-provenance. The actual loading goes through `load_finetuned_model`, which
-reads the embedded `transfer_config` from the safetensors metadata.
+Run one-off predictions:
+
+```bash
+agt predict --model base.safetensors --checkpoint "$BUNDLE/{adapter_filename}" \\
+    --head {head} --locus chr1:1000000-1131072 --output ./predictions
+```
+
+Or serve it behind the AlphaGenome API:
+
+```bash
+agt serve --weights base.safetensors --checkpoint "$BUNDLE/{adapter_filename}"
+```
+
+The bundle's `alphagenome_adapter.json` is display/provenance only; loading reads
+the embedded `transfer_config` from the safetensors metadata via
+`load_finetuned_model`. Use a base model whose hash matches `Base model hash`
+above.
 """
 
 
@@ -316,6 +335,12 @@ def render_model_card(manifest: Manifest) -> str:
     if manifest.genome:
         tags.append(manifest.genome)
     tag_block = "".join(f"- {t}\n" for t in tags)
+    # A concrete --head for the predict example: prefer a real head name from the
+    # bundle, fall back to the modality, then a placeholder.
+    head = (
+        manifest.heads[0] if manifest.heads
+        else (manifest.modality or "<head>")
+    )
     return _MODEL_CARD_TEMPLATE.format(
         base_model_block=base_model_block,
         license=manifest.license or "unknown",
@@ -331,4 +356,5 @@ def render_model_card(manifest: Manifest) -> str:
         base_model_hash=manifest.base_model_hash,
         ag_version=manifest.alphagenome_pytorch_version or "—",
         adapter_filename=manifest.adapter_filename,
+        head=head,
     )

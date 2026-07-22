@@ -506,6 +506,32 @@ class TestModelCard:
         assert "sha256:abc" in card
         assert "atac" in card
 
+    def test_render_includes_pull_predict_serve_usage(self) -> None:
+        m = Manifest(
+            id="wtc11-atac-lora",
+            base_model_hash="sha256:abc",
+            modality="atac",
+            heads=["atac_wtc11"],
+            adapter_filename="adapter.safetensors",
+        )
+        card = render_model_card(m)
+        # All three CLI steps documented, wired to the pulled bundle path.
+        assert "agt adapters pull" in card
+        assert "agt predict" in card
+        assert "agt serve" in card
+        assert '"$BUNDLE/adapter.safetensors"' in card
+        # predict's --head uses a real head name from the bundle.
+        assert "--head atac_wtc11" in card
+
+    def test_predict_head_falls_back_to_modality_then_placeholder(self) -> None:
+        with_modality = Manifest(
+            id="x", base_model_hash="sha256:x", modality="dnase"
+        )
+        assert "--head dnase" in render_model_card(with_modality)
+
+        bare = Manifest(id="x", base_model_hash="sha256:x")
+        assert "--head <head>" in render_model_card(bare)
+
 
 # ---------------------------------------------------------------------------
 # Organism provenance survives export (regression: mouse must not fall back to
