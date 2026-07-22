@@ -55,7 +55,9 @@ def _register_export(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--genome", default=None)
     p.add_argument("--organism", default=None,
                    choices=["human", "mouse"])
-    p.add_argument("--modality", default=None)
+    p.add_argument("--modality", default=None,
+                   help="Override displayed modalities (single or comma-separated). "
+                        "Auto-derived from the checkpoint's heads when omitted.")
     p.add_argument("--biosample", default=None)
     p.add_argument("--heads", default=None,
                    help="Comma-separated head names trained in this adapter.")
@@ -185,6 +187,13 @@ def _run_export(args: argparse.Namespace) -> int:
     elif summary.get("new_head_names"):
         heads_list = list(summary["new_head_names"])
 
+    # Modalities are auto-derived from the checkpoint's head configs; an explicit
+    # --modality (single or comma-separated) overrides that for display.
+    if args.modality:
+        modalities = [m.strip() for m in args.modality.split(",") if m.strip()]
+    else:
+        modalities = list(summary.get("modalities") or [])
+
     manifest = Manifest(
         id=args.bundle_id,
         base_model_hash=base_hash,
@@ -194,9 +203,10 @@ def _run_export(args: argparse.Namespace) -> int:
         adapter_summary=summary.get("adapter_summary", {}),
         genome=args.genome,
         organism=args.organism,
-        modality=args.modality,
+        modalities=modalities,
         biosample=args.biosample,
         heads=heads_list,
+        num_tracks=summary.get("num_tracks"),
         metrics_path=METRICS_FILENAME if args.metrics else None,
         license=args.license_name,
         provenance=summary.get("provenance", {}),
@@ -404,10 +414,32 @@ def _summary_from_header(header: dict[str, Any]) -> dict[str, Any]:
             if value is None or value == [] or value == "":
                 continue
             adapter_summary[key] = value
+    # Derive per-bundle rollups from the head configs: the head names, the set
+    # of modalities they cover (order-preserving, deduplicated), and the total
+    # number of tracks/tasks across all heads. Each new_head carries its own
+    # ``modality`` and ``num_tracks``.
     new_heads = transfer_config.get("new_heads") or {}
+    new_head_names: list[str] = []
+    modalities: list[str] = []
+    total_tracks = 0
+    have_track_counts = False
+    if isinstance(new_heads, dict):
+        for name, head_config in new_heads.items():
+            new_head_names.append(name)
+            if not isinstance(head_config, dict):
+                continue
+            modality = head_config.get("modality")
+            if modality and modality not in modalities:
+                modalities.append(modality)
+            num_tracks = head_config.get("num_tracks")
+            if isinstance(num_tracks, int):
+                total_tracks += num_tracks
+                have_track_counts = True
     return {
         "adapter_summary": adapter_summary,
-        "new_head_names": list(new_heads.keys()) if isinstance(new_heads, dict) else [],
+        "new_head_names": new_head_names,
+        "modalities": modalities,
+        "num_tracks": total_tracks if have_track_counts else None,
     }
 
 
@@ -494,10 +526,11 @@ def _run_inspect(args: argparse.Namespace) -> int:
         f"  ag version:   {manifest.alphagenome_pytorch_version or '—'}",
         f"  genome:       {manifest.genome or '—'}",
         f"  organism:     {manifest.organism or '—'}",
-        f"  modality:     {manifest.modality or '—'}",
+        f"  modalities:   {', '.join(manifest.modalities) if manifest.modalities else '—'}",
         f"  biosample:    {manifest.biosample or '—'}",
         f"  license:      {manifest.license or '—'}",
         f"  heads:        {', '.join(manifest.heads) if manifest.heads else '—'}",
+        f"  tracks:       {manifest.num_tracks if manifest.num_tracks is not None else '—'}",
         f"  adapter:      {paths.adapter_safetensors.name}",
     ]
     if manifest.adapter_summary:

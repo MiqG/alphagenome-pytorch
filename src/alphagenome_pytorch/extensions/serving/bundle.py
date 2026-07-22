@@ -68,9 +68,10 @@ class Manifest:
     adapter_summary: dict[str, Any] = field(default_factory=dict)
     genome: str | None = None
     organism: str | None = None
-    modality: str | None = None
+    modalities: list[str] = field(default_factory=list)
     biosample: str | None = None
     heads: list[str] = field(default_factory=list)
+    num_tracks: int | None = None  # total tracks/tasks across all heads
     metrics_path: str | None = None
     license: str | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
@@ -283,7 +284,9 @@ Adapter bundle exported by `agt adapters export`.
 | Adapter | `{adapter_kind}` |
 | Genome | {genome} |
 | Organism | {organism} |
-| Modality | {modality} |
+| Modalities | {modalities_display} |
+| Heads | {n_heads} |
+| Tracks | {n_tracks} |
 | Biosample | {biosample} |
 | Base model | `{base_model_id}` |
 | Base model hash | `{base_model_hash}` |
@@ -300,7 +303,7 @@ Download the bundle from this repo (prints its local path):
 BUNDLE=$(agt adapters pull hf://<org>/<repo>)
 ```
 
-Run one-off predictions:
+{predict_intro}
 
 ```bash
 agt predict --model base.safetensors --checkpoint "$BUNDLE/{adapter_filename}" \\
@@ -327,20 +330,33 @@ def render_model_card(manifest: Manifest) -> str:
         if manifest.base_model_id
         else ""
     )
-    tags = []
-    if manifest.modality:
-        tags.append(manifest.modality)
+    tags = list(manifest.modalities)
     if manifest.organism:
         tags.append(manifest.organism)
     if manifest.genome:
         tags.append(manifest.genome)
     tag_block = "".join(f"- {t}\n" for t in tags)
+
+    n_heads = len(manifest.heads)
+    n_tracks = manifest.num_tracks if manifest.num_tracks is not None else "—"
+    modalities_display = ", ".join(manifest.modalities) if manifest.modalities else "—"
     # A concrete --head for the predict example: prefer a real head name from the
-    # bundle, fall back to the modality, then a placeholder.
+    # bundle, fall back to the first modality, then a placeholder.
     head = (
         manifest.heads[0] if manifest.heads
-        else (manifest.modality or "<head>")
+        else (manifest.modalities[0] if manifest.modalities else "<head>")
     )
+    # A multi-modality fine-tune registers one head per modality. `predict` runs a
+    # single head per call, so note the choice when there is more than one — the
+    # full head list stays in ``alphagenome_adapter.json`` rather than the card.
+    if n_heads > 1:
+        predict_intro = (
+            f"Run one-off predictions. This bundle exposes {n_heads} heads; "
+            f"`predict` runs one per call, selected with `--head` (see the "
+            f"`heads` list in `alphagenome_adapter.json`):"
+        )
+    else:
+        predict_intro = "Run one-off predictions:"
     return _MODEL_CARD_TEMPLATE.format(
         base_model_block=base_model_block,
         license=manifest.license or "unknown",
@@ -350,11 +366,14 @@ def render_model_card(manifest: Manifest) -> str:
         adapter_kind="+".join(adapter_summary_kinds(manifest.adapter_summary)) or "unknown",
         genome=manifest.genome or "—",
         organism=manifest.organism or "—",
-        modality=manifest.modality or "—",
+        modalities_display=modalities_display,
+        n_heads=n_heads,
+        n_tracks=n_tracks,
         biosample=manifest.biosample or "—",
         base_model_id=manifest.base_model_id or "—",
         base_model_hash=manifest.base_model_hash,
         ag_version=manifest.alphagenome_pytorch_version or "—",
         adapter_filename=manifest.adapter_filename,
         head=head,
+        predict_intro=predict_intro,
     )
