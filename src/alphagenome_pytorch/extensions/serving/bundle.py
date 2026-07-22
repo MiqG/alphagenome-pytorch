@@ -35,6 +35,22 @@ class BundleError(Exception):
     """Raised on malformed bundles or compatibility failures."""
 
 
+def adapter_summary_kinds(adapter_summary: dict[str, Any] | None) -> list[str]:
+    """Return the adapter kinds from a summary, preferring the ``kinds`` list.
+
+    Falls back to the legacy scalar ``kind`` for bundles exported before the
+    ``kinds`` list existed, so already-published bundles keep validating and
+    displaying. Returns an empty list when neither field is present.
+    """
+    if not adapter_summary:
+        return []
+    kinds = adapter_summary.get("kinds")
+    if isinstance(kinds, list):
+        return [k for k in kinds if k]
+    kind = adapter_summary.get("kind")
+    return [kind] if kind else []
+
+
 @dataclass
 class Manifest:
     """Human/machine-readable bundle metadata.
@@ -184,7 +200,7 @@ def validate_bundle(
     - Adapter safetensors file exists and embeds a ``transfer_config``.
     - If ``base_model`` is provided, ``compute_base_model_hash(base_model)``
       matches the manifest's ``base_model_hash``.
-    - The manifest's ``adapter_summary.kind`` (if set) matches the
+    - The manifest's ``adapter_summary`` kinds (if set) are present in the
       ``transfer_config`` mode.
 
     Returns a ``ValidationReport``; never raises for normal validation errors
@@ -211,14 +227,15 @@ def validate_bundle(
         )
         transfer_config = {}
 
-    declared_kind = manifest.adapter_summary.get("kind") if manifest.adapter_summary else None
-    if declared_kind and transfer_config:
+    declared_kinds = adapter_summary_kinds(manifest.adapter_summary)
+    if declared_kinds and transfer_config:
         actual_mode = transfer_config.get("mode")
         actual_modes = actual_mode if isinstance(actual_mode, list) else [actual_mode]
         actual_modes = [m for m in actual_modes if m]
-        if declared_kind not in actual_modes:
+        missing_kinds = [k for k in declared_kinds if k not in actual_modes]
+        if missing_kinds:
             warnings.append(
-                f"Manifest adapter_summary.kind={declared_kind!r} is not present "
+                f"Manifest adapter_summary kinds {missing_kinds} are not present "
                 f"in transfer_config.mode={actual_mode!r}"
             )
 
@@ -305,7 +322,7 @@ def render_model_card(manifest: Manifest) -> str:
         tag_block=tag_block,
         label=manifest.label or manifest.id,
         id=manifest.id,
-        adapter_kind=manifest.adapter_summary.get("kind", "unknown"),
+        adapter_kind="+".join(adapter_summary_kinds(manifest.adapter_summary)) or "unknown",
         genome=manifest.genome or "—",
         organism=manifest.organism or "—",
         modality=manifest.modality or "—",

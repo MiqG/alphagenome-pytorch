@@ -26,6 +26,7 @@ from alphagenome_pytorch.extensions.serving.bundle import (
     MANIFEST_FILENAME,
     Manifest,
     SCHEMA_VERSION,
+    adapter_summary_kinds,
     render_model_card,
     validate_bundle,
 )
@@ -229,14 +230,14 @@ class TestValidateBundle:
     def test_kind_mismatch_warns(self, tmp_path: Path) -> None:
         bundle = tmp_path / "b"
         _export_via_cli(tmp_path, bundle, base_model_hash="sha256:demo")
-        # Mutate manifest to declare a different kind
+        # Mutate manifest to declare a kind not present in the transfer_config
         manifest_path = bundle / MANIFEST_FILENAME
         m = json.loads(manifest_path.read_text())
-        m["adapter_summary"]["kind"] = "houlsby"
+        m["adapter_summary"]["kinds"] = ["houlsby"]
         manifest_path.write_text(json.dumps(m))
         report = validate_bundle(bundle)
         assert report.ok  # still ok; mismatch is a warning
-        assert any("kind=" in w for w in report.warnings)
+        assert any("houlsby" in w for w in report.warnings)
 
     def test_missing_adapter_file_errors(self, tmp_path: Path) -> None:
         bundle = tmp_path / "b"
@@ -289,7 +290,9 @@ class TestExportCli:
         assert manifest.label == "WTC11 ATAC LoRA"
         # base hash is taken from the source delta checkpoint
         assert manifest.base_model_hash == "sha256:from-ckpt"
-        assert manifest.adapter_summary.get("kind") == "lora"
+        assert manifest.adapter_summary.get("kinds") == ["lora"]
+        assert manifest.adapter_summary.get("lora_rank") == 4
+        assert "locon_rank" not in manifest.adapter_summary
         assert manifest.organism == "human"
         # provenance pulled from the source checkpoint metadata
         assert manifest.provenance.get("epoch") == 3
@@ -692,3 +695,77 @@ class TestCatalogAdapterDevicePlacement:
     def test_cuda_placement(self, tmp_path: Path) -> None:
         entry = self._build_entry(tmp_path, "cuda")
         self._assert_all_on(entry, "cuda")
+
+
+# ---------------------------------------------------------------------------
+# adapter_summary generation and kind resolution
+# ---------------------------------------------------------------------------
+
+
+def _summary(config: TransferConfig) -> dict:
+    from dataclasses import asdict
+
+    return adapters_cli._summary_from_header(
+        {"transfer_config": asdict(config)}
+    )["adapter_summary"]
+
+
+class TestSummaryFromHeader:
+    def test_pure_locon_reports_locon_not_lora(self) -> None:
+        # transfer_config is a full asdict, so lora_rank/lora_alpha are always
+        # present as defaults; the summary must not leak them for a Locon run.
+        summary = _summary(
+            TransferConfig(mode="locon", locon_rank=4, locon_alpha=1)
+        )
+        assert summary["kinds"] == ["locon"]
+        assert summary["locon_rank"] == 4
+        assert summary["locon_alpha"] == 1
+        assert "lora_rank" not in summary
+        assert "lora_alpha" not in summary
+
+    def test_pure_lora(self) -> None:
+        summary = _summary(TransferConfig(mode="lora", lora_rank=8, lora_alpha=16))
+        assert summary["kinds"] == ["lora"]
+        assert summary["lora_rank"] == 8
+        assert summary["lora_alpha"] == 16
+        assert "locon_rank" not in summary
+
+    def test_combined_lora_locon_reports_both(self) -> None:
+        summary = _summary(
+            TransferConfig(
+                mode=["lora", "locon"],
+                lora_rank=8,
+                lora_alpha=16,
+                locon_rank=4,
+                locon_alpha=1,
+            )
+        )
+        assert summary["kinds"] == ["lora", "locon"]
+        assert summary["lora_rank"] == 8
+        assert summary["lora_alpha"] == 16
+        assert summary["locon_rank"] == 4
+        assert summary["locon_alpha"] == 1
+        # No misleading scalar kind that would collapse to just "lora".
+        assert "kind" not in summary
+
+    def test_linear_mode_has_no_adapter_hyperparams(self) -> None:
+        summary = _summary(TransferConfig(mode="linear"))
+        assert summary["kinds"] == ["linear"]
+        assert "lora_rank" not in summary
+        assert "locon_rank" not in summary
+
+
+class TestAdapterSummaryKinds:
+    def test_prefers_kinds_list(self) -> None:
+        assert adapter_summary_kinds({"kinds": ["lora", "locon"]}) == ["lora", "locon"]
+
+    def test_falls_back_to_legacy_scalar_kind(self) -> None:
+        assert adapter_summary_kinds({"kind": "lora"}) == ["lora"]
+
+    def test_kinds_wins_over_legacy_kind(self) -> None:
+        assert adapter_summary_kinds({"kind": "lora", "kinds": ["locon"]}) == ["locon"]
+
+    def test_empty_or_missing(self) -> None:
+        assert adapter_summary_kinds(None) == []
+        assert adapter_summary_kinds({}) == []
+        assert adapter_summary_kinds({"kinds": []}) == []
