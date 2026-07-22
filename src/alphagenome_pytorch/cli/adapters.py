@@ -358,17 +358,18 @@ def _convert_delta_checkpoint_to_export(src: Path, dest: Path) -> dict[str, Any]
     return summary
 
 
-# Per-kind hyperparameters to surface in ``adapter_summary``. Only keys that
-# are actually present in the transfer_config are emitted — and crucially, only
-# for the kinds that are active. ``transfer_config`` is a full ``asdict`` of
-# ``TransferConfig`` and so always carries *every* field's default (e.g.
-# ``lora_rank``/``lora_alpha`` even for a pure-Locon run); filtering by kind is
-# what keeps a Locon bundle from advertising LoRA's hyperparameters.
+# Per-kind config fields to surface in ``adapter_summary`` — the hyperparameters
+# (rank/alpha/latent dim) and the placement (which modules each adapter targets).
+# Only keys present in the transfer_config with a non-empty value are emitted,
+# and crucially only for the kinds that are active. ``transfer_config`` is a full
+# ``asdict`` of ``TransferConfig`` and so always carries *every* field's default
+# (e.g. ``lora_rank``/``lora_alpha`` even for a pure-Locon run); filtering by kind
+# is what keeps a Locon bundle from advertising LoRA's hyperparameters.
 _KIND_SUMMARY_FIELDS: dict[str, tuple[str, ...]] = {
-    "lora": ("lora_rank", "lora_alpha"),
-    "locon": ("locon_rank", "locon_alpha"),
-    "houlsby": ("houlsby_latent_dim",),
-    # ia3 has no rank/alpha hyperparameters.
+    "lora": ("lora_rank", "lora_alpha", "lora_targets"),
+    "locon": ("locon_rank", "locon_alpha", "locon_targets"),
+    "ia3": ("ia3_targets", "ia3_ff_targets"),  # ia3 has no rank/alpha
+    "houlsby": ("houlsby_latent_dim", "houlsby_placement", "houlsby_targets"),
 }
 
 
@@ -377,10 +378,10 @@ def _summary_from_header(header: dict[str, Any]) -> dict[str, Any]:
 
     ``transfer_config.mode`` is a single string or a list (e.g.
     ``["lora", "locon"]`` for a combined adapter). We surface the full set as
-    ``adapter_summary.kinds`` and emit only the hyperparameters belonging to the
-    active kinds. ``kind`` (scalar) is intentionally not written — it could not
-    honestly represent a multi-adapter bundle; readers fall back to a legacy
-    ``kind`` via ``adapter_summary_kinds``.
+    ``adapter_summary.kinds`` and emit each active kind's hyperparameters and
+    placement (targets). ``kind`` (scalar) is intentionally not written — it
+    could not honestly represent a multi-adapter bundle; readers fall back to a
+    legacy ``kind`` via ``adapter_summary_kinds``.
     """
     transfer_config = header.get("transfer_config") or {}
     mode = transfer_config.get("mode")
@@ -395,8 +396,14 @@ def _summary_from_header(header: dict[str, Any]) -> dict[str, Any]:
         adapter_summary["kinds"] = kinds
     for kind in kinds:
         for key in _KIND_SUMMARY_FIELDS.get(kind, ()):
-            if key in transfer_config:
-                adapter_summary[key] = transfer_config[key]
+            if key not in transfer_config:
+                continue
+            value = transfer_config[key]
+            # Skip absent/empty placement lists (e.g. unused ia3_ff_targets) so
+            # the summary stays uncluttered; keep numeric hyperparameters as-is.
+            if value is None or value == [] or value == "":
+                continue
+            adapter_summary[key] = value
     new_heads = transfer_config.get("new_heads") or {}
     return {
         "adapter_summary": adapter_summary,
