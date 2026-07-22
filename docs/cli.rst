@@ -684,6 +684,68 @@ Flag                       Meaning
 ``--device STR``           Torch device (default: ``cpu``).
 ========================== ==========================================================
 
+Serving fine-tuned models and adapter bundles:
+
+.. code-block:: bash
+
+   # Serve a fine-tuned checkpoint, a local bundle directory, or a bundle URI
+   agt serve --weights model.pth --fasta hg38.fa \
+       --checkpoint runs/wtc11-atac/best.delta.pth
+
+   # Serve many fine-tunes over a shared base from a catalog file
+   agt serve --weights model.pth --fasta hg38.fa --rest-port 8080 \
+       --adapter-catalog adapters.yaml
+
+``--checkpoint SRC``
+    Serve a fine-tuned model on top of ``--weights``. ``SRC`` may be a
+    ``.delta.pth`` / ``.safetensors`` file, a local bundle directory, or a
+    ``local:`` / ``file://`` / ``hf://`` bundle URI. A served single-organism
+    fine-tune (e.g. mouse) defaults to its trained organism when a request
+    omits ``organism``.
+
+``--transfer-config PATH``
+    TransferConfig JSON for older checkpoints that don't embed one.
+
+``--no-merge-adapters``
+    Keep adapter modules separate instead of merging them into the base weights.
+
+``--adapter-catalog PATH``
+    Serve multiple fine-tuned models over a shared base from a YAML/JSON
+    catalog. Enables the REST ``/v1/models`` endpoints; gRPC then requires the
+    ``alphagenome-model-id`` metadata header on every request. Mutually
+    exclusive with ``--checkpoint``.
+
+See :doc:`/serving/adapters` for the bundle format, catalog schema, REST/gRPC
+behavior, and the full ``agt adapters`` workflow.
+
+
+``agt adapters``
+----------------
+
+Package a fine-tuned checkpoint into a shareable **adapter bundle** (a
+delta-weights export plus an ``alphagenome_adapter.json`` manifest), and
+inspect, validate, pull, or publish bundles:
+
+.. code-block:: bash
+
+   # Build a bundle from a delta checkpoint
+   agt adapters export \
+       --checkpoint runs/wtc11-atac/best.delta.pth \
+       --base-model your-org/alphagenome \
+       --id wtc11-atac-lora --organism human --modality atac \
+       --out dist/wtc11-atac-lora
+
+   agt adapters inspect  dist/wtc11-atac-lora
+   agt adapters validate dist/wtc11-atac-lora --base-weights model.pth
+   agt adapters pull     hf://your-org/alphagenome-wtc11-atac-lora
+   agt adapters publish  dist/wtc11-atac-lora hf://your-org/alphagenome-wtc11-atac-lora
+
+Requires: ``pip install alphagenome-pytorch[serving]`` (plus ``[hf]`` for
+``pull`` / ``publish`` of ``hf://`` URIs).
+
+See :doc:`/serving/adapters` for the bundle layout, manifest schema, URI forms,
+and catalog serving.
+
 
 Dependency Gating
 -----------------
