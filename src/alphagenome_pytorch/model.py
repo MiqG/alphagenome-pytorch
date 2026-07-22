@@ -11,6 +11,44 @@ from .config import DtypePolicy
 from .named_outputs import NamedOutputs, TrackMetadataCatalog
 from alphagenome_pytorch.utils.splicing import generate_splice_site_positions
 
+
+# --- Sequence-length constraints (imposed by the encoder/decoder geometry) ---
+# The encoder halves the sequence 7 times (one initial pool + six DownResBlocks)
+# down to 128 bp trunk bins, and the decoder rebuilds full resolution through
+# U-Net skip connections. A valid input length must therefore be a multiple of
+# 128; a non-multiple gets ceil-padded at each pool and the skip sizes no longer
+# line up. The model was trained on windows up to 1 Mb; longer is untested.
+#
+# This is the single source of truth for the constraint — the serving layer and
+# the predict CLI both call ``validate_sequence_length``, so relaxing or
+# tightening the rule (e.g. a new max) is a one-line change here.
+SEQUENCE_LENGTH_BIN = 128  # 2**7, from the encoder's seven pooling stages
+MIN_SEQUENCE_LENGTH = SEQUENCE_LENGTH_BIN  # one 128 bp trunk bin
+MAX_SEQUENCE_LENGTH = 2 ** 20  # 1_048_576 — trained ceiling
+
+
+def validate_sequence_length(length: int) -> None:
+    """Raise ``ValueError`` unless ``length`` is one the model can process.
+
+    Valid lengths are multiples of :data:`SEQUENCE_LENGTH_BIN` within
+    ``[MIN_SEQUENCE_LENGTH, MAX_SEQUENCE_LENGTH]``.
+
+    Note: contact maps pool the trunk by a further factor of 16, so their grid is
+    ``length // 2048`` — below ~2048 bp they degenerate to a 1x1 map. Track
+    outputs are unaffected.
+    """
+    if (
+        length < MIN_SEQUENCE_LENGTH
+        or length > MAX_SEQUENCE_LENGTH
+        or length % SEQUENCE_LENGTH_BIN != 0
+    ):
+        raise ValueError(
+            f"Sequence length {length} not supported. Length must be a multiple "
+            f"of {SEQUENCE_LENGTH_BIN} within "
+            f"[{MIN_SEQUENCE_LENGTH}, {MAX_SEQUENCE_LENGTH}]."
+        )
+
+
 class SequenceEncoder(nn.Module):
     """Encodes DNA sequence to trunk representation. Outputs NCL format (B, C, S)."""
 
