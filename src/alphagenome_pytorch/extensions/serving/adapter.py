@@ -22,6 +22,7 @@ from alphagenome.data import track_data as ag_track_data
 from alphagenome.models import dna_output
 from alphagenome.protos import dna_model_pb2
 
+from alphagenome_pytorch.model import validate_sequence_length
 from alphagenome_pytorch.prediction import AlphaGenomePredictionRuntime
 from alphagenome_pytorch.extensions.attribution import (
     AttributionResult,
@@ -44,6 +45,12 @@ SEQUENCE_LENGTH_100KB = 2**17  # 131_072
 SEQUENCE_LENGTH_500KB = 2**19  # 524_288
 SEQUENCE_LENGTH_1MB = 2**20  # 1_048_576
 
+# The four values here are the *standard* crop sizes — they mirror the upstream
+# dna_client menu — but they are not the model's actual limits. Length validation
+# is delegated to ``validate_sequence_length`` (below), which accepts any
+# multiple of 128 within the trained range, so fine-tuned models (e.g.
+# encoder-only MPRA models trained on short windows) can be served at their
+# native length instead of being forced onto one of these four sizes.
 SUPPORTED_SEQUENCE_LENGTHS: Mapping[str, int] = {
     'SEQUENCE_LENGTH_16KB': SEQUENCE_LENGTH_16KB,
     'SEQUENCE_LENGTH_100KB': SEQUENCE_LENGTH_100KB,
@@ -98,12 +105,10 @@ _PRODUCED_PT_OUTPUTS = {
     PTOutputType.PROCAP,
 }
 
-def _validate_sequence_length(length: int) -> None:
-    if length not in SUPPORTED_SEQUENCE_LENGTHS.values():
-        raise ValueError(
-            f'Sequence length {length} not supported. '
-            f'Supported lengths: {list(SUPPORTED_SEQUENCE_LENGTHS.values())}'
-        )
+# Length validation is a model-geometry property; ``model.validate_sequence_length``
+# is the single source of truth. Keep the private name so existing callers
+# (scorer.py, the request handlers below) import it from here unchanged.
+_validate_sequence_length = validate_sequence_length
 
 
 def _organism_proto_from_index(idx: int) -> int:
