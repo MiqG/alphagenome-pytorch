@@ -740,8 +740,9 @@ inspect, validate, pull, or publish bundles:
    agt adapters pull     hf://your-org/alphagenome-wtc11-atac-lora
    agt adapters publish  dist/wtc11-atac-lora hf://your-org/alphagenome-wtc11-atac-lora
 
-Requires: ``pip install alphagenome-pytorch[serving]`` (plus ``[hf]`` for
-``pull`` / ``publish`` of ``hf://`` URIs).
+Bundle management (``export`` / ``inspect`` / ``validate`` and local bundle
+operations) works in the base installation. Install ``[hf]`` for ``hf://``
+``pull`` / ``publish``, and ``[serving]`` to run ``agt serve``.
 
 See :doc:`/serving/adapters` for the bundle layout, manifest schema, URI forms,
 and catalog serving.

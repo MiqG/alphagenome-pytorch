@@ -557,6 +557,49 @@ class TestExportOrganismProvenance:
         )
         assert ctx.default_organism_index == 1
 
+    def test_organism_flag_writes_embedded_metadata(self, tmp_path: Path) -> None:
+        """--organism updates the bundle's EMBEDDED metadata (not just the
+        manifest) so serving honors it even for checkpoints lacking organism."""
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            _read_delta_export_header,
+            resolve_finetuned_organism,
+        )
+
+        src = _write_delta_pth(tmp_path)  # no organism embedded
+        out = tmp_path / "bundle"
+        rc = adapters_cli.run(_make_export_args(
+            checkpoint=str(src), out=str(out), bundle_id="x", organism="mouse",
+        ))
+        assert rc == 0
+
+        header = _read_delta_export_header(BundlePaths.resolve(out).adapter_safetensors)
+        assert header.get("organism") == "mouse"
+        assert header.get("organism_indices") == [1]
+        ctx = resolve_finetuned_organism(
+            organism_indices=header.get("organism_indices"),
+            checkpoint_organism=header.get("organism"),
+            track_metadata=header.get("track_metadata"),
+            num_organisms=2,
+        )
+        assert ctx.default_organism_index == 1  # serves mouse, not human
+
+    def test_organism_flag_overrides_embedded_organism(self, tmp_path: Path) -> None:
+        """--organism overrides an organism the source checkpoint already embeds."""
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            _read_delta_export_header,
+        )
+
+        src = self._write_mouse_delta(tmp_path)  # embeds organism=mouse, [1]
+        out = tmp_path / "bundle"
+        rc = adapters_cli.run(_make_export_args(
+            checkpoint=str(src), out=str(out), bundle_id="x", organism="human",
+        ))
+        assert rc == 0
+
+        header = _read_delta_export_header(BundlePaths.resolve(out).adapter_safetensors)
+        assert header.get("organism") == "human"
+        assert header.get("organism_indices") == [0]
+
 
 class TestCatalogAdapterDevicePlacement:
     """build_adapter_entry must leave the captured adapter/head modules on the
