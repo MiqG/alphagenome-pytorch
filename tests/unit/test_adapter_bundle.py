@@ -292,6 +292,7 @@ class TestExportCli:
         assert manifest.base_model_hash == "sha256:from-ckpt"
         assert manifest.adapter_summary.get("kinds") == ["lora"]
         assert manifest.adapter_summary.get("lora_rank") == 4
+        assert manifest.adapter_summary.get("lora_targets") == ["q_proj"]
         assert "locon_rank" not in manifest.adapter_summary
         assert manifest.organism == "human"
         # provenance pulled from the source checkpoint metadata
@@ -715,20 +716,33 @@ class TestSummaryFromHeader:
         # transfer_config is a full asdict, so lora_rank/lora_alpha are always
         # present as defaults; the summary must not leak them for a Locon run.
         summary = _summary(
-            TransferConfig(mode="locon", locon_rank=4, locon_alpha=1)
+            TransferConfig(
+                mode="locon",
+                locon_rank=4,
+                locon_alpha=1,
+                locon_targets=["down_blocks.4", "down_blocks.5"],
+            )
         )
         assert summary["kinds"] == ["locon"]
         assert summary["locon_rank"] == 4
         assert summary["locon_alpha"] == 1
+        assert summary["locon_targets"] == ["down_blocks.4", "down_blocks.5"]
         assert "lora_rank" not in summary
         assert "lora_alpha" not in summary
+        assert "lora_targets" not in summary
 
     def test_pure_lora(self) -> None:
-        summary = _summary(TransferConfig(mode="lora", lora_rank=8, lora_alpha=16))
+        summary = _summary(
+            TransferConfig(
+                mode="lora", lora_rank=8, lora_alpha=16, lora_targets=["q_proj", "v_proj"]
+            )
+        )
         assert summary["kinds"] == ["lora"]
         assert summary["lora_rank"] == 8
         assert summary["lora_alpha"] == 16
+        assert summary["lora_targets"] == ["q_proj", "v_proj"]
         assert "locon_rank" not in summary
+        assert "locon_targets" not in summary
 
     def test_combined_lora_locon_reports_both(self) -> None:
         summary = _summary(
@@ -736,23 +750,36 @@ class TestSummaryFromHeader:
                 mode=["lora", "locon"],
                 lora_rank=8,
                 lora_alpha=16,
+                lora_targets=["q_proj", "v_proj"],
                 locon_rank=4,
                 locon_alpha=1,
+                locon_targets=["down_blocks.4"],
             )
         )
         assert summary["kinds"] == ["lora", "locon"]
         assert summary["lora_rank"] == 8
         assert summary["lora_alpha"] == 16
+        assert summary["lora_targets"] == ["q_proj", "v_proj"]
         assert summary["locon_rank"] == 4
         assert summary["locon_alpha"] == 1
+        assert summary["locon_targets"] == ["down_blocks.4"]
         # No misleading scalar kind that would collapse to just "lora".
         assert "kind" not in summary
+
+    def test_empty_target_lists_are_omitted(self) -> None:
+        # ia3_ff_targets defaults to [] — an empty placement list must not clutter
+        # the summary.
+        summary = _summary(TransferConfig(mode="ia3", ia3_targets=["k_proj", "v_proj"]))
+        assert summary["kinds"] == ["ia3"]
+        assert summary["ia3_targets"] == ["k_proj", "v_proj"]
+        assert "ia3_ff_targets" not in summary
 
     def test_linear_mode_has_no_adapter_hyperparams(self) -> None:
         summary = _summary(TransferConfig(mode="linear"))
         assert summary["kinds"] == ["linear"]
         assert "lora_rank" not in summary
         assert "locon_rank" not in summary
+        assert "lora_targets" not in summary
 
 
 class TestAdapterSummaryKinds:

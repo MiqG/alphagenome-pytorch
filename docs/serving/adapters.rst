@@ -37,7 +37,7 @@ Manifest Schema (v1)
      "base_model_id": "your-org/alphagenome",
      "base_model_hash": "sha256:abc...",
      "alphagenome_pytorch_version": "x.y.z",
-     "adapter_summary": {"kinds": ["lora"], "lora_rank": 8, "lora_alpha": 16},
+     "adapter_summary": {"kinds": ["lora"], "lora_rank": 8, "lora_alpha": 16, "lora_targets": ["q_proj", "v_proj"]},
      "genome": "hg38",
      "organism": "human",
      "modality": "atac",
