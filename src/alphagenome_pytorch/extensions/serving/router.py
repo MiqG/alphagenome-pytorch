@@ -403,8 +403,9 @@ class ServedModelRouter:
             if e.manifest is not None:
                 row["genome"] = e.manifest.genome
                 row["organism"] = e.manifest.organism
-                row["modality"] = e.manifest.modality
+                row["modalities"] = e.manifest.modalities
                 row["biosample"] = e.manifest.biosample
+                row["num_tracks"] = e.manifest.num_tracks
                 if e.manifest.adapter_summary:
                     row["adapter"] = e.manifest.adapter_summary
             out.append(row)

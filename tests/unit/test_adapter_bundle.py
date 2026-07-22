@@ -295,6 +295,8 @@ class TestExportCli:
         assert manifest.adapter_summary.get("lora_targets") == ["q_proj"]
         assert "locon_rank" not in manifest.adapter_summary
         assert manifest.organism == "human"
+        # --modality override feeds the modalities list
+        assert manifest.modalities == ["atac"]
         # provenance pulled from the source checkpoint metadata
         assert manifest.provenance.get("epoch") == 3
         assert manifest.provenance.get("val_loss") == pytest.approx(0.2)
@@ -494,7 +496,7 @@ class TestModelCard:
             base_model_id="org/alphagenome",
             adapter_summary={"kind": "lora"},
             organism="human",
-            modality="atac",
+            modalities=["atac"],
             biosample="WTC11",
             license="apache-2.0",
         )
@@ -510,7 +512,7 @@ class TestModelCard:
         m = Manifest(
             id="wtc11-atac-lora",
             base_model_hash="sha256:abc",
-            modality="atac",
+            modalities=["atac"],
             heads=["atac_wtc11"],
             adapter_filename="adapter.safetensors",
         )
@@ -523,9 +525,44 @@ class TestModelCard:
         # predict's --head uses a real head name from the bundle.
         assert "--head atac_wtc11" in card
 
+    def test_multi_head_bundle_shows_counts_and_modalities(self) -> None:
+        # A multi-modality fine-tune registers one head per modality; the card
+        # summarises with counts (not name lists) plus the modalities covered.
+        m = Manifest(
+            id="wtc11-multi",
+            base_model_hash="sha256:abc",
+            modalities=["atac", "dnase", "rna_seq"],
+            heads=["atac_wtc11", "dnase_wtc11", "rna_seq_wtc11"],
+            num_tracks=1408,
+        )
+        card = render_model_card(m)
+        # Counts, not per-head name rows.
+        assert "| Heads | 3 |" in card
+        assert "| Tracks | 1408 |" in card
+        assert "| Modalities | atac, dnase, rna_seq |" in card
+        # Individual head names are NOT enumerated in the card table.
+        assert "`dnase_wtc11`" not in card
+        # The predict section notes there are several heads, one per call.
+        assert "exposes 3 heads" in card
+        # The runnable example still uses a concrete (first) head.
+        assert "--head atac_wtc11" in card
+
+    def test_single_head_bundle_shows_count_one(self) -> None:
+        m = Manifest(
+            id="x", base_model_hash="sha256:x", heads=["atac_wtc11"], num_tracks=4
+        )
+        card = render_model_card(m)
+        assert "| Heads | 1 |" in card
+        assert "| Tracks | 4 |" in card
+        assert "exposes" not in card  # no multi-head note
+
+    def test_tracks_dash_when_unknown(self) -> None:
+        m = Manifest(id="x", base_model_hash="sha256:x", heads=["h"])
+        assert "| Tracks | — |" in render_model_card(m)
+
     def test_predict_head_falls_back_to_modality_then_placeholder(self) -> None:
         with_modality = Manifest(
-            id="x", base_model_hash="sha256:x", modality="dnase"
+            id="x", base_model_hash="sha256:x", modalities=["dnase"]
         )
         assert "--head dnase" in render_model_card(with_modality)
 
@@ -735,6 +772,39 @@ def _summary(config: TransferConfig) -> dict:
     return adapters_cli._summary_from_header(
         {"transfer_config": asdict(config)}
     )["adapter_summary"]
+
+
+def _full_summary(config: TransferConfig) -> dict:
+    from dataclasses import asdict
+
+    return adapters_cli._summary_from_header({"transfer_config": asdict(config)})
+
+
+class TestSummaryRollups:
+    """modalities + num_tracks are derived from the heads' own configs."""
+
+    def test_derives_modalities_and_total_tracks(self) -> None:
+        cfg = TransferConfig(
+            mode="lora",
+            new_heads={
+                "atac_wtc11": {"modality": "atac", "num_tracks": 4},
+                "dnase_wtc11": {"modality": "dnase", "num_tracks": 8},
+                "atac_extra": {"modality": "atac", "num_tracks": 2},  # dup modality
+            },
+        )
+        summary = _full_summary(cfg)
+        # order-preserving, deduplicated
+        assert summary["modalities"] == ["atac", "dnase"]
+        assert summary["num_tracks"] == 14
+        assert summary["new_head_names"] == [
+            "atac_wtc11", "dnase_wtc11", "atac_extra",
+        ]
+
+    def test_no_new_heads_yields_empty_modalities_and_none_tracks(self) -> None:
+        summary = _full_summary(TransferConfig(mode="lora", new_heads={}))
+        assert summary["modalities"] == []
+        assert summary["num_tracks"] is None
+        assert summary["new_head_names"] == []
 
 
 class TestSummaryFromHeader:
