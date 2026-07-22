@@ -67,6 +67,12 @@ Build a bundle from an existing delta checkpoint:
      --biosample WTC11 \
      --out dist/wtc11-atac-lora
 
+``--organism`` is an **override**: it is written into the bundle's embedded
+delta metadata (``organism`` / ``organism_indices``), not just the manifest, so
+the served model honors it (catalog mode resolves organism from the embedded
+metadata). For a checkpoint that already embeds organism provenance, omit
+``--organism`` and the trained organism carries through unchanged.
+
 Inspect or validate before sharing:
 
 .. code-block:: bash
@@ -184,11 +190,29 @@ wrapper modules (``LoRA`` / ``Locon`` / ``IA3`` / ``Houlsby``) and any new
 heads. Wrappers store references to the trunk's ``Linear`` / ``Conv1d``
 parameters, so all entries share the same base weights.
 
-A request for ``model_id`` triggers a serialized swap: the active entry's
-wrappers are detached (``setattr`` back to ``original_layer``), the requested
-entry's wrappers are reattached, and any new heads are placed onto
-``base_model.heads``. Swap latency is bounded by adapter + head state-dict
-size, not by reloading base weights.
+A request for ``model_id`` acquires the router lock, swaps the entry in (the
+active entry's wrappers are detached — ``setattr`` back to ``original_layer`` —
+the requested entry's wrappers are reattached, and any new heads are placed onto
+``base_model.heads``), and runs the model call. **One catalog model operation
+runs at a time:** the lock spans the swap *and* the inference/scoring call, so a
+concurrent request can never swap the shared trunk mid-forward. Response
+serialization and the network write happen after the lock is released. Swap
+latency is bounded by adapter + head state-dict size, not by reloading base
+weights.
+
+Each entry is **self-describing**: it carries its own bundle's embedded track
+metadata, track names, variant scorer, and default organism. An entry's service
+adapter and its scorer share one runtime, so predictions and variant scores
+resolve tracks and organism identically. An explicit ``--track-metadata`` at
+serve time overrides the embedded metadata for every entry.
+
+Organism defaulting:
+
+- A request that omits ``organism`` uses the bundle's **trained organism**
+  (e.g. a mouse finetune serves mouse), not human.
+- An explicit ``organism`` in the request overrides the bundle default.
+- A **mixed-organism** bundle (trained on more than one organism) is rejected at
+  catalog startup — multi-organism serving is not supported in v1.
 
 Constraints (v1)
 ~~~~~~~~~~~~~~~~
@@ -199,3 +223,6 @@ Constraints (v1)
 - Bundles whose ``transfer_config`` uses ``keep_heads`` or ``remove_heads``
   cannot be served in catalog mode (the router cannot reversibly remove
   base heads). Use singleton mode for such adapters.
+- Mixed-organism bundles (trained on more than one organism) cannot be served
+  in catalog mode — there is no single default organism. Serve a
+  single-organism bundle.

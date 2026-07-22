@@ -170,6 +170,13 @@ def _run_export(args: argparse.Namespace) -> int:
 
     summary = _materialize_adapter_safetensors(src, adapter_out)
 
+    # An explicit --organism is an override: write it into the bundle's embedded
+    # delta metadata (not just the manifest), because serving resolves organism
+    # from the embedded ``organism`` / ``organism_indices`` — otherwise the
+    # manifest could claim mouse while the served model defaults to human.
+    if args.organism:
+        _apply_organism_override(adapter_out, args.organism)
+
     base_hash = _resolve_base_model_hash(args, summary)
 
     heads_list: list[str] = []
@@ -251,6 +258,34 @@ def _materialize_adapter_safetensors(
         f"Source {src} is neither a delta checkpoint nor a delta-weights export. "
         "Pass a .delta.pth or an exported .safetensors produced by export_delta_weights."
     )
+
+
+def _apply_organism_override(dest: Path, organism: str) -> None:
+    """Write an explicit ``--organism`` into the bundle's embedded delta metadata.
+
+    Serving resolves organism from the embedded ``organism`` /
+    ``organism_indices`` metadata (not the manifest), so ``--organism`` must
+    update those embedded values or a manifest could claim mouse while the served
+    model defaults to human. This is an override: it replaces any organism the
+    source checkpoint embedded. Rewrites ``dest``'s safetensors metadata in place
+    (tensor data is re-saved unchanged). Raises on an unknown organism.
+    """
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    from alphagenome_pytorch.organisms import normalize_organism_index
+
+    index = normalize_organism_index(organism, num_organisms=2)
+
+    tensors: dict[str, torch.Tensor] = {}
+    with safe_open(str(dest), framework="pt") as f:
+        metadata = dict(f.metadata() or {})
+        for key in f.keys():
+            tensors[key] = f.get_tensor(key)
+    metadata["organism"] = json.dumps(organism)
+    metadata["organism_indices"] = json.dumps([index])
+    save_file(tensors, str(dest), metadata=metadata)
 
 
 def _convert_delta_checkpoint_to_export(src: Path, dest: Path) -> dict[str, Any]:
