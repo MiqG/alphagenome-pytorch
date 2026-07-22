@@ -327,3 +327,55 @@ def test_explicit_organism_overrides_entry_default(monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_lock_released_before_serialization(monkeypatch):
+    """The router lock must be released after inference and BEFORE serialization
+    and the socket write, so a slow client cannot hold the single catalog slot
+    longer than the computation itself."""
+    import threading
+
+    import alphagenome_pytorch.extensions.serving.rest_service as rs
+
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+    router, _ = _make_router(ids=['alpha', 'beta'])
+
+    serialize_started = threading.Event()
+    release_serialize = threading.Event()
+    original_serialize = rs._serialize_output
+
+    def _blocking_serialize(output):
+        # Runs while building the response payload — must be OUTSIDE the lock.
+        serialize_started.set()
+        assert release_serialize.wait(timeout=5)
+        return original_serialize(output)
+
+    monkeypatch.setattr(rs, '_serialize_output', _blocking_serialize)
+
+    server = serve_rest(router, host='127.0.0.1', port=0, wait=False)
+    host, port = server.server_address
+    try:
+        def _request_alpha():
+            _post(host, port, '/v1/models/alpha/predict_sequence', {
+                'sequence': 'A' * SEQUENCE_LENGTH_16KB,
+                'requested_outputs': ['DNASE'],
+            })
+
+        worker = threading.Thread(target=_request_alpha)
+        worker.start()
+        # Wait until A has finished inference and is stuck serializing.
+        assert serialize_started.wait(timeout=5)
+        # With inference done and the lock released, another request can take the
+        # router slot even though A is still serializing/writing.
+        acquired = router._lock.acquire(timeout=2)
+        try:
+            assert acquired, "router lock is still held during serialization"
+        finally:
+            if acquired:
+                router._lock.release()
+        release_serialize.set()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+    finally:
+        server.shutdown()
+        server.server_close()
