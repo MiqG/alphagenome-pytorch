@@ -72,6 +72,27 @@ def _write_delta_safetensors(tmp_path: Path) -> Path:
     return p
 
 
+def _write_multimodal_delta_pth(tmp_path: Path, *, base_hash: str | None = None) -> Path:
+    """A fine-tune across 3 heads / 2+ modalities with differing track counts."""
+    model = _make_lora_model()
+    model.heads = nn.ModuleDict({
+        "atac_wtc11": nn.Linear(16, 4),
+        "dnase_wtc11": nn.Linear(16, 8),
+        "rna_seq_wtc11": nn.Linear(16, 6),
+    })
+    cfg = TransferConfig(
+        mode="lora", lora_rank=4, lora_targets=["q_proj"],
+        new_heads={
+            "atac_wtc11": {"modality": "atac", "num_tracks": 4},
+            "dnase_wtc11": {"modality": "dnase", "num_tracks": 8},
+            "rna_seq_wtc11": {"modality": "rna_seq", "num_tracks": 6},
+        },
+    )
+    p = tmp_path / "multi.delta.pth"
+    save_delta_checkpoint(p, model, cfg, base_model_hash=base_hash, epoch=1)
+    return p
+
+
 def _make_export_args(**overrides) -> argparse.Namespace:
     base = dict(
         adapters_command="export",
@@ -300,6 +321,29 @@ class TestExportCli:
         # provenance pulled from the source checkpoint metadata
         assert manifest.provenance.get("epoch") == 3
         assert manifest.provenance.get("val_loss") == pytest.approx(0.2)
+
+    def test_export_multimodality_derives_modalities_and_tracks(
+        self, tmp_path: Path
+    ) -> None:
+        # No --modality passed: modalities and num_tracks must be auto-derived
+        # from the checkpoint's per-head configs and land in the on-disk JSON.
+        src = _write_multimodal_delta_pth(tmp_path, base_hash="sha256:mm")
+        out = tmp_path / "bundle"
+        rc = adapters_cli.run(_make_export_args(
+            checkpoint=str(src), out=str(out), bundle_id="wtc11-multi",
+        ))
+        assert rc == 0
+
+        manifest = Manifest.load(BundlePaths.resolve(out).manifest)
+        assert manifest.modalities == ["atac", "dnase", "rna_seq"]
+        assert manifest.heads == ["atac_wtc11", "dnase_wtc11", "rna_seq_wtc11"]
+        assert manifest.num_tracks == 4 + 8 + 6
+
+        # The raw JSON carries the new fields and not the retired scalar.
+        raw = json.loads((out / MANIFEST_FILENAME).read_text())
+        assert raw["modalities"] == ["atac", "dnase", "rna_seq"]
+        assert raw["num_tracks"] == 18
+        assert "modality" not in raw
 
     def test_export_from_safetensors_requires_hash_source(
         self, tmp_path: Path
