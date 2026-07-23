@@ -303,23 +303,27 @@ Download the bundle from this repo (prints its local path):
 BUNDLE=$(agt adapters pull hf://<org>/<repo>)
 ```
 
-{predict_intro}
+{predict_intro} `--fasta` points at the reference genome the loci are relative to
+(e.g. hg38 for human); `agt predict` and `agt serve` both require it.
 
 ```bash
 agt predict --model base.safetensors --checkpoint "$BUNDLE/{adapter_filename}" \\
+    --fasta hg38.fa \\
     --head {head} --locus chr1:1000000-1131072 --output ./predictions
 ```
 
 Or serve it behind the AlphaGenome API:
 
 ```bash
-agt serve --weights base.safetensors --checkpoint "$BUNDLE/{adapter_filename}"
+agt serve --weights base.safetensors --checkpoint "$BUNDLE" --fasta hg38.fa
 ```
 
-The bundle's `alphagenome_adapter.json` is display/provenance only; loading reads
-the embedded `transfer_config` from the safetensors metadata via
-`load_finetuned_model`. Use a base model whose hash matches `Base model hash`
-above.
+`agt serve` takes the bundle *directory* (`"$BUNDLE"`), not the inner
+safetensors file, so it can read `alphagenome_adapter.json` and verify the
+manifest's `Base model hash` against `--weights` before serving. The manifest is
+otherwise display/provenance only: loading reads the embedded `transfer_config`
+from the safetensors metadata via `load_finetuned_model`. Use a base model whose
+hash matches `Base model hash` above.
 """
 
 

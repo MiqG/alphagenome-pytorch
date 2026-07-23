@@ -565,7 +565,14 @@ class TestModelCard:
         assert "agt adapters pull" in card
         assert "agt predict" in card
         assert "agt serve" in card
-        assert '"$BUNDLE/adapter.safetensors"' in card
+        # predict points at the inner safetensors (it does not resolve bundle dirs).
+        assert '--checkpoint "$BUNDLE/adapter.safetensors"' in card
+        # Both runnable commands must include --fasta — both CLIs require it, so a
+        # copy-paste without it fails (predict raises, serve exits on argparse).
+        assert card.count("--fasta") >= 2
+        # serve takes the bundle *directory* so the manifest (and its base-model
+        # hash check) is preserved; passing the inner file would skip it.
+        assert 'agt serve --weights base.safetensors --checkpoint "$BUNDLE" --fasta' in card
         # predict's --head uses a real head name from the bundle.
         assert "--head atac_wtc11" in card
 
