@@ -722,9 +722,11 @@ behavior, and the full ``agt adapters`` workflow.
 ``agt adapters``
 ----------------
 
-Package a fine-tuned checkpoint into a shareable **adapter bundle** (a
-delta-weights export plus an ``alphagenome_adapter.json`` manifest), and
-inspect, validate, pull, or publish bundles:
+Package a fine-tuned **delta** checkpoint (``.delta.pth``) or delta-weights
+export (``.safetensors``) into a shareable **adapter bundle** (a delta-weights
+export plus an ``alphagenome_adapter.json`` manifest), and inspect, validate,
+pull, or publish bundles. A full or merged checkpoint cannot be exported — it
+has no separable adapter weights:
 
 .. code-block:: bash
 
