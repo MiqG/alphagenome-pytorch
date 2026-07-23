@@ -45,6 +45,65 @@ def grpc_server(monkeypatch):
 
 
 @pytest.fixture
+def catalog_grpc_server(monkeypatch):
+    """A router-backed (catalog-mode) service with one entry, ``'m1'``.
+
+    The two catalog error paths (missing / unknown ``alphagenome-model-id``)
+    reject before any model computation, so the entry's adapter is never built
+    — a bare ``nn.Linear`` base and a lambda adapter factory are enough.
+    """
+    import torch.nn as nn
+
+    from alphagenome_pytorch.extensions.serving.router import (
+        ServedModelEntry,
+        ServedModelRouter,
+    )
+
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+    entry = ServedModelEntry(
+        id='m1', label='M1', kind='adapter', base_model_hash='sha256:demo',
+    )
+    router = ServedModelRouter(
+        base_model=nn.Linear(4, 4),
+        runtime=FakeRuntime(),
+        entries=[entry],
+        adapter_factory=lambda r, e: object(),  # unreached on the error paths
+    )
+    yield from _start_grpc(router)
+
+
+def _catalog_predict_request():
+    return dna_model_service_pb2.PredictSequenceRequest(
+        sequence='A' * SEQUENCE_LENGTH_16KB,
+        organism=dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        requested_outputs=[dna_output.OutputType.DNASE.to_proto()],
+    )
+
+
+def test_catalog_missing_model_id_is_failed_precondition(catalog_grpc_server):
+    """Regression: a deliberate abort raised inside ``_acquire`` must not be
+    swallowed by the RPC method's broad ``except`` and re-aborted as INTERNAL."""
+    with pytest.raises(grpc.RpcError) as exc_info:
+        list(catalog_grpc_server.PredictSequence(iter([_catalog_predict_request()])))
+    assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    # Details must survive too — the INTERNAL bug also blanked them.
+    assert 'alphagenome-model-id' in exc_info.value.details()
+
+
+def test_catalog_unknown_model_id_is_not_found(catalog_grpc_server):
+    """Regression: unknown model id must surface NOT_FOUND, not INTERNAL."""
+    metadata = (('alphagenome-model-id', 'does-not-exist'),)
+    with pytest.raises(grpc.RpcError) as exc_info:
+        list(
+            catalog_grpc_server.PredictSequence(
+                iter([_catalog_predict_request()]), metadata=metadata
+            )
+        )
+    assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+    assert 'does-not-exist' in exc_info.value.details()
+
+
+@pytest.fixture
 def prediction_only_grpc_server(monkeypatch):
     monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
     adapter = LocalDnaModelAdapter(FakeRuntime())
