@@ -27,8 +27,31 @@ from .adapter import LocalDnaModelAdapter
 LOGGER = logging.getLogger(__name__)
 
 
+class _CatalogModelIdMissing(Exception):
+    """Catalog mode: the request omitted the required model-id metadata header.
+
+    Raised (rather than aborting immediately) so it flows through the RPC
+    method's broad ``except Exception`` handler and is mapped exactly once to
+    FAILED_PRECONDITION. Calling ``context.abort`` inside ``_acquire`` instead
+    would raise a bare ``Exception`` that the same handler re-aborts as INTERNAL,
+    losing the intended status code and details.
+    """
+
+
+class _CatalogModelNotFound(Exception):
+    """Catalog mode: the request named a model id that is not in the catalog.
+
+    See :class:`_CatalogModelIdMissing` for why this is a typed exception rather
+    than a direct ``context.abort``. Mapped to NOT_FOUND.
+    """
+
+
 def _set_grpc_error(context: grpc.ServicerContext, exc: Exception) -> None:
-    if isinstance(exc, ValueError):
+    if isinstance(exc, _CatalogModelIdMissing):
+        code = grpc.StatusCode.FAILED_PRECONDITION
+    elif isinstance(exc, _CatalogModelNotFound):
+        code = grpc.StatusCode.NOT_FOUND
+    elif isinstance(exc, ValueError):
         code = grpc.StatusCode.INVALID_ARGUMENT
     elif isinstance(exc, NotImplementedError):
         code = grpc.StatusCode.UNIMPLEMENTED
@@ -278,11 +301,17 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
     def _acquire(self, context):
         """Yield the per-request adapter, holding the router lock in catalog mode.
 
-        Enforces catalog-mode metadata rules (``FAILED_PRECONDITION`` when the
-        ``alphagenome-model-id`` header is missing, ``NOT_FOUND`` for unknown
-        ids) and keeps the shared base model swapped in for the duration of the
-        ``with`` body so a concurrent RPC cannot re-swap it mid-forward. Keep
-        only the model computation inside the block; stream after release.
+        Enforces catalog-mode metadata rules by raising typed exceptions —
+        :class:`_CatalogModelIdMissing` (mapped to ``FAILED_PRECONDITION`` when
+        the ``alphagenome-model-id`` header is missing) and
+        :class:`_CatalogModelNotFound` (``NOT_FOUND`` for unknown ids). These
+        propagate through the caller's broad ``except Exception`` handler, which
+        aborts exactly once with the right code; aborting here directly would be
+        swallowed and re-aborted as INTERNAL (see the exception docstrings).
+
+        Keeps the shared base model swapped in for the duration of the ``with``
+        body so a concurrent RPC cannot re-swap it mid-forward. Keep only the
+        model computation inside the block; stream after release.
         """
         if self.router is None:
             yield self.adapter
@@ -297,18 +326,16 @@ class LocalDnaModelService(dna_model_service_pb2_grpc.DnaModelServiceServicer):
                 model_id = v
                 break
         if model_id is None:
-            context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION,
+            raise _CatalogModelIdMissing(
                 f"Catalog mode requires '{_MODEL_ID_METADATA_KEY}' metadata. "
-                f"Available models: {self.router.model_ids}",
+                f"Available models: {self.router.model_ids}"
             )
         try:
             resolved = self.router.resolve_model_id(model_id)
         except ModelNotFoundError:
-            context.abort(
-                grpc.StatusCode.NOT_FOUND,
-                f"Unknown model id: {model_id!r}. Available: {self.router.model_ids}",
-            )
+            raise _CatalogModelNotFound(
+                f"Unknown model id: {model_id!r}. Available: {self.router.model_ids}"
+            ) from None
         with self.router.acquire(resolved) as adapter:
             yield adapter
 
