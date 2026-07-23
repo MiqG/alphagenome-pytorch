@@ -212,8 +212,15 @@ def _resolve_finetuned_metadata_catalog(
     return None
 
 
-def _resolve_checkpoint_arg(checkpoint: str) -> str:
-    """Map a ``--checkpoint`` value to a concrete weights path.
+def _resolve_checkpoint_and_manifest(checkpoint: str):
+    """Resolve a ``--checkpoint`` value to ``(weights_path, manifest)``.
+
+    ``weights_path`` is the concrete file the loader consumes; ``manifest`` is
+    the bundle's parsed :class:`~...bundle.Manifest` when the checkpoint is a
+    bundle (a directory or URI carrying ``alphagenome_adapter.json``), otherwise
+    ``None``. The manifest is surfaced — not discarded — so the caller can
+    cross-check ``base_model_hash`` before serving, the same compatibility
+    guarantee catalog mode enforces in ``build_adapter_entry``.
 
     Accepts:
     - a path to a `.delta.pth` checkpoint or `.safetensors` delta-weights export,
@@ -222,14 +229,15 @@ def _resolve_checkpoint_arg(checkpoint: str) -> str:
       ``hf://``).
 
     Bundle directories resolve to the bundle's adapter safetensors path. Any
-    other input — including missing files — is returned unchanged so the
-    downstream loader can surface its native error.
+    other input — including missing files — is returned unchanged (with a
+    ``None`` manifest) so the downstream loader can surface its native error.
     """
     from pathlib import Path
 
     from alphagenome_pytorch.extensions.serving.bundle import (
         BundlePaths,
         MANIFEST_FILENAME,
+        Manifest,
     )
     from alphagenome_pytorch.extensions.serving.uri import (
         parse_bundle_uri,
@@ -242,22 +250,57 @@ def _resolve_checkpoint_arg(checkpoint: str) -> str:
     ):
         p = Path(checkpoint)
         if p.is_dir() and (p / MANIFEST_FILENAME).is_file():
-            return str(BundlePaths.resolve(p).adapter_safetensors)
-        return checkpoint
+            paths = BundlePaths.resolve(p)
+            return str(paths.adapter_safetensors), Manifest.load(paths.manifest)
+        return checkpoint, None
 
     parsed = parse_bundle_uri(checkpoint)
     if parsed.is_local:
         local = Path(parsed.path)
         if local.is_file():
-            return str(local)
+            return str(local), None
         if local.is_dir() and (local / MANIFEST_FILENAME).is_file():
             paths = resolve_bundle(parsed)
-            return str(paths.adapter_safetensors)
+            return str(paths.adapter_safetensors), Manifest.load(paths.manifest)
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
 
     # Remote URI (hf://). Resolve to a local bundle and return its adapter file.
     paths = resolve_bundle(parsed)
-    return str(paths.adapter_safetensors)
+    return str(paths.adapter_safetensors), Manifest.load(paths.manifest)
+
+
+def _resolve_checkpoint_arg(checkpoint: str) -> str:
+    """Map a ``--checkpoint`` value to a concrete weights path.
+
+    Thin wrapper over :func:`_resolve_checkpoint_and_manifest` for callers that
+    only need the weights path.
+    """
+    return _resolve_checkpoint_and_manifest(checkpoint)[0]
+
+
+def _verify_bundle_base_hash(model, manifest) -> None:
+    """Refuse to serve a bundle whose base model is incompatible.
+
+    Mirrors the check ``build_adapter_entry`` runs in catalog mode: the bundle's
+    manifest records the ``base_model_hash`` (trunk structure) it was trained
+    against; if the base ``model`` we just loaded hashes to something else, the
+    adapter/head weights were built for a different architecture and would load
+    incorrectly. ``compute_base_model_hash`` is structural and invariant to the
+    applied adapters/merge, so it is safe to call on the fully-loaded model.
+    """
+    from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        compute_base_model_hash,
+    )
+
+    actual_hash = compute_base_model_hash(model)
+    if actual_hash != manifest.base_model_hash:
+        raise ValueError(
+            f"Bundle {manifest.id!r} declares base_model_hash="
+            f"{manifest.base_model_hash!r} but the base model hashes to "
+            f"{actual_hash!r}. Refusing to serve an adapter on an incompatible "
+            f"base — check that --weights matches the model the bundle was "
+            f"trained against, or rebuild the bundle."
+        )
 
 
 def _finetuned_default_organism(meta: dict) -> int:
@@ -292,7 +335,7 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         with open(args.transfer_config) as f:
             transfer_config = transfer_config_from_dict(json.load(f))
 
-    checkpoint_path = _resolve_checkpoint_arg(args.checkpoint)
+    checkpoint_path, manifest = _resolve_checkpoint_and_manifest(args.checkpoint)
 
     model, meta = load_finetuned_model(
         checkpoint_path=checkpoint_path,
@@ -302,6 +345,12 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         transfer_config=transfer_config,
         merge=not args.no_merge_adapters,
     )
+    # Bundle serving must honour the same base-model compatibility guarantee as
+    # catalog mode (documented in docs/serving/adapters.rst). The manifest holds
+    # the only copy of base_model_hash — the delta safetensors does not embed it
+    # — so verify here now that resolution no longer discards the manifest.
+    if manifest is not None:
+        _verify_bundle_base_hash(model, manifest)
     metadata_catalog = _resolve_finetuned_metadata_catalog(args, meta)
     runtime = AlphaGenomePredictionRuntime(
         model=model,
