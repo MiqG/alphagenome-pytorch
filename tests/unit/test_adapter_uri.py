@@ -301,6 +301,85 @@ class TestServeCheckpointResolution:
             _resolve_checkpoint_arg(f"local:{tmp_path / 'nope'}")
 
 
+class TestServeCheckpointManifestResolution:
+    """``_resolve_checkpoint_and_manifest`` must surface the bundle manifest so
+    singleton serving can verify ``base_model_hash`` (it used to be discarded)."""
+
+    def test_bundle_dir_returns_manifest(self, tmp_path: Path) -> None:
+        from alphagenome_pytorch.extensions.serving.cli import (
+            _resolve_checkpoint_and_manifest,
+        )
+
+        bundle = _make_local_bundle(tmp_path, name="wtc11")
+        path, manifest = _resolve_checkpoint_and_manifest(str(bundle))
+        assert path == str(bundle / DEFAULT_ADAPTER_FILENAME)
+        assert manifest is not None
+        assert manifest.id == "wtc11"
+        assert manifest.base_model_hash == "sha256:demo"
+
+    def test_local_uri_returns_manifest(self, tmp_path: Path) -> None:
+        from alphagenome_pytorch.extensions.serving.cli import (
+            _resolve_checkpoint_and_manifest,
+        )
+
+        bundle = _make_local_bundle(tmp_path)
+        _, manifest = _resolve_checkpoint_and_manifest(f"local:{bundle}")
+        assert manifest is not None
+        assert manifest.base_model_hash == "sha256:demo"
+
+    def test_bare_file_has_no_manifest(self, tmp_path: Path) -> None:
+        from alphagenome_pytorch.extensions.serving.cli import (
+            _resolve_checkpoint_and_manifest,
+        )
+
+        f = tmp_path / "ck.delta.pth"
+        f.write_bytes(b"x")
+        path, manifest = _resolve_checkpoint_and_manifest(str(f))
+        assert path == str(f)
+        assert manifest is None
+
+
+class TestVerifyBundleBaseHash:
+    """``_verify_bundle_base_hash`` gives singleton bundle serving the same
+    base-model compatibility guard catalog mode has."""
+
+    @staticmethod
+    def _tiny_model():
+        import torch.nn as nn
+
+        class _Tiny(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.q_proj = nn.Linear(8, 8)
+                self.heads = nn.ModuleDict()
+
+        return _Tiny()
+
+    def test_passes_on_matching_hash(self) -> None:
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            compute_base_model_hash,
+        )
+        from alphagenome_pytorch.extensions.serving.cli import (
+            _verify_bundle_base_hash,
+        )
+
+        model = self._tiny_model()
+        manifest = Manifest(
+            id="ok", base_model_hash=compute_base_model_hash(model)
+        )
+        _verify_bundle_base_hash(model, manifest)  # must not raise
+
+    def test_raises_on_mismatch(self) -> None:
+        from alphagenome_pytorch.extensions.serving.cli import (
+            _verify_bundle_base_hash,
+        )
+
+        model = self._tiny_model()
+        manifest = Manifest(id="bad", base_model_hash="sha256:not-the-real-hash")
+        with pytest.raises(ValueError, match="incompatible"):
+            _verify_bundle_base_hash(model, manifest)
+
+
 # ---------------------------------------------------------------------------
 # CLI wiring: agt adapters pull (with mocked HF)
 # ---------------------------------------------------------------------------
