@@ -48,7 +48,7 @@ SEQUENCE_LENGTH_1MB = 2**20  # 1_048_576
 # The four values here are the *standard* crop sizes — they mirror the upstream
 # dna_client menu — but they are not the model's actual limits. Length validation
 # is delegated to ``validate_sequence_length`` (below), which accepts any
-# multiple of 128 within the trained range, so fine-tuned models (e.g.
+# multiple of 2048 within the trained range, so fine-tuned models (e.g.
 # encoder-only MPRA models trained on short windows) can be served at their
 # native length instead of being forced onto one of these four sizes.
 SUPPORTED_SEQUENCE_LENGTHS: Mapping[str, int] = {
