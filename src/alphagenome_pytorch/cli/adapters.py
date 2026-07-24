@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from alphagenome_pytorch.cli._output import emit_error, emit_json, emit_text
+from alphagenome_pytorch.cli._output import emit_json, emit_text
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -46,6 +46,9 @@ def _register_export(sub: argparse._SubParsersAction) -> None:
                    help="Human-readable label.")
     p.add_argument("--base-model", dest="base_model_id", default=None,
                    help="Identifier of the base model (e.g. an HF repo).")
+    p.add_argument("--base-model-variant", default=None,
+                   help="Human-readable base checkpoint variant "
+                        "(e.g. fold_1 or all_folds).")
     p.add_argument("--base-weights", default=None,
                    help="Base weights file. Required for safetensors-source exports "
                         "to compute base_model_hash; also computes the exact "
@@ -205,6 +208,7 @@ def _run_export(args: argparse.Namespace) -> int:
         base_model_weights_hash=base_weights_hash,
         label=args.label,
         base_model_id=args.base_model_id,
+        base_model_variant=args.base_model_variant,
         alphagenome_pytorch_version=summary.get("alphagenome_pytorch_version") or ag_version,
         adapter_summary=summary.get("adapter_summary", {}),
         genome=args.genome,
@@ -240,6 +244,7 @@ def _run_export(args: argparse.Namespace) -> int:
             f"  manifest: alphagenome_adapter.json\n"
             f"  weights:  {adapter_out.name}\n"
             f"  id:       {manifest.id}\n"
+            f"  base variant:  {manifest.base_model_variant or '—'}\n"
             f"  structure hash: {manifest.base_model_hash}\n"
             f"  weights hash:   {manifest.base_model_weights_hash or '—'}"
         )
@@ -553,6 +558,7 @@ def _run_inspect(args: argparse.Namespace) -> int:
         f"  id:           {manifest.id}",
         f"  label:        {manifest.label or '—'}",
         f"  base_model:   {manifest.base_model_id or '—'}",
+        f"  base variant: {manifest.base_model_variant or '—'}",
         f"  structure hash: {manifest.base_model_hash}",
         f"  weights hash:   {manifest.base_model_weights_hash or '—'}",
         f"  ag version:   {manifest.alphagenome_pytorch_version or '—'}",
