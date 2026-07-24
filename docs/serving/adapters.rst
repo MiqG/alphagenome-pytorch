@@ -21,9 +21,17 @@ A bundle is a directory:
 
 The ``adapter.safetensors`` file embeds the ``transfer_config`` (and optional
 ``track_names`` / ``track_metadata``) used to reconstruct the finetuned model
-at load time. The manifest is **display/provenance only**; it does not gate
-loading. The manifest's ``base_model_hash`` is cross-checked against the live
-base at load time and a mismatch raises a clear error.
+at load time. The manifest also gates base-model compatibility:
+
+- ``base_model_hash`` hashes trunk key names, shapes, and dtypes. It detects an
+  incompatible architecture but intentionally does not distinguish folds.
+- ``base_model_weights_hash`` hashes the canonical trunk tensor contents. It
+  identifies the exact base checkpoint/fold and is independent of whether the
+  same tensors were serialized as ``.pth`` or safetensors.
+
+Both are checked when exact provenance is available. Older bundles without
+``base_model_weights_hash`` remain loadable with a warning and receive only the
+structural compatibility check.
 
 Manifest Schema (v1)
 ~~~~~~~~~~~~~~~~~~~~
@@ -36,6 +44,7 @@ Manifest Schema (v1)
      "label": "WTC11 ATAC LoRA",
      "base_model_id": "your-org/alphagenome",
      "base_model_hash": "sha256:abc...",
+     "base_model_weights_hash": "sha256-tensors-v1:def...",
      "alphagenome_pytorch_version": "x.y.z",
      "adapter_summary": {"kinds": ["lora"], "lora_rank": 8, "lora_alpha": 16, "lora_targets": ["q_proj", "v_proj"]},
      "genome": "hg38",
@@ -66,6 +75,18 @@ Build a bundle from an existing delta checkpoint:
      --organism human \
      --modality atac \
      --biosample WTC11 \
+     --out dist/wtc11-atac-lora
+
+New fine-tuning runs record the exact base weights hash automatically. When
+exporting an older checkpoint, pass ``--base-weights`` to add it:
+
+.. code-block:: bash
+
+   agt adapters export \
+     --checkpoint old-run/best.delta.pth \
+     --base-weights fold_3.safetensors \
+     --base-model your-org/alphagenome \
+     --id wtc11-atac-lora \
      --out dist/wtc11-atac-lora
 
 ``--organism`` is an **override**: it is written into the bundle's embedded

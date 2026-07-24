@@ -8,8 +8,11 @@ from __future__ import annotations
 import hashlib
 import os
 import signal
+import struct
+import sys
 import tempfile
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -633,6 +636,110 @@ def compute_base_model_hash(model: nn.Module) -> str:
     return _hash_state_dict_structure(get_trunk_state_dict(model))
 
 
+BASE_MODEL_WEIGHTS_HASH_VERSION = "sha256-tensors-v1"
+
+
+def _hash_framed_bytes(hasher: Any, value: bytes) -> None:
+    """Hash a byte string with an unambiguous little-endian length prefix."""
+    hasher.update(struct.pack("<Q", len(value)))
+    hasher.update(value)
+
+
+def _canonical_tensor_bytes(tensor: torch.Tensor) -> bytes:
+    """Return contiguous tensor bytes in canonical little-endian order."""
+    tensor = tensor.detach().cpu().contiguous()
+    # Flatten first because PyTorch cannot reinterpret a zero-dimensional
+    # scalar as a dtype with a different element size.
+    raw = tensor.reshape(-1).view(torch.uint8).numpy().tobytes(order="C")
+    if sys.byteorder == "little" or tensor.element_size() == 1:
+        return raw
+
+    # Tensor storage follows host byte order. Normalize multi-byte elements on
+    # big-endian hosts so the digest is portable across architectures. Complex
+    # values contain two independently endian-sensitive scalar components.
+    element_size = (
+        tensor.element_size() // 2 if tensor.is_complex() else tensor.element_size()
+    )
+    return b"".join(
+        raw[offset : offset + element_size][::-1]
+        for offset in range(0, len(raw), element_size)
+    )
+
+
+def _hash_state_dict_weights(state_dict: Mapping[str, torch.Tensor]) -> str:
+    """Hash canonical tensor names, metadata, and numerical contents."""
+    hasher = hashlib.sha256()
+    hasher.update(b"alphagenome-base-model-weights\0v1\0")
+    for key in sorted(state_dict):
+        tensor = state_dict[key]
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"State dict value for {key!r} is {type(tensor).__name__}, "
+                "expected a torch.Tensor"
+            )
+        _hash_framed_bytes(hasher, key.encode("utf-8"))
+        _hash_framed_bytes(hasher, str(tensor.dtype).encode("ascii"))
+        hasher.update(struct.pack("<Q", tensor.ndim))
+        for dimension in tensor.shape:
+            hasher.update(struct.pack("<q", dimension))
+        _hash_framed_bytes(hasher, _canonical_tensor_bytes(tensor))
+    return f"{BASE_MODEL_WEIGHTS_HASH_VERSION}:{hasher.hexdigest()}"
+
+
+def compute_base_model_weights_hash(model: nn.Module) -> str:
+    """Compute an exact, serialization-independent hash of trunk tensor values.
+
+    Unlike :func:`compute_base_model_hash`, this identifies the numerical base
+    weights (and therefore a particular fold/checkpoint), not merely a
+    compatible architecture. Heads and adapters are excluded and adapter key
+    paths are normalized, matching the structural hash's trunk definition.
+    """
+    return _hash_state_dict_weights(get_trunk_state_dict(model))
+
+
+def _load_base_weights_state_dict(path: Path | str) -> dict[str, torch.Tensor]:
+    """Load a base weights file and return its normalized trunk tensors."""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Base weights file not found: {path}")
+
+    if path.suffix == ".safetensors":
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:
+            raise ImportError(
+                "safetensors not installed. Install with: pip install safetensors"
+            ) from exc
+        loaded: Any = load_file(str(path), device="cpu")
+    else:
+        loaded = torch.load(str(path), map_location="cpu", weights_only=True)
+
+    # Accept both the normal bare state dict and common checkpoint wrappers.
+    if isinstance(loaded, Mapping) and isinstance(
+        loaded.get("model_state_dict"), Mapping
+    ):
+        loaded = loaded["model_state_dict"]
+    elif isinstance(loaded, Mapping) and isinstance(loaded.get("state_dict"), Mapping):
+        loaded = loaded["state_dict"]
+    if not isinstance(loaded, Mapping):
+        raise ValueError(f"Base weights file {path} does not contain a state dict")
+
+    state_dict = _strip_orig_mod(dict(loaded))
+    trunk = {
+        key: value
+        for key, value in state_dict.items()
+        if isinstance(value, torch.Tensor) and not key.startswith(_HEAD_PREFIXES)
+    }
+    if not trunk:
+        raise ValueError(f"Base weights file {path} contains no trunk tensors")
+    return trunk
+
+
+def compute_base_model_weights_hash_from_file(path: Path | str) -> str:
+    """Hash base trunk tensor values independently of ``.pth``/safetensors."""
+    return _hash_state_dict_weights(_load_base_weights_state_dict(path))
+
+
 def save_delta_checkpoint(
     path: Path | str,
     model: nn.Module,
@@ -640,6 +747,7 @@ def save_delta_checkpoint(
     base_model_hash: str | None = None,
     optimizer: Optimizer | None = None,
     scheduler: LRScheduler | None = None,
+    base_model_weights_hash: str | None = None,
     **metadata: Any,
 ) -> None:
     """Save a delta checkpoint containing only adapter and new head weights.
@@ -661,6 +769,10 @@ def save_delta_checkpoint(
             adapters and new heads, with normalized key paths).
         optimizer: Optional optimizer to save state for training resume.
         scheduler: Optional LR scheduler to save state for training resume.
+        base_model_weights_hash: Optional exact hash of the pristine base
+            model's trunk tensor values. This cannot be derived safely from a
+            model after fine-tuning, so callers should compute it from the
+            original weights file before training.
         **metadata: Additional metadata (``epoch``, ``val_loss``,
             ``track_names``, ``modality``, ``resolutions``,
             ``track_metadata``, etc.). ``track_metadata`` should be a
@@ -724,6 +836,7 @@ def save_delta_checkpoint(
         "head_state_dict": head_state_dict,
         "norm_state_dict": norm_state_dict,
         "base_model_hash": base_model_hash,
+        "base_model_weights_hash": base_model_weights_hash,
         "metadata": {
             "created_at": datetime.now(timezone.utc).isoformat(),
             **metadata,
@@ -883,6 +996,8 @@ def load_delta_checkpoint(
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
     metadata = checkpoint.get("metadata", {})
+    if checkpoint.get("base_model_weights_hash") is not None:
+        metadata["base_model_weights_hash"] = checkpoint["base_model_weights_hash"]
     metadata["has_optimizer_state"] = has_optimizer_state
     metadata["has_scheduler_state"] = has_scheduler_state
     return config, metadata
@@ -944,6 +1059,7 @@ def export_delta_weights(
     track_metadata: list[dict[str, Any]] | None = None,
     organism: str | None = None,
     organism_indices: list[int] | None = None,
+    base_model_weights_hash: str | None = None,
 ) -> None:
     """Export only delta weights (adapters + new heads) for sharing.
 
@@ -969,6 +1085,8 @@ def export_delta_weights(
             (e.g. ``[1]`` for mouse). Validated at export against the model's
             ``num_organisms``; if both ``organism`` and ``organism_indices`` are
             given, the scalar must be a member of the plural set.
+        base_model_weights_hash: Optional exact hash of the pristine base
+            model trunk tensors.
 
     Example:
         >>> # Export just the LoRA weights + head for sharing
@@ -1037,6 +1155,8 @@ def export_delta_weights(
             extras["organism"] = organism
         if norm_organism_indices is not None:
             extras["organism_indices"] = list(norm_organism_indices)
+        if base_model_weights_hash is not None:
+            extras["base_model_weights_hash"] = base_model_weights_hash
         # safetensors metadata must be str -> str
         metadata = {k: json.dumps(v) for k, v in extras.items()}
         save_file({k: v.cpu() for k, v in weights.items()}, path, metadata=metadata)
@@ -1052,6 +1172,8 @@ def export_delta_weights(
             extras["organism"] = organism
         if norm_organism_indices is not None:
             extras["organism_indices"] = list(norm_organism_indices)
+        if base_model_weights_hash is not None:
+            extras["base_model_weights_hash"] = base_model_weights_hash
         torch.save({"weights": weights, **extras}, path)
     else:
         raise ValueError(f"Unknown format: {format}. Use 'safetensors' or 'pth'.")
@@ -1093,6 +1215,10 @@ def _read_delta_export_header(path: Path | str) -> dict[str, Any]:
             header["organism"] = json.loads(metadata["organism"])
         if "organism_indices" in metadata:
             header["organism_indices"] = json.loads(metadata["organism_indices"])
+        if "base_model_weights_hash" in metadata:
+            header["base_model_weights_hash"] = json.loads(
+                metadata["base_model_weights_hash"]
+            )
     else:
         data = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(data, dict) or "transfer_config" not in data:
@@ -1108,6 +1234,8 @@ def _read_delta_export_header(path: Path | str) -> dict[str, Any]:
             header["organism"] = data["organism"]
         if "organism_indices" in data:
             header["organism_indices"] = data["organism_indices"]
+        if "base_model_weights_hash" in data:
+            header["base_model_weights_hash"] = data["base_model_weights_hash"]
 
     return header
 
@@ -1471,6 +1599,8 @@ def load_finetuned_model(
         embedded a metadata catalog; otherwise ``None``),
         ``organism`` (``"human"``/``"mouse"`` the tracks were trained on,
         or ``None`` for older checkpoints that predate this field),
+        ``base_model_weights_hash`` (exact base checkpoint identity when
+        recorded),
         ``epoch``, ``val_loss``, ``head_names``.
 
     Supported formats: delta checkpoint (``.delta.pth`` from
@@ -1549,6 +1679,7 @@ def load_finetuned_model(
             "track_metadata": header.get("track_metadata"),
             "organism": header.get("organism"),
             "organism_indices": header.get("organism_indices"),
+            "base_model_weights_hash": header.get("base_model_weights_hash"),
             "epoch": -1,
             "val_loss": None,
             "head_names": list(config.new_heads.keys()),
@@ -1595,6 +1726,7 @@ def load_finetuned_model(
             "track_metadata": metadata.get("track_metadata"),
             "organism": metadata.get("organism"),
             "organism_indices": metadata.get("organism_indices"),
+            "base_model_weights_hash": metadata.get("base_model_weights_hash"),
             "epoch": metadata.get("epoch", -1),
             "val_loss": metadata.get("val_loss"),
             "head_names": head_names,
@@ -1609,6 +1741,7 @@ def load_finetuned_model(
             "track_metadata": ckpt.get("track_metadata"),
             "organism": ckpt.get("organism"),
             "organism_indices": ckpt.get("organism_indices"),
+            "base_model_weights_hash": ckpt.get("base_model_weights_hash"),
         }
         return _finalize_delta_export(header, ckpt["weights"])
 
@@ -1681,6 +1814,7 @@ def load_finetuned_model(
         "track_metadata": ckpt.get("track_metadata"),
         "organism": ckpt.get("organism"),
         "organism_indices": ckpt.get("organism_indices"),
+        "base_model_weights_hash": ckpt.get("base_model_weights_hash"),
         "epoch": ckpt.get("epoch", -1),
         "val_loss": ckpt.get("val_loss"),
         "head_names": head_names,
@@ -1718,7 +1852,10 @@ __all__ = [
     "split_model_state_dict",
     "get_trunk_state_dict",
     "get_adapter_state_dict",
+    "compute_base_model_hash",
+    "compute_base_model_weights_hash",
+    "compute_base_model_weights_hash_from_file",
+    "BASE_MODEL_WEIGHTS_HASH_VERSION",
     "get_new_head_state_dict",
     "get_norm_state_dict",
-    "compute_base_model_hash",
 ]

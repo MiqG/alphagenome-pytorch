@@ -160,15 +160,19 @@ def build_adapter_entry(
     scorer: Any | None = None,
     default_organism: int | None = None,
     runtime: Any | None = None,
+    base_model_weights_hash: str | None = None,
 ) -> ServedModelEntry:
     """Build a :class:`ServedModelEntry` for an adapter bundle.
 
     Mutates ``base_model`` to apply the bundle's ``TransferConfig`` and load
     delta weights, then captures the wrappers + new heads and *detaches* them
-    so ``base_model`` is left in its original clean state.
+    so ``base_model`` is left in its original clean state. When available,
+    ``base_model_weights_hash`` should be computed from the source weights file;
+    direct callers that omit it fall back to hashing the live model.
     """
     from alphagenome_pytorch.extensions.finetuning.checkpointing import (
         compute_base_model_hash,
+        compute_base_model_weights_hash,
         load_delta_config,
         load_delta_weights,
     )
@@ -186,6 +190,17 @@ def build_adapter_entry(
             f"{manifest.base_model_hash!r} but base model hashes to "
             f"{actual_hash!r}. Refusing to load incompatible adapter."
         )
+    if manifest.base_model_weights_hash is not None:
+        actual_weights_hash = base_model_weights_hash
+        if actual_weights_hash is None:
+            actual_weights_hash = compute_base_model_weights_hash(base_model)
+        if actual_weights_hash != manifest.base_model_weights_hash:
+            raise ValueError(
+                f"Bundle {manifest.id!r} declares base_model_weights_hash="
+                f"{manifest.base_model_weights_hash!r} but the supplied base "
+                f"hashes to {actual_weights_hash!r}. Refusing to load an adapter "
+                "on a different base checkpoint/fold."
+            )
 
     new_head_names = list(transfer_config.new_heads.keys())
 
@@ -401,6 +416,7 @@ class ServedModelRouter:
                 "base_model_hash": e.base_model_hash,
             }
             if e.manifest is not None:
+                row["base_model_weights_hash"] = e.manifest.base_model_weights_hash
                 row["genome"] = e.manifest.genome
                 row["organism"] = e.manifest.organism
                 row["modalities"] = e.manifest.modalities
