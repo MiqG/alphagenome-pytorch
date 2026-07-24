@@ -328,25 +328,27 @@ Adapter bundle exported by `agt adapters export`.
 Install the CLI (`pip install 'alphagenome-pytorch[hf]'`), then fetch this
 bundle and run it against a base model.
 
-Download the bundle from this repo (prints its local path):
+Download the bundle (this prints its local path) and point `FASTA` at the
+reference genome your loci are relative to{genome_hint} — both `agt predict` and
+`agt serve` require it:
 
 ```bash
 BUNDLE=$(agt adapters pull hf://<org>/<repo>)
+FASTA=/path/to/reference.fa
 ```
 
-{predict_intro} `--fasta` points at the reference genome the loci are relative to
-(e.g. hg38 for human); `agt predict` and `agt serve` both require it.
+{predict_intro}
 
 ```bash
 agt predict --model base.safetensors --checkpoint "$BUNDLE/{adapter_filename}" \\
-    --fasta hg38.fa \\
+    --fasta "$FASTA" \\
     --head {head} --locus chr1:1000000-1131072 --output ./predictions
 ```
 
 Or serve it behind the AlphaGenome API:
 
 ```bash
-agt serve --weights base.safetensors --checkpoint "$BUNDLE" --fasta hg38.fa
+agt serve --weights base.safetensors --checkpoint "$BUNDLE" --fasta "$FASTA"
 ```
 
 `agt serve` takes the bundle *directory* (`"$BUNDLE"`), not the inner
@@ -393,7 +395,13 @@ def render_model_card(manifest: Manifest) -> str:
         )
     else:
         predict_intro = "Run one-off predictions:"
+    # Name the reference genome when the manifest records it, so a non-human
+    # bundle doesn't leave the reader guessing (or assuming hg38). Kept as a hint
+    # beside the neutral ``FASTA`` variable — ``genome`` is a build label like
+    # "mm10", not a path, so it can't be dropped straight into ``--fasta``.
+    genome_hint = f" (this bundle was trained on {manifest.genome})" if manifest.genome else ""
     return _MODEL_CARD_TEMPLATE.format(
+        genome_hint=genome_hint,
         base_model_block=base_model_block,
         license=manifest.license or "unknown",
         tag_block=tag_block,
