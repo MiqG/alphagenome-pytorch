@@ -46,8 +46,8 @@ Manifest Schema (v1)
 
    {
      "schema_version": 1,
-     "id": "wtc11-atac-lora",
-     "label": "WTC11 ATAC LoRA",
+     "id": "k562-atac-lora",
+     "label": "K562 ATAC LoRA",
      "base_model_id": "your-org/alphagenome",
      "base_model_variant": "fold_1",
      "base_model_hash": "sha256:abc...",
@@ -57,8 +57,8 @@ Manifest Schema (v1)
      "genome": "hg38",
      "organism": "human",
      "modalities": ["atac"],
-     "biosample": "WTC11",
-     "heads": ["atac_wtc11"],
+     "biosample": "K562",
+     "heads": ["atac_k562"],
      "num_tracks": 4,
      "metrics_path": "metrics.json",
      "license": "apache-2.0",
@@ -74,22 +74,25 @@ Build a bundle from an existing delta checkpoint:
 .. code-block:: bash
 
    agt adapters export \
-     --checkpoint runs/wtc11-atac/best.delta.pth \
+     --checkpoint runs/k562-atac/best.delta.pth \
      --base-model your-org/alphagenome \
      --base-model-variant fold_1 \
      --base-weights fold_1.safetensors \
-     --id wtc11-atac-lora \
-     --label "WTC11 ATAC LoRA" \
+     --id k562-atac-lora \
+     --label "K562 ATAC LoRA" \
      --genome hg38 \
      --organism human \
      --modality atac \
-     --biosample WTC11 \
-     --out dist/wtc11-atac-lora
+     --biosample K562 \
+     --out dist/k562-atac-lora
 
 Use ``--base-model-variant`` to record the readable fold/checkpoint name.
 ``--base-weights`` computes the exact, serialization-independent weights hash
 from the base file. New fine-tuning runs embed that hash automatically, but
-older checkpoints require ``--base-weights``:
+older checkpoints require ``--base-weights``. When a checkpoint already embeds
+the hash, export verifies that ``--base-weights`` matches it and rejects a
+different fold. The resolved hash is written to both the manifest and the
+exported ``adapter.safetensors`` metadata:
 
 .. code-block:: bash
 
@@ -98,8 +101,8 @@ older checkpoints require ``--base-weights``:
      --base-weights fold_3.safetensors \
      --base-model your-org/alphagenome \
      --base-model-variant fold_3 \
-     --id wtc11-atac-lora \
-     --out dist/wtc11-atac-lora
+     --id k562-atac-lora \
+     --out dist/k562-atac-lora
 
 ``--organism`` is an **override**: it is written into the bundle's embedded
 delta metadata (``organism`` / ``organism_indices``), not just the manifest, so
@@ -111,21 +114,21 @@ Inspect or validate before sharing:
 
 .. code-block:: bash
 
-   agt adapters inspect dist/wtc11-atac-lora
-   agt adapters validate dist/wtc11-atac-lora --base-weights model.pth
-
-Pull a bundle (local or Hugging Face) and print its resolved local path:
-
-.. code-block:: bash
-
-   agt adapters pull hf://your-org/alphagenome-wtc11-atac-lora
+   agt adapters inspect dist/k562-atac-lora
+   agt adapters validate dist/k562-atac-lora --base-weights model.pth
 
 Publish a bundle to the Hugging Face Hub (requires the ``hf`` extra,
 ``pip install 'alphagenome-pytorch[hf]'``):
 
 .. code-block:: bash
 
-   agt adapters publish dist/wtc11-atac-lora hf://your-org/alphagenome-wtc11-atac-lora
+   agt adapters publish dist/k562-atac-lora hf://your-org/alphagenome-k562-atac-lora
+
+Pull a bundle (local or Hugging Face) and print its resolved local path:
+
+.. code-block:: bash
+
+   agt adapters pull hf://your-org/alphagenome-k562-atac-lora
 
 URI Forms
 ~~~~~~~~~
@@ -137,6 +140,13 @@ the following are recognized:
 - ``file:///abs/path`` — local URL.
 - ``hf://org/repo[/subdir][@revision]`` — Hugging Face Hub.
 
+Hugging Face subdirectory URIs are supported for storing and resolving multiple
+bundles in one repository. However, the Hub only recognizes the repository-root
+``README.md`` and metadata as its model card. To take advantage of adapter model
+cards, ``base_model`` links, and the standard Hub model interface, create a
+separate Hugging Face repository for each adapter and publish the bundle at the
+repository root.
+
 Singleton Serving
 -----------------
 
@@ -147,7 +157,7 @@ The existing ``--checkpoint`` flag accepts a delta checkpoint, a delta-weights
 
    agt serve \
      --weights base.safetensors \
-     --checkpoint hf://your-org/alphagenome-wtc11-atac-lora \
+     --checkpoint hf://your-org/alphagenome-k562-atac-lora \
      --fasta hg38.fa \
      --rest-port 8080
 
@@ -170,8 +180,8 @@ Catalog file (``adapters.yaml``):
      id: alphagenome-base               # optional; if present, base is also served
      label: AlphaGenome (base)
    adapters:
-     - id: wtc11-atac-lora
-       source: hf://your-org/alphagenome-wtc11-atac-lora
+     - id: k562-atac-lora
+       source: hf://your-org/alphagenome-k562-atac-lora
      - id: k562-rna-locon
        source: local:/srv/bundles/k562-rna-locon
 
