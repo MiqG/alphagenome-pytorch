@@ -160,6 +160,8 @@ def _run_export(args: argparse.Namespace) -> int:
         README_FILENAME,
         Manifest,
         render_model_card,
+        short_base_model_hash,
+        short_base_model_weights_hash,
     )
 
     src = Path(args.checkpoint)
@@ -245,8 +247,9 @@ def _run_export(args: argparse.Namespace) -> int:
             f"  weights:  {adapter_out.name}\n"
             f"  id:       {manifest.id}\n"
             f"  base variant:  {manifest.base_model_variant or '—'}\n"
-            f"  structure hash: {manifest.base_model_hash}\n"
-            f"  weights hash:   {manifest.base_model_weights_hash or '—'}"
+            f"  structure hash: {short_base_model_hash(manifest.base_model_hash)}\n"
+            f"  weights hash:   "
+            f"{short_base_model_weights_hash(manifest.base_model_weights_hash)}"
         )
     return 0
 
@@ -535,6 +538,8 @@ def _run_inspect(args: argparse.Namespace) -> int:
     from alphagenome_pytorch.extensions.serving.bundle import (
         BundlePaths,
         Manifest,
+        short_base_model_hash,
+        short_base_model_weights_hash,
     )
 
     paths = BundlePaths.resolve(args.bundle_dir)
@@ -559,8 +564,9 @@ def _run_inspect(args: argparse.Namespace) -> int:
         f"  label:        {manifest.label or '—'}",
         f"  base_model:   {manifest.base_model_id or '—'}",
         f"  base variant: {manifest.base_model_variant or '—'}",
-        f"  structure hash: {manifest.base_model_hash}",
-        f"  weights hash:   {manifest.base_model_weights_hash or '—'}",
+        f"  structure hash: {short_base_model_hash(manifest.base_model_hash)}",
+        f"  weights hash:   "
+        f"{short_base_model_weights_hash(manifest.base_model_weights_hash)}",
         f"  ag version:   {manifest.alphagenome_pytorch_version or '—'}",
         f"  genome:       {manifest.genome or '—'}",
         f"  organism:     {manifest.organism or '—'}",

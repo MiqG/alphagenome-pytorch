@@ -127,6 +127,16 @@ class Manifest:
         p.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n")
 
 
+def short_base_model_hash(value: str | None) -> str:
+    """Return a 16-character digest shorthand for human-facing output."""
+    if not value:
+        return "—"
+    return value.rsplit(":", 1)[-1][:16]
+
+
+short_base_model_weights_hash = short_base_model_hash
+
+
 @dataclass
 class BundlePaths:
     """Resolved on-disk locations within a bundle directory."""
@@ -251,13 +261,16 @@ def validate_bundle(
     if base_model is not None:
         try:
             from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+                base_model_structure_hashes_match,
                 compute_base_model_hash,
             )
             actual_hash = compute_base_model_hash(base_model)
         except Exception as exc:
             errors.append(f"Could not compute base_model_hash: {exc}")
         else:
-            if actual_hash != manifest.base_model_hash:
+            if not base_model_structure_hashes_match(
+                actual_hash, manifest.base_model_hash
+            ):
                 errors.append(
                     f"base_model_hash mismatch: manifest declares "
                     f"{manifest.base_model_hash!r} but supplied base model "
@@ -419,8 +432,10 @@ def render_model_card(manifest: Manifest) -> str:
         biosample=manifest.biosample or "—",
         base_model_id=manifest.base_model_id or "—",
         base_model_variant=manifest.base_model_variant or "—",
-        base_model_hash=manifest.base_model_hash,
-        base_model_weights_hash=manifest.base_model_weights_hash or "—",
+        base_model_hash=short_base_model_hash(manifest.base_model_hash),
+        base_model_weights_hash=short_base_model_weights_hash(
+            manifest.base_model_weights_hash
+        ),
         ag_version=manifest.alphagenome_pytorch_version or "—",
         adapter_filename=manifest.adapter_filename,
         head=head,

@@ -610,7 +610,25 @@ def _hash_state_dict_structure(state_dict: dict[str, torch.Tensor]) -> str:
         for key in sorted(state_dict.keys())
     ]
     content = str(items).encode("utf-8")
-    return f"sha256:{hashlib.sha256(content).hexdigest()[:16]}"
+    return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def base_model_structure_hashes_match(left: str, right: str) -> bool:
+    """Compare full structure hashes while accepting legacy 16-hex digests."""
+    if left == right:
+        return True
+    try:
+        left_algorithm, left_digest = left.split(":", 1)
+        right_algorithm, right_digest = right.split(":", 1)
+    except ValueError:
+        return False
+    if left_algorithm != "sha256" or right_algorithm != "sha256":
+        return False
+    if len(left_digest) == 16 and len(right_digest) == 64:
+        return right_digest.startswith(left_digest)
+    if len(right_digest) == 16 and len(left_digest) == 64:
+        return left_digest.startswith(right_digest)
+    return False
 
 
 def compute_base_model_hash(model: nn.Module) -> str:
@@ -954,7 +972,7 @@ def load_delta_checkpoint(
         saved_hash = checkpoint.get("base_model_hash")
         if saved_hash is not None:
             current_hash = compute_base_model_hash(model)
-            if current_hash != saved_hash:
+            if not base_model_structure_hashes_match(current_hash, saved_hash):
                 raise ValueError(
                     f"Base model structure mismatch. "
                     f"Expected hash '{saved_hash}', got '{current_hash}'. "
@@ -1853,6 +1871,7 @@ __all__ = [
     "get_trunk_state_dict",
     "get_adapter_state_dict",
     "compute_base_model_hash",
+    "base_model_structure_hashes_match",
     "compute_base_model_weights_hash",
     "compute_base_model_weights_hash_from_file",
     "BASE_MODEL_WEIGHTS_HASH_VERSION",

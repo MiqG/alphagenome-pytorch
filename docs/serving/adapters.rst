@@ -25,11 +25,17 @@ at load time. The manifest also gates base-model compatibility:
 
 - ``base_model_hash`` hashes trunk key names, shapes, and dtypes. It detects an
   incompatible architecture but intentionally does not distinguish folds.
+- ``base_model_variant`` is the human-readable checkpoint variant supplied at
+  export time, such as ``fold_1`` or ``all_folds``.
 - ``base_model_weights_hash`` hashes the canonical trunk tensor contents. It
   identifies the exact base checkpoint/fold and is independent of whether the
   same tensors were serialized as ``.pth`` or safetensors.
 
-Both are checked when exact provenance is available. Older bundles without
+The variant is display/provenance metadata; the hashes enforce compatibility.
+New manifests store both SHA-256 digests in full. Human-facing CLI output and
+generated model cards show 16-character shorthands; JSON output retains the
+complete values. Legacy 16-character structure hashes remain compatible.
+Older bundles without
 ``base_model_weights_hash`` remain loadable with a warning and receive only the
 structural compatibility check.
 
@@ -43,6 +49,7 @@ Manifest Schema (v1)
      "id": "wtc11-atac-lora",
      "label": "WTC11 ATAC LoRA",
      "base_model_id": "your-org/alphagenome",
+     "base_model_variant": "fold_1",
      "base_model_hash": "sha256:abc...",
      "base_model_weights_hash": "sha256-tensors-v1:def...",
      "alphagenome_pytorch_version": "x.y.z",
@@ -69,6 +76,8 @@ Build a bundle from an existing delta checkpoint:
    agt adapters export \
      --checkpoint runs/wtc11-atac/best.delta.pth \
      --base-model your-org/alphagenome \
+     --base-model-variant fold_1 \
+     --base-weights fold_1.safetensors \
      --id wtc11-atac-lora \
      --label "WTC11 ATAC LoRA" \
      --genome hg38 \
@@ -77,8 +86,10 @@ Build a bundle from an existing delta checkpoint:
      --biosample WTC11 \
      --out dist/wtc11-atac-lora
 
-New fine-tuning runs record the exact base weights hash automatically. When
-exporting an older checkpoint, pass ``--base-weights`` to add it:
+Use ``--base-model-variant`` to record the readable fold/checkpoint name.
+``--base-weights`` computes the exact, serialization-independent weights hash
+from the base file. New fine-tuning runs embed that hash automatically, but
+older checkpoints require ``--base-weights``:
 
 .. code-block:: bash
 
@@ -86,6 +97,7 @@ exporting an older checkpoint, pass ``--base-weights`` to add it:
      --checkpoint old-run/best.delta.pth \
      --base-weights fold_3.safetensors \
      --base-model your-org/alphagenome \
+     --base-model-variant fold_3 \
      --id wtc11-atac-lora \
      --out dist/wtc11-atac-lora
 

@@ -171,6 +171,7 @@ def build_adapter_entry(
     direct callers that omit it fall back to hashing the live model.
     """
     from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        base_model_structure_hashes_match,
         compute_base_model_hash,
         compute_base_model_weights_hash,
         load_delta_config,
@@ -184,7 +185,7 @@ def build_adapter_entry(
     _ensure_swappable_config(transfer_config)
 
     actual_hash = compute_base_model_hash(base_model)
-    if actual_hash != manifest.base_model_hash:
+    if not base_model_structure_hashes_match(actual_hash, manifest.base_model_hash):
         raise ValueError(
             f"Bundle {manifest.id!r} declares base_model_hash="
             f"{manifest.base_model_hash!r} but base model hashes to "

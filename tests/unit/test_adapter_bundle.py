@@ -28,6 +28,8 @@ from alphagenome_pytorch.extensions.serving.bundle import (
     SCHEMA_VERSION,
     adapter_summary_kinds,
     render_model_card,
+    short_base_model_hash,
+    short_base_model_weights_hash,
     validate_bundle,
 )
 
@@ -191,6 +193,15 @@ class TestManifest:
         })
         assert m.id == "x"
         assert not hasattr(m, "future_field")
+
+    def test_weights_hash_shorthand(self) -> None:
+        full_hash = "sha256-tensors-v1:" + "0123456789abcdef" + "a" * 48
+        assert short_base_model_weights_hash(full_hash) == "0123456789abcdef"
+        assert (
+            short_base_model_hash("sha256:fedcba9876543210" + "b" * 48)
+            == "fedcba9876543210"
+        )
+        assert short_base_model_weights_hash(None) == "—"
 
     def test_load_missing_file_raises(self, tmp_path: Path) -> None:
         with pytest.raises(BundleError, match="not found"):
@@ -388,7 +399,9 @@ class TestExportCli:
         )
         header = _read_delta_export_header(BundlePaths.resolve(out).adapter_safetensors)
         assert header["base_model_weights_hash"] == exact_hash
-        assert exact_hash in render_model_card(manifest)
+        card = render_model_card(manifest)
+        assert "a" * 16 in card
+        assert exact_hash not in card
 
     def test_export_from_delta_pth(self, tmp_path: Path) -> None:
         src = _write_delta_pth(tmp_path, base_hash="sha256:from-ckpt")
@@ -573,7 +586,7 @@ class TestInspectCli:
         assert rc == 0
         out = buf.getvalue()
         assert "demo" in out
-        assert "sha256:demo" in out
+        assert "structure hash: demo" in out
         assert "lora" in out
 
     def test_inspect_json(self, tmp_path: Path) -> None:
@@ -655,7 +668,7 @@ class TestModelCard:
         assert "base_model_relation: adapter" in card
         assert "| Base model variant | `fold_1` |" in card
         assert "WTC11 ATAC LoRA" in card
-        assert "sha256:abc" in card
+        assert "| Base model structure hash | `abc` |" in card
         assert "atac" in card
 
     def test_render_includes_pull_predict_serve_usage(self) -> None:
