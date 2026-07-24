@@ -632,12 +632,33 @@ class TestModelCard:
         assert '--checkpoint "$BUNDLE/adapter.safetensors"' in card
         # Both runnable commands must include --fasta — both CLIs require it, so a
         # copy-paste without it fails (predict raises, serve exits on argparse).
-        assert card.count("--fasta") >= 2
+        assert card.count('--fasta "$FASTA"') >= 2
+        # The FASTA path is a neutral variable, never a hard-coded genome, so the
+        # instructions aren't misleading for a mouse/other-genome bundle.
+        assert "FASTA=/path/to/reference.fa" in card
+        assert "hg38.fa" not in card
         # serve takes the bundle *directory* so the manifest (and its base-model
         # hash check) is preserved; passing the inner file would skip it.
-        assert 'agt serve --weights base.safetensors --checkpoint "$BUNDLE" --fasta' in card
+        assert 'agt serve --weights base.safetensors --checkpoint "$BUNDLE" --fasta "$FASTA"' in card
         # predict's --head uses a real head name from the bundle.
         assert "--head atac_wtc11" in card
+
+    def test_fasta_hint_names_the_genome_when_known(self) -> None:
+        # A non-human bundle must not imply hg38: when the manifest records the
+        # genome, the card names it beside the neutral $FASTA variable.
+        mouse = Manifest(
+            id="mm10-atac", base_model_hash="sha256:abc",
+            heads=["atac_mouse"], genome="mm10",
+        )
+        card = render_model_card(mouse)
+        assert "mm10" in card
+        assert "hg38" not in card
+        assert "FASTA=/path/to/reference.fa" in card
+        # Unknown genome: no dangling hint, still uses the neutral variable.
+        bare = Manifest(id="x", base_model_hash="sha256:abc", heads=["h"])
+        bare_card = render_model_card(bare)
+        assert "trained on" not in bare_card
+        assert "FASTA=/path/to/reference.fa" in bare_card
 
     def test_multi_head_bundle_shows_counts_and_modalities(self) -> None:
         # A multi-modality fine-tune registers one head per modality; the card
