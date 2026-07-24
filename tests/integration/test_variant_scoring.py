@@ -10,7 +10,6 @@ with the AlphaGenome model. Tests are designed to:
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np

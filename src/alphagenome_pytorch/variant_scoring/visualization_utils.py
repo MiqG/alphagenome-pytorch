@@ -6,9 +6,6 @@ from alphagenome.visualization import plot_components
 from .types import OutputType
 import pandas as pd
 import numpy as np
-import torch
-import matplotlib.patches as mpatches
-from matplotlib.colors import to_rgba
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import logomaker

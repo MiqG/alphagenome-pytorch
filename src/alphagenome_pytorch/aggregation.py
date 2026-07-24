@@ -51,7 +51,6 @@ from typing import TYPE_CHECKING, Any, Sequence
 import torch
 from torch import Tensor
 
-from .metrics import pearson_r
 
 if TYPE_CHECKING:  # avoid importing heavy / optional modules at import time
     import pandas as pd

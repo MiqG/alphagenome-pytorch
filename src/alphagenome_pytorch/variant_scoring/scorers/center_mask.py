@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import torch
 
 from ..aggregations import compute_aggregation, create_center_mask
 from ..types import AggregationType, Interval, OutputType, Variant, VariantScore

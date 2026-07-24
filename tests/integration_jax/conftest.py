@@ -484,7 +484,6 @@ def param_name_mapping(pytorch_model):
 @pytest.fixture(scope="session")
 def run_jax_per_head_loss(jax_model):
     """Factory fixture to compute per-head losses in JAX."""
-    import jax
     import jax.numpy as jnp
     import haiku as hk
     import jmp

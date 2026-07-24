@@ -1,9 +1,6 @@
 
-import pytest
 import numpy as np
-import torch
 from dataclasses import dataclass
-from typing import Optional
 
 # =============================================================================
 # METRICS AND COMPARISON UTILITIES
@@ -115,9 +112,9 @@ def print_layer_result(result: LayerComparisonResult, verbose: bool = True):
         print(f"{status_marker} LAYER: {result.name} [{status}]")
         print(f"{'='*80}")
         print(f"Shape: {result.shape}")
-        print(f"-"*80)
+        print("-"*80)
         print(f"{'Metric':<25} {'Value':>15} {'Threshold':>15} {'Status':>10}")
-        print(f"-"*80)
+        print("-"*80)
 
         corr_status = "OK" if result.pearson_corr >= 0.9999 else "FAIL"
         print(f"{'Pearson Correlation':<25} {result.pearson_corr:>15.6f} {'>= 0.9999':>15} {corr_status:>10}")
@@ -129,10 +126,10 @@ def print_layer_result(result: LayerComparisonResult, verbose: bool = True):
         scale_status = "OK" if 0.99 <= result.scale_ratio <= 1.01 else "WARN"
         print(f"{'Scale Ratio (PT/JAX)':<25} {result.scale_ratio:>15.6f} {'~1.0':>15} {scale_status:>10}")
 
-        print(f"-"*80)
+        print("-"*80)
         print(f"{'Max Absolute Diff':<25} {result.max_diff:>15.6f}")
         print(f"{'Mean Absolute Diff':<25} {result.mean_diff:>15.6f}")
-        print(f"-"*80)
+        print("-"*80)
         print(f"{'PyTorch std':<25} {result.pt_std:>15.6f}")
         print(f"{'JAX std':<25} {result.jax_std:>15.6f}")
         print(f"{'PyTorch mean':<25} {result.pt_mean:>15.6f}")

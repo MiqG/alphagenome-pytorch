@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from alphagenome_pytorch.cli._deps import require_extra
-from alphagenome_pytorch.cli._output import emit_json, emit_text
+from alphagenome_pytorch.cli._output import emit_json
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -205,7 +205,6 @@ def _resolve_track_strands(head, organism, track_indices, *,
 
 
 def _load_model(args, dtype_policy, json_mode):
-    import torch
     from alphagenome_pytorch import AlphaGenome
 
     if args.checkpoint:

@@ -17,7 +17,6 @@ log spam and identify the first point of divergence.
 import pytest
 import numpy as np
 import torch
-from typing import Optional
 from tests.layer_utils import compute_metrics, print_layer_result
 
 

@@ -58,8 +58,6 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
-    is_delta_checkpoint,
-    load_delta_checkpoint,
     load_finetuned_model as _load_finetuned_model,
     select_organism_index,
 )

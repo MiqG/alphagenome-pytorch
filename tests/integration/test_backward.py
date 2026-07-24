@@ -9,13 +9,12 @@ These tests verify that the model is trainable by checking:
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
 from alphagenome_pytorch.model import SequenceEncoder, SequenceDecoder, TransformerTower
 from alphagenome_pytorch.convolutions import StandardizedConv1d, ConvBlock, DownResBlock, UpResBlock
-from alphagenome_pytorch.attention import MHABlock, MLPBlock, PairUpdateBlock, SequenceToPairBlock
+from alphagenome_pytorch.attention import MHABlock, PairUpdateBlock
 from alphagenome_pytorch.heads import (
     MultiOrganismLinear,
     GenomeTracksHead,
@@ -24,11 +23,9 @@ from alphagenome_pytorch.heads import (
     SpliceSitesUsageHead,
     SpliceSitesJunctionHead,
 )
-from alphagenome_pytorch.layers import RMSBatchNorm, LayerNorm
+from alphagenome_pytorch.layers import RMSBatchNorm
 
 from ..gradient_utils import (
-    check_all_gradients,
-    assert_all_params_have_gradients,
     assert_no_nan_inf_gradients,
     compute_combined_loss,
     compute_head_loss,
@@ -155,7 +152,6 @@ class TestFullModelBackward:
 
         Merged from test_nans.py which focused on forward pass validation.
         """
-        import numpy as np
 
         device = next(pytorch_model.parameters()).device
         pt_input = torch.tensor(random_dna_sequence).to(device)

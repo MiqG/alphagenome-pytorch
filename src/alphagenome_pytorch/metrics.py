@@ -5,7 +5,6 @@ Provides evaluation metrics for genomic predictions.
 """
 
 from typing import Dict, Any, Optional
-import torch
 from torch import Tensor
 
 

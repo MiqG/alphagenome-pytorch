@@ -10,14 +10,12 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 import pandas as pd
 import pytest
 import torch
 
 from alphagenome_pytorch.aggregation import (
     GeneCountAccumulator,
-    GeneCounts,
     aggregate_genes,
     aggregate_intervals,
     combine_gene_expression,

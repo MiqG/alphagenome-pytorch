@@ -1254,7 +1254,6 @@ class TestPredictStrandFlags:
     def test_match_errors_when_no_strand_metadata(self, tmp_path):
         """A head absent from the catalog (and no --track-strands) fails fast."""
         from alphagenome_pytorch.cli import predict as predict_cli
-        from alphagenome_pytorch.extensions import inference as inf
 
         model = tmp_path / "m.pth"; model.write_text("")
         fasta = tmp_path / "g.fa"; fasta.write_text("")

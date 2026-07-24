@@ -10,7 +10,7 @@ import torch
 from ..types import Interval, OutputType, Variant, VariantScore
 
 if TYPE_CHECKING:
-    from ..annotations import GeneAnnotation
+    pass
 
 
 class BaseVariantScorer(ABC):

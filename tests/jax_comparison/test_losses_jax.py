@@ -25,7 +25,6 @@ def jax_losses():
 @pytest.fixture
 def torch_losses():
     """Import PyTorch losses module."""
-    import torch
     from alphagenome_pytorch import losses as torch_losses
     return torch_losses
 

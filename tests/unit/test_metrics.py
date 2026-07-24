@@ -63,7 +63,6 @@ def test_count_pearson_r():
     # Verify it's correlating counts across regions
     # If we scale all positions in a region by the same factor,
     # the profile correlation stays the same but count correlation reflects it
-    from alphagenome_pytorch.metrics import profile_pearson_r
 
     # Scale each region by a different factor
     scales = torch.rand(n_regions, 1, 1) * 2 + 0.5  # Random scales 0.5-2.5

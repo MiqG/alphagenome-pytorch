@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from collections.abc import Mapping
@@ -560,7 +559,6 @@ def _run_track_means(args: argparse.Namespace, state_dict: dict) -> int:
 def _run_validate(args: argparse.Namespace, state_dict: dict) -> int:
     """Validate checkpoint against model architecture."""
     json_mode = getattr(args, "json_output", False)
-    import torch
     from alphagenome_pytorch import AlphaGenome
 
     model = AlphaGenome(num_organisms=2)
