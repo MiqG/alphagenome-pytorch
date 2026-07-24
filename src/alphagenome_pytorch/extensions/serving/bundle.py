@@ -79,6 +79,7 @@ class Manifest:
     adapter_filename: str = DEFAULT_ADAPTER_FILENAME
     # Appended to preserve the positional constructor order of schema v1.
     base_model_weights_hash: str | None = None
+    base_model_variant: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -320,6 +321,7 @@ Adapter bundle exported by `agt adapters export`.
 | Tracks | {n_tracks} |
 | Biosample | {biosample} |
 | Base model | `{base_model_id}` |
+| Base model variant | `{base_model_variant}` |
 | Base model structure hash | `{base_model_hash}` |
 | Base model weights hash | `{base_model_weights_hash}` |
 | alphagenome-pytorch version | `{ag_version}` |
@@ -416,6 +418,7 @@ def render_model_card(manifest: Manifest) -> str:
         n_tracks=n_tracks,
         biosample=manifest.biosample or "—",
         base_model_id=manifest.base_model_id or "—",
+        base_model_variant=manifest.base_model_variant or "—",
         base_model_hash=manifest.base_model_hash,
         base_model_weights_hash=manifest.base_model_weights_hash or "—",
         ag_version=manifest.alphagenome_pytorch_version or "—",

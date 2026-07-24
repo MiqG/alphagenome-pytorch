@@ -107,6 +107,7 @@ def _make_export_args(**overrides) -> argparse.Namespace:
         bundle_id="demo",
         label=None,
         base_model_id=None,
+        base_model_variant=None,
         base_weights=None,
         base_model_hash=None,
         base_model_weights_hash=None,
@@ -137,6 +138,7 @@ class TestManifest:
             base_model_hash="sha256:abc",
             label="Demo",
             base_model_id="org/repo",
+            base_model_variant="fold_1",
             adapter_summary={"kind": "lora", "lora_rank": 4},
             heads=["atac"],
         )
@@ -145,9 +147,18 @@ class TestManifest:
         assert loaded.id == m.id
         assert loaded.base_model_hash == m.base_model_hash
         assert loaded.label == "Demo"
+        assert loaded.base_model_variant == "fold_1"
         assert loaded.adapter_summary == {"kind": "lora", "lora_rank": 4}
         assert loaded.heads == ["atac"]
         assert loaded.schema_version == SCHEMA_VERSION
+
+    def test_legacy_manifest_without_base_model_variant(self) -> None:
+        loaded = Manifest.from_dict({
+            "schema_version": SCHEMA_VERSION,
+            "id": "legacy",
+            "base_model_hash": "sha256:abc",
+        })
+        assert loaded.base_model_variant is None
 
     def test_dump_writes_alphagenome_adapter_json(self, tmp_path: Path) -> None:
         Manifest(id="x", base_model_hash="sha256:abc").dump(tmp_path)
@@ -340,6 +351,23 @@ def _export_via_cli(tmp_path: Path, out: Path, *, base_model_hash: str) -> Path:
 
 
 class TestExportCli:
+    def test_parser_accepts_base_model_variant(self) -> None:
+        from alphagenome_pytorch.cli._main import build_parser
+
+        args = build_parser().parse_args([
+            "adapters",
+            "export",
+            "--checkpoint",
+            "adapter.delta.pth",
+            "--out",
+            "bundle",
+            "--id",
+            "demo",
+            "--base-model-variant",
+            "fold_1",
+        ])
+        assert args.base_model_variant == "fold_1"
+
     def test_export_carries_exact_base_weights_hash(self, tmp_path: Path) -> None:
         exact_hash = "sha256-tensors-v1:" + "a" * 64
         src = _write_delta_pth(
@@ -371,6 +399,7 @@ class TestExportCli:
             bundle_id="wtc11-atac-lora",
             label="WTC11 ATAC LoRA",
             base_model_id="org/alphagenome",
+            base_model_variant="fold_1",
             organism="human",
             modality="atac",
             biosample="WTC11",
@@ -383,6 +412,7 @@ class TestExportCli:
         manifest = Manifest.load(paths.manifest)
         assert manifest.id == "wtc11-atac-lora"
         assert manifest.label == "WTC11 ATAC LoRA"
+        assert manifest.base_model_variant == "fold_1"
         # base hash is taken from the source delta checkpoint
         assert manifest.base_model_hash == "sha256:from-ckpt"
         assert manifest.adapter_summary.get("kinds") == ["lora"]
@@ -612,6 +642,7 @@ class TestModelCard:
             base_model_hash="sha256:abc",
             label="WTC11 ATAC LoRA",
             base_model_id="org/alphagenome",
+            base_model_variant="fold_1",
             adapter_summary={"kind": "lora"},
             organism="human",
             modalities=["atac"],
@@ -622,6 +653,7 @@ class TestModelCard:
         assert "library_name: alphagenome-pytorch" in card
         assert "base_model: org/alphagenome" in card
         assert "base_model_relation: adapter" in card
+        assert "| Base model variant | `fold_1` |" in card
         assert "WTC11 ATAC LoRA" in card
         assert "sha256:abc" in card
         assert "atac" in card
