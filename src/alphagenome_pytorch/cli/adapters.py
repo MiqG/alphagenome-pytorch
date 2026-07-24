@@ -56,9 +56,6 @@ def _register_export(sub: argparse._SubParsersAction) -> None:
                         "that already carry both hashes.")
     p.add_argument("--base-model-hash", default=None,
                    help="Override base model hash explicitly (skips loading base weights).")
-    p.add_argument("--base-model-weights-hash", default=None,
-                   help="Override the exact canonical base weights hash. Usually "
-                        "computed automatically from --base-weights.")
     p.add_argument("--genome", default=None)
     p.add_argument("--organism", default=None,
                    choices=["human", "mouse"])
@@ -181,15 +178,17 @@ def _run_export(args: argparse.Namespace) -> int:
 
     summary = _materialize_adapter_safetensors(src, adapter_out)
 
-    # An explicit --organism is an override: write it into the bundle's embedded
-    # delta metadata (not just the manifest), because serving resolves organism
-    # from the embedded ``organism`` / ``organism_indices`` — otherwise the
-    # manifest could claim mouse while the served model defaults to human.
-    if args.organism:
-        _apply_organism_override(adapter_out, args.organism)
-
     base_hash = _resolve_base_model_hash(args, summary)
     base_weights_hash = _resolve_base_model_weights_hash(args, summary)
+
+    # Keep the loading artifact and display manifest on the same provenance.
+    # This also upgrades older delta exports when --base-weights supplies the
+    # exact identity they did not originally embed.
+    _apply_export_metadata(
+        adapter_out,
+        organism=args.organism,
+        base_model_weights_hash=base_weights_hash,
+    )
 
     heads_list: list[str] = []
     if args.heads:
@@ -285,31 +284,45 @@ def _materialize_adapter_safetensors(
     )
 
 
-def _apply_organism_override(dest: Path, organism: str) -> None:
-    """Write an explicit ``--organism`` into the bundle's embedded delta metadata.
+def _apply_export_metadata(
+    dest: Path,
+    *,
+    organism: str | None,
+    base_model_weights_hash: str | None,
+) -> None:
+    """Synchronize resolved provenance into the exported delta metadata.
 
     Serving resolves organism from the embedded ``organism`` /
     ``organism_indices`` metadata (not the manifest), so ``--organism`` must
     update those embedded values or a manifest could claim mouse while the served
-    model defaults to human. This is an override: it replaces any organism the
-    source checkpoint embedded. Rewrites ``dest``'s safetensors metadata in place
-    (tensor data is re-saved unchanged). Raises on an unknown organism.
+    model defaults to human. The resolved base weights hash is likewise embedded
+    so the loading artifact and sidecar manifest cannot disagree. Rewrites
+    ``dest``'s safetensors metadata in place (tensor data is re-saved unchanged).
     """
+    if organism is None and base_model_weights_hash is None:
+        return
+
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
-
-    from alphagenome_pytorch.organisms import normalize_organism_index
-
-    index = normalize_organism_index(organism, num_organisms=2)
 
     tensors: dict[str, torch.Tensor] = {}
     with safe_open(str(dest), framework="pt") as f:
         metadata = dict(f.metadata() or {})
         for key in f.keys():
             tensors[key] = f.get_tensor(key)
-    metadata["organism"] = json.dumps(organism)
-    metadata["organism_indices"] = json.dumps([index])
+
+    if organism is not None:
+        from alphagenome_pytorch.organisms import normalize_organism_index
+
+        index = normalize_organism_index(organism, num_organisms=2)
+        metadata["organism"] = json.dumps(organism)
+        metadata["organism_indices"] = json.dumps([index])
+    if base_model_weights_hash is not None:
+        metadata["base_model_weights_hash"] = json.dumps(
+            base_model_weights_hash
+        )
+
     save_file(tensors, str(dest), metadata=metadata)
 
 
@@ -517,16 +530,22 @@ def _hash_from_base_weights(weights_path: Path) -> str:
 def _resolve_base_model_weights_hash(
     args: argparse.Namespace, summary: dict[str, Any]
 ) -> str | None:
-    """Resolve exact base identity, preserving compatibility with old exports."""
-    explicit = getattr(args, "base_model_weights_hash", None)
-    if explicit:
-        return explicit
+    """Resolve exact base identity and reject conflicting fold provenance."""
+    source_hash = summary.get("base_model_weights_hash_from_source")
     if args.base_weights:
         from alphagenome_pytorch.extensions.finetuning.checkpointing import (
             compute_base_model_weights_hash_from_file,
         )
-        return compute_base_model_weights_hash_from_file(args.base_weights)
-    return summary.get("base_model_weights_hash_from_source")
+        supplied_hash = compute_base_model_weights_hash_from_file(args.base_weights)
+        if source_hash is not None and supplied_hash != source_hash:
+            raise ValueError(
+                "Base model weights hash mismatch: source delta declares "
+                f"{source_hash!r}, but --base-weights {args.base_weights!r} "
+                f"hashes to {supplied_hash!r}. The supplied base weights are "
+                "not the checkpoint/fold used to train this adapter."
+            )
+        return supplied_hash
+    return source_hash
 
 
 # ---------------------------------------------------------------------------

@@ -112,7 +112,6 @@ def _make_export_args(**overrides) -> argparse.Namespace:
         base_model_variant=None,
         base_weights=None,
         base_model_hash=None,
-        base_model_weights_hash=None,
         genome=None,
         organism=None,
         modality=None,
@@ -402,6 +401,68 @@ class TestExportCli:
         card = render_model_card(manifest)
         assert "a" * 16 in card
         assert exact_hash not in card
+
+    @pytest.mark.parametrize("source_embeds_hash", [False, True])
+    def test_base_weights_hash_is_written_to_both_artifacts(
+        self, tmp_path: Path, source_embeds_hash: bool
+    ) -> None:
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            _read_delta_export_header,
+            compute_base_model_weights_hash_from_file,
+        )
+
+        base_weights = tmp_path / "base.pth"
+        torch.save(
+            {"trunk.weight": torch.arange(4, dtype=torch.float32)},
+            base_weights,
+        )
+        exact_hash = compute_base_model_weights_hash_from_file(base_weights)
+        src = _write_delta_pth(
+            tmp_path,
+            base_hash="sha256:structure",
+            base_weights_hash=exact_hash if source_embeds_hash else None,
+        )
+        out = tmp_path / "bundle"
+
+        assert adapters_cli.run(_make_export_args(
+            checkpoint=str(src),
+            out=str(out),
+            bundle_id="exact",
+            base_model_hash="sha256:structure",
+            base_weights=str(base_weights),
+        )) == 0
+
+        manifest = Manifest.load(out)
+        header = _read_delta_export_header(
+            BundlePaths.resolve(out).adapter_safetensors
+        )
+        assert manifest.base_model_weights_hash == exact_hash
+        assert header["base_model_weights_hash"] == exact_hash
+
+    def test_rejects_base_weights_from_different_fold(self, tmp_path: Path) -> None:
+        embedded_hash = "sha256-tensors-v1:" + "a" * 64
+        src = _write_delta_pth(
+            tmp_path,
+            base_hash="sha256:structure",
+            base_weights_hash=embedded_hash,
+        )
+        wrong_weights = tmp_path / "wrong-fold.pth"
+        torch.save(
+            {"trunk.weight": torch.arange(4, dtype=torch.float32)},
+            wrong_weights,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="not the checkpoint/fold used to train this adapter",
+        ):
+            adapters_cli.run(_make_export_args(
+                checkpoint=str(src),
+                out=str(tmp_path / "bundle"),
+                bundle_id="wrong-fold",
+                base_model_hash="sha256:structure",
+                base_weights=str(wrong_weights),
+            ))
 
     def test_export_from_delta_pth(self, tmp_path: Path) -> None:
         src = _write_delta_pth(tmp_path, base_hash="sha256:from-ckpt")
