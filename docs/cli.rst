@@ -734,6 +734,8 @@ has no separable adapter weights:
    agt adapters export \
        --checkpoint runs/wtc11-atac/best.delta.pth \
        --base-model your-org/alphagenome \
+       --base-model-variant fold_1 \
+       --base-weights fold_1.safetensors \
        --id wtc11-atac-lora --organism human --modality atac \
        --out dist/wtc11-atac-lora
 
@@ -745,6 +747,8 @@ has no separable adapter weights:
 Bundle management (``export`` / ``inspect`` / ``validate`` and local bundle
 operations) works in the base installation. Install ``[hf]`` for ``hf://``
 ``pull`` / ``publish``, and ``[serving]`` to run ``agt serve``.
+``--base-model-variant`` records a readable variant such as ``fold_1`` or
+``all_folds``; ``--base-weights`` records the exact base tensor identity.
 
 See :doc:`/serving/adapters` for the bundle layout, manifest schema, URI forms,
 and catalog serving.

@@ -289,11 +289,12 @@ def _verify_bundle_base_hash(model, manifest) -> None:
     applied adapters/merge, so it is safe to call on the fully-loaded model.
     """
     from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        base_model_structure_hashes_match,
         compute_base_model_hash,
     )
 
     actual_hash = compute_base_model_hash(model)
-    if actual_hash != manifest.base_model_hash:
+    if not base_model_structure_hashes_match(actual_hash, manifest.base_model_hash):
         raise ValueError(
             f"Bundle {manifest.id!r} declares base_model_hash="
             f"{manifest.base_model_hash!r} but the base model hashes to "

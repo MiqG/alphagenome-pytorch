@@ -14,6 +14,7 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
 )
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     compute_base_model_hash,
+    base_model_structure_hashes_match,
     compute_base_model_weights_hash,
     compute_base_model_weights_hash_from_file,
     export_delta_weights,
@@ -206,6 +207,18 @@ class TestBaseModelHash:
 
         assert hash1 == hash2
         assert hash1.startswith("sha256:")
+        assert len(hash1.removeprefix("sha256:")) == 64
+
+    def test_legacy_short_hash_matches_full_hash(self):
+        model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
+        full_hash = compute_base_model_hash(model)
+        legacy_hash = full_hash[:len("sha256:") + 16]
+
+        assert base_model_structure_hashes_match(full_hash, legacy_hash)
+        assert base_model_structure_hashes_match(legacy_hash, full_hash)
+        assert not base_model_structure_hashes_match(
+            full_hash, "sha256:" + "0" * 16
+        )
 
     def test_hash_changes_with_different_model(self):
         """Different models should produce different hashes."""
