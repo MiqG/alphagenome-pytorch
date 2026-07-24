@@ -27,6 +27,7 @@ from alphagenome_pytorch.prediction import AlphaGenomePredictionRuntime
 from alphagenome_pytorch.extensions.attribution import (
     AttributionResult,
     get_method,
+    UnsupportedMethodError,
 )
 from alphagenome_pytorch.extensions.attribution.heads import default_head_selector
 from alphagenome_pytorch.extensions.attribution.window import target_slice_for_resolution

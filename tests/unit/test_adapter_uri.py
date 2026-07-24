@@ -15,6 +15,7 @@ from alphagenome_pytorch.extensions.serving.bundle import (
 )
 from alphagenome_pytorch.extensions.serving.uri import (
     HF_INSTALL_HINT,
+    BundleURI,
     parse_bundle_uri,
     publish_bundle,
     resolve_bundle,
@@ -409,8 +410,7 @@ class TestVerifyBundleBaseWeightsHash:
 
 class TestPullCli:
     def test_pull_local_bundle(self, tmp_path: Path) -> None:
-        import argparse
-        import io
+        import argparse, io
         from alphagenome_pytorch.cli import adapters as adapters_cli
         from alphagenome_pytorch.cli._output import emit_text as orig_emit_text
 
@@ -431,8 +431,7 @@ class TestPullCli:
         assert str(bundle) in buf.getvalue()
 
     def test_pull_hf_uri_uses_snapshot_download(self, tmp_path: Path) -> None:
-        import argparse
-        import io
+        import argparse, io
         from alphagenome_pytorch.cli import adapters as adapters_cli
         from alphagenome_pytorch.cli._output import emit_text as orig_emit_text
 

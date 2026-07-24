@@ -4,6 +4,7 @@ Unit tests for fine-tuning datasets.
 Tests the fine-tuning datasets with mock data.
 """
 
+import pytest
 import torch
 
 

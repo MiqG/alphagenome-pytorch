@@ -93,7 +93,7 @@ def convert_gtf_to_parquet(
     input_size_mb = input_path.stat().st_size / (1024 * 1024)
     output_size_mb = output_path.stat().st_size / (1024 * 1024)
 
-    print("\nConversion complete!")
+    print(f"\nConversion complete!")
     print(f"  Input size:  {input_size_mb:.1f} MB")
     print(f"  Output size: {output_size_mb:.1f} MB")
     print(f"  Compression ratio: {input_size_mb / output_size_mb:.1f}x")

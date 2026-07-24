@@ -9,6 +9,7 @@ import gc
 
 import pytest
 import torch
+import torch.nn as nn
 
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy

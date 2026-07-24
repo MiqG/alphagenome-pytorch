@@ -12,6 +12,7 @@ from torch import nn
 
 from alphagenome_pytorch.extensions.attribution.gradient import gradient_x_input
 from alphagenome_pytorch.extensions.attribution.heads import (
+    HeadSelector,
     default_head_selector,
 )
 from alphagenome_pytorch.extensions.attribution.types import AttributionResult

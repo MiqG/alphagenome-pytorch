@@ -14,6 +14,8 @@ import torch.nn as nn
 from alphagenome_pytorch.extensions.finetuning.adapters import LoRA
 from alphagenome_pytorch.extensions.serving.router import (
     AmbiguousModelError,
+    CatalogAdapterSpec,
+    CatalogBaseSpec,
     ModelNotFoundError,
     ServedModelEntry,
     ServedModelRouter,
