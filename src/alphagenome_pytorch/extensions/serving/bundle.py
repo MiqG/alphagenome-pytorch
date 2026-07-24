@@ -147,7 +147,8 @@ class BundlePaths:
                 f"Bundle at {d} is missing {MANIFEST_FILENAME}"
             )
         manifest = Manifest.load(manifest_path)
-        adapter_path = d / manifest.adapter_filename
+        adapter_filename = Path(manifest.adapter_filename).name
+        adapter_path = d / adapter_filename
         if not adapter_path.is_file():
             raise BundleError(
                 f"Bundle at {d} declares adapter_filename={manifest.adapter_filename!r} "
