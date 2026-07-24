@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from alphagenome_pytorch.cli._deps import require_extra
-from alphagenome_pytorch.cli._output import emit_json
+from alphagenome_pytorch.cli._output import emit_json, emit_text
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:

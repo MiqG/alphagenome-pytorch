@@ -13,8 +13,10 @@ Needs the 'jax' extra: pip install alphagenome-pytorch[jax]
 """
 
 import argparse
+import sys
 import torch
 import numpy as np
+import jax
 
 from alphagenome_pytorch.model import AlphaGenome
 from alphagenome_pytorch.jax_compat.weight_mapping import map_pytorch_to_jax

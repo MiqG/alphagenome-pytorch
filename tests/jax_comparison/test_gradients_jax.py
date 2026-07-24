@@ -8,6 +8,8 @@ Uses jax.grad() to compute reference gradients.
 import pytest
 import numpy as np
 import torch
+import sys
+import os
 
 
 # Module-level tolerance constants for JAX-PyTorch comparison

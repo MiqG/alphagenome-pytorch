@@ -12,9 +12,15 @@ This module remains as a compatibility layer for existing imports.
 from __future__ import annotations
 
 from pathlib import Path
+from alphagenome_pytorch.utils.sequence import (
+    sequence_to_onehot_tensor as sequence_to_onehot,
+    onehot_tensor_to_sequence as onehot_to_sequence,
+)
 from alphagenome_pytorch.genome import (
     GenomeSequenceSource,
+    apply_variant_to_onehot,
     apply_variant_to_sequence,
+    extract_sequence_from_fasta,
 )
 from .types import Interval, Variant
 

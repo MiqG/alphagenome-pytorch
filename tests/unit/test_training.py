@@ -16,6 +16,7 @@ from alphagenome_pytorch.training import (
 )
 from alphagenome_pytorch.metrics import (
     pearson_r,
+    spearman_r,
     AlphaGenomeMetrics,
 )
 

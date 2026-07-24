@@ -42,15 +42,18 @@ Example
 
 from __future__ import annotations
 
+import gc
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
+from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.variant_scoring import (
     AggregationType,
     CenterMaskScorer,
@@ -1133,7 +1136,7 @@ class TestAllScorersComprehensive:
         pt_scorers = get_recommended_scorers('human')
 
         print(f"\n{'='*70}")
-        print("ALL 19 SCORERS COMPREHENSIVE TEST")
+        print(f"ALL 19 SCORERS COMPREHENSIVE TEST")
         print(f"Variant: {TEST_VARIANT_STR}")
         print(f"{'='*70}")
 

@@ -10,7 +10,7 @@ across test fixtures in conftest.py. These utilities handle common patterns:
 
 import gc
 from contextlib import contextmanager
-from typing import Dict, Any, Callable
+from typing import Dict, Any, Callable, Tuple
 import numpy as np
 
 

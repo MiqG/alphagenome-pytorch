@@ -16,6 +16,7 @@ For unit tests (dataset loading, head creation), see tests/unit/test_finetuning_
 
 import pytest
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from alphagenome_pytorch import AlphaGenome

@@ -8,6 +8,7 @@ Contact Maps use pair-based predictions from pair embeddings.
 import numpy as np
 import pytest
 
+from .comparison_utils import compare_arrays
 
 
 @pytest.mark.integration_jax

@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from alphagenome_pytorch.organisms import (
+    ORGANISM_ALIASES,
     normalize_organism_index,
     normalize_organism_indices,
 )

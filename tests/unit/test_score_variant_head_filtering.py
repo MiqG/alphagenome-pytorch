@@ -18,6 +18,7 @@ from alphagenome_pytorch.variant_scoring import (
     GeneMaskSplicingScorer,
     Interval,
     OutputType,
+    PolyadenylationScorer,
     SpliceJunctionScorer,
     Variant,
     VariantScoringModel,

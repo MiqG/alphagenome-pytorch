@@ -22,6 +22,7 @@ from tqdm import tqdm
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     load_finetuned_model as _canonical_load_finetuned_model,
+    select_organism_index,
 )
 from alphagenome_pytorch.extensions.finetuning.training import NUM_SEGMENTS
 from alphagenome_pytorch.extensions.finetuning.transfer import (

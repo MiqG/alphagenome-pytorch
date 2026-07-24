@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import jax
 import jax.numpy as jnp
+import haiku as hk
 import argparse
 
 # Add src to path
@@ -228,7 +229,7 @@ def main():
 
         if jax_key is None:
             print(f"--- {key} ---")
-            print("  Skipping: No JAX mapping defined.")
+            print(f"  Skipping: No JAX mapping defined.")
             continue
 
         if jax_key not in jax_out:
@@ -274,7 +275,7 @@ def main():
                         break
 
                 if not matched:
-                    print("  No matching resolution found.")
+                    print(f"  No matching resolution found.")
                     print(f"    JAX shape: {j_arr.shape}")
                     for sub_k, pt_tensor in pt_val.items():
                         print(f"    PyTorch Res {sub_k} shape: {pt_tensor.shape}")
