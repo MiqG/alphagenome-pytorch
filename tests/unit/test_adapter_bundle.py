@@ -6,6 +6,8 @@ import argparse
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -1053,6 +1055,111 @@ class TestCatalogAdapterDevicePlacement:
     def test_cuda_placement(self, tmp_path: Path) -> None:
         entry = self._build_entry(tmp_path, "cuda")
         self._assert_all_on(entry, "cuda")
+
+
+class TestCatalogAdapterHeadOverlayBuild:
+    """Catalog entry construction treats declared heads as reversible overlays."""
+
+    @staticmethod
+    def _patch_build_dependencies(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        prepared_head: nn.Module,
+        load_error: Exception | None = None,
+    ) -> None:
+        from alphagenome_pytorch.extensions.finetuning import (
+            checkpointing,
+            transfer,
+        )
+
+        config = SimpleNamespace(
+            new_heads={"atac": {"modality": "atac", "num_tracks": 1}},
+            keep_heads=[],
+            remove_heads=[],
+        )
+
+        def prepare(model: nn.Module, _config: Any) -> nn.Module:
+            model.heads["atac"] = prepared_head
+            model.q_proj = LoRA(model.q_proj, rank=2)
+            return model
+
+        def load(_model: nn.Module, _path: Path, strict: bool = True) -> None:
+            if load_error is not None:
+                raise load_error
+
+        monkeypatch.setattr(
+            checkpointing, "load_delta_config", lambda _path: config
+        )
+        monkeypatch.setattr(
+            checkpointing, "compute_base_model_hash", lambda _model: "hash"
+        )
+        monkeypatch.setattr(
+            checkpointing,
+            "base_model_structure_hashes_match",
+            lambda actual, expected: actual == expected,
+        )
+        monkeypatch.setattr(checkpointing, "load_delta_weights", load)
+        monkeypatch.setattr(transfer, "prepare_for_transfer", prepare)
+
+    def test_same_name_declared_head_is_captured_and_native_restored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from alphagenome_pytorch.extensions.serving.router import (
+            build_adapter_entry,
+        )
+
+        base = nn.Module()
+        base.q_proj = nn.Linear(8, 8)
+        native_head = nn.Linear(8, 8)
+        prepared_head = nn.Linear(8, 1)
+        base.heads = nn.ModuleDict({"atac": native_head})
+        original_q_proj = base.q_proj
+        self._patch_build_dependencies(
+            monkeypatch, prepared_head=prepared_head
+        )
+
+        entry = build_adapter_entry(
+            base_model=base,
+            bundle_paths=SimpleNamespace(
+                adapter_safetensors=Path("adapter.safetensors")
+            ),
+            manifest=Manifest(id="same-name", base_model_hash="hash"),
+        )
+
+        assert entry.head_modules == {"atac": prepared_head}
+        assert len(entry.adapter_attachments) == 1
+        assert base.heads["atac"] is native_head
+        assert base.q_proj is original_q_proj
+
+    def test_failed_load_restores_native_heads_and_wrappers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from alphagenome_pytorch.extensions.serving.router import (
+            build_adapter_entry,
+        )
+
+        base = nn.Module()
+        base.q_proj = nn.Linear(8, 8)
+        native_head = nn.Linear(8, 8)
+        base.heads = nn.ModuleDict({"atac": native_head})
+        original_q_proj = base.q_proj
+        self._patch_build_dependencies(
+            monkeypatch,
+            prepared_head=nn.Linear(8, 1),
+            load_error=RuntimeError("broken weights"),
+        )
+
+        with pytest.raises(RuntimeError, match="broken weights"):
+            build_adapter_entry(
+                base_model=base,
+                bundle_paths=SimpleNamespace(
+                    adapter_safetensors=Path("adapter.safetensors")
+                ),
+                manifest=Manifest(id="broken", base_model_hash="hash"),
+            )
+
+        assert base.heads["atac"] is native_head
+        assert base.q_proj is original_q_proj
 
 
 # ---------------------------------------------------------------------------

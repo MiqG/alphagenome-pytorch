@@ -8,9 +8,11 @@ underlying frozen trunk parameters by reference — the wrappers' ``original_lay
 attributes point at the same ``Linear``/``Conv1d`` instances inside ``base_model``.
 
 A :meth:`ServedModelRouter.select` call detaches whichever entry is currently
-active (``setattr`` the wrappers back to their ``original_layer``; remove
-new heads from ``base_model.heads``) and attaches the requested entry. Swap
-is serialized behind a lock; v1 makes no attempt to overlap requests.
+active (``setattr`` the wrappers back to their ``original_layer``; restore the
+native ``base_model.heads`` registry) and attaches the requested entry. Adapter
+heads are an overlay on that native registry, so a finetune may use the same
+head name as the base or another catalog entry. Swap is serialized behind a
+lock; v1 makes no attempt to overlap requests.
 
 Catalog mode is REST-first: gRPC users must pass ``alphagenome-model-id``
 metadata explicitly (no default fallback). Constraints:
@@ -94,6 +96,24 @@ def capture_adapter_attachments(model: nn.Module) -> list[_AdapterAttachment]:
 
     visit(model)
     return out
+
+
+def _restore_head_modules(
+    model: nn.Module, native_heads: dict[str, nn.Module]
+) -> None:
+    """Restore ``model.heads`` exactly to a captured native registry.
+
+    The snapshot stores module references rather than aliasing the mutable
+    ``ModuleDict``. This makes same-name finetuned heads a reversible overlay:
+    restoring swaps the original module object back into its registry slot.
+    """
+    if not hasattr(model, "heads"):
+        return
+    heads = model.heads
+    for name in list(heads.keys()):
+        del heads[name]
+    for name, module in native_heads.items():
+        heads[name] = module
 
 
 # ---------------------------------------------------------------------------
@@ -203,60 +223,77 @@ def build_adapter_entry(
             )
 
     new_head_names = list(transfer_config.new_heads.keys())
-
-    # Snapshot which heads existed before — anything new that appears must be
-    # removed during detach. (prepare_for_transfer only adds when keep_heads /
-    # remove_heads are unset, which we enforce above.)
-    pre_heads = set(base_model.heads.keys()) if hasattr(base_model, "heads") else set()
-
-    prepare_for_transfer(base_model, transfer_config)
-    load_delta_weights(base_model, bundle_paths.adapter_safetensors, strict=False)
-
-    attachments = capture_adapter_attachments(base_model)
-
+    native_heads = (
+        dict(base_model.heads.items()) if hasattr(base_model, "heads") else {}
+    )
+    native_wrapper_ids = {
+        id(att.wrapper) for att in capture_adapter_attachments(base_model)
+    }
+    attachments: list[_AdapterAttachment] = []
     head_modules: dict[str, nn.Module] = {}
-    if hasattr(base_model, "heads"):
-        post_heads = set(base_model.heads.keys())
-        added = post_heads - pre_heads
-        # Sanity: declared new heads must match what got added.
-        for h in new_head_names:
-            if h not in added:
-                # Either the head was already there (replaced) or transfer_config
-                # disagrees with what prepare_for_transfer did — both are bugs.
-                raise ValueError(
-                    f"Bundle {manifest.id!r}: declared new head {h!r} was not "
-                    "added to base_model.heads during prepare_for_transfer."
-                )
-            head_modules[h] = base_model.heads[h]
-        # Detect unexpected additions — surface as an error rather than silently
-        # leaving them attached.
-        for h in added - set(new_head_names):
-            raise ValueError(
-                f"Bundle {manifest.id!r} added unexpected head {h!r}; "
-                "transfer_config.new_heads is the source of truth."
-            )
-
-    # prepare_for_transfer builds some adapter params (e.g. IA3 ``scale``) and
-    # the new head modules on CPU regardless of the base device, and these
-    # detached modules never ride along in a later ``base_model.to(device)``.
-    # Align them to the base device now so CUDA catalog inference does not fail
-    # with a device mismatch when the entry is attached.
     try:
-        device = next(base_model.parameters()).device
-    except StopIteration:
-        device = None
-    if device is not None:
-        for att in attachments:
-            att.wrapper.to(device)
-        for hmod in head_modules.values():
-            hmod.to(device)
+        prepare_for_transfer(base_model, transfer_config)
+        attachments = [
+            att
+            for att in capture_adapter_attachments(base_model)
+            if id(att.wrapper) not in native_wrapper_ids
+        ]
+        load_delta_weights(
+            base_model, bundle_paths.adapter_safetensors, strict=False
+        )
 
-    # Detach: restore base_model to clean state.
-    for att in attachments:
-        setattr(att.parent, att.attr_name, _wrapped_target(att.wrapper))
-    if hasattr(base_model, "heads"):
-        for h in new_head_names:
-            del base_model.heads[h]
+        if new_head_names and not hasattr(base_model, "heads"):
+            raise ValueError(
+                f"Bundle {manifest.id!r} declares new heads but the base model "
+                "has no heads registry."
+            )
+        if hasattr(base_model, "heads"):
+            missing = [h for h in new_head_names if h not in base_model.heads]
+            if missing:
+                raise ValueError(
+                    f"Bundle {manifest.id!r}: declared heads {missing!r} were not "
+                    "present in base_model.heads after prepare_for_transfer."
+                )
+            head_modules = {
+                h: base_model.heads[h] for h in new_head_names
+            }
+
+            # Declared heads may replace native registry slots or add new ones,
+            # but preparation must not create undeclared entries.
+            allowed_heads = set(native_heads) | set(new_head_names)
+            unexpected = [
+                h for h in base_model.heads if h not in allowed_heads
+            ]
+            if unexpected:
+                raise ValueError(
+                    f"Bundle {manifest.id!r} added unexpected heads "
+                    f"{unexpected!r}; transfer_config.new_heads is the source "
+                    "of truth."
+                )
+
+        # prepare_for_transfer builds some adapter params (e.g. IA3 ``scale``)
+        # and heads on CPU regardless of the base device. Detached entries do
+        # not ride along in a later base_model.to(device), so align them now.
+        try:
+            device = next(base_model.parameters()).device
+        except StopIteration:
+            device = None
+        if device is not None:
+            for att in attachments:
+                att.wrapper.to(device)
+            for hmod in head_modules.values():
+                hmod.to(device)
+    finally:
+        # Entry construction is transactional: even a partially prepared model
+        # is returned to its native wrappers and exact native head registry.
+        for att in capture_adapter_attachments(base_model):
+            if id(att.wrapper) not in native_wrapper_ids:
+                setattr(
+                    att.parent,
+                    att.attr_name,
+                    _wrapped_target(att.wrapper),
+                )
+        _restore_head_modules(base_model, native_heads)
 
     return ServedModelEntry(
         id=manifest.id,
@@ -382,6 +419,11 @@ class ServedModelRouter:
             self._order.append(e.id)
         self.base_model = base_model
         self.runtime = runtime
+        self._native_heads = (
+            dict(base_model.heads.items())
+            if hasattr(base_model, "heads")
+            else {}
+        )
         self._adapter_factory = adapter_factory or _default_adapter_factory
         self._active_id: str | None = None
         self._lock = threading.RLock()
@@ -479,19 +521,21 @@ class ServedModelRouter:
 
     # ---- swap mechanics --------------------------------------------------
 
+    def _restore_native_heads_locked(self) -> None:
+        _restore_head_modules(self.base_model, self._native_heads)
+
     def _detach_active_locked(self) -> None:
         if self._active_id is None:
+            self._restore_native_heads_locked()
             return
         entry = self._entries[self._active_id]
         for att in entry.adapter_attachments:
             setattr(att.parent, att.attr_name, _wrapped_target(att.wrapper))
-        if hasattr(self.base_model, "heads"):
-            for hname in entry.head_modules:
-                if hname in self.base_model.heads:
-                    del self.base_model.heads[hname]
+        self._restore_native_heads_locked()
         self._active_id = None
 
     def _attach_locked(self, entry: ServedModelEntry) -> None:
+        self._restore_native_heads_locked()
         if entry.is_base():
             return
         for att in entry.adapter_attachments:
