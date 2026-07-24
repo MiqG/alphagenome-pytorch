@@ -450,6 +450,18 @@ def _build_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
     return _build_weights_adapter(args)
 
 
+def _load_catalog_base_weights(model, weights_path: str):
+    """Load all base weights for catalog serving in pth or safetensors format."""
+    from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk
+
+    return load_trunk(
+        model,
+        weights_path,
+        exclude_heads=False,
+        strict=False,
+    )
+
+
 def _build_catalog_router(args: argparse.Namespace):
     """Construct a :class:`ServedModelRouter` from ``--adapter-catalog``."""
     from alphagenome_pytorch.extensions.serving.bundle import (
@@ -479,8 +491,7 @@ def _build_catalog_router(args: argparse.Namespace):
     # Build base model + shared runtime exactly as in singleton-base mode, but
     # without constructing a singleton scorer (each entry brings its own).
     model = AlphaGenome(num_organisms=2)
-    state_dict = torch.load(args.weights, map_location=args.device, weights_only=True)
-    model.load_state_dict(state_dict, strict=False)
+    model = _load_catalog_base_weights(model, args.weights)
     model.to(args.device)
     model.eval()
 

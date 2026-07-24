@@ -228,3 +228,22 @@ def test_weights_path_creates_scoring_adapter():
     assert isinstance(adapter, LocalDnaModelAdapter)
     assert isinstance(adapter.scorer, VariantScorer)
     scoring_mock.assert_called_once()
+
+
+def test_catalog_base_loader_accepts_safetensors(tmp_path):
+    """The documented catalog --weights safetensors path must be loadable."""
+    from safetensors.torch import save_file
+
+    from alphagenome_pytorch.extensions.serving.cli import (
+        _load_catalog_base_weights,
+    )
+
+    source = torch.nn.Linear(3, 2)
+    weights_path = tmp_path / "base.safetensors"
+    save_file(source.state_dict(), weights_path)
+
+    target = torch.nn.Linear(3, 2)
+    _load_catalog_base_weights(target, str(weights_path))
+
+    for key, expected in source.state_dict().items():
+        assert torch.equal(target.state_dict()[key], expected)

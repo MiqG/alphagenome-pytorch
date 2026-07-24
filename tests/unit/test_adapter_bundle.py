@@ -240,6 +240,17 @@ class TestBundlePaths:
         paths = BundlePaths.resolve(tmp_path)
         assert paths.adapter_safetensors.name == "custom.safetensors"
 
+    def test_adapter_filename_uses_only_basename(self, tmp_path: Path) -> None:
+        Manifest(
+            id="x",
+            base_model_hash="sha256:x",
+            adapter_filename="nested/custom.safetensors",
+        ).dump(tmp_path)
+        (tmp_path / "custom.safetensors").write_bytes(b"")
+
+        paths = BundlePaths.resolve(tmp_path)
+        assert paths.adapter_safetensors == tmp_path / "custom.safetensors"
+
 
 # ---------------------------------------------------------------------------
 # validate_bundle
