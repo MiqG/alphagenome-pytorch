@@ -234,15 +234,16 @@ wrapper modules (``LoRA`` / ``Locon`` / ``IA3`` / ``Houlsby``) and any new
 heads. Wrappers store references to the trunk's ``Linear`` / ``Conv1d``
 parameters, so all entries share the same base weights.
 
-A request for ``model_id`` acquires the router lock, swaps the entry in (the
-active entry's wrappers are detached — ``setattr`` back to ``original_layer`` —
-the requested entry's wrappers are reattached, and any new heads are placed onto
-``base_model.heads``), and runs the model call. **One catalog model operation
-runs at a time:** the lock spans the swap *and* the inference/scoring call, so a
-concurrent request can never swap the shared trunk mid-forward. Response
-serialization and the network write happen after the lock is released. Swap
-latency is bounded by adapter + head state-dict size, not by reloading base
-weights.
+A request for ``model_id`` acquires the router lock and swaps the entry in. The
+active entry's wrappers are detached (``setattr`` back to ``original_layer``),
+the native base-head registry is restored, then the requested entry's wrappers
+and heads are overlaid. Adapter heads may use the same names as native heads or
+heads in other entries; the router swaps module objects rather than requiring
+globally unique names. **One catalog model operation runs at a time:** the lock
+spans the swap *and* the inference/scoring call, so a concurrent request can
+never swap the shared trunk mid-forward. Response serialization and the network
+write happen after the lock is released. Swap latency is bounded by adapter +
+head state-dict size, not by reloading base weights.
 
 Each entry is **self-describing**: it carries its own bundle's embedded track
 metadata, track names, variant scorer, and default organism. An entry's service

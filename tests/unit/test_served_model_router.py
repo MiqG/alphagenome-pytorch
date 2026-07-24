@@ -223,6 +223,58 @@ class TestSwapMechanics:
         r._detach_active_locked()
         assert "new_head" not in m.heads
 
+    def test_same_name_head_overlays_and_restores_native_head(self) -> None:
+        m = _TinyModel()
+        native_head = nn.Linear(8, 8)
+        adapter_head = nn.Linear(8, 4)
+        m.heads["atac"] = native_head
+        entry = ServedModelEntry(
+            id="finetuned", label=None, kind="adapter",
+            base_model_hash="sha256:demo",
+            head_modules={"atac": adapter_head},
+        )
+        router = ServedModelRouter(
+            base_model=m, runtime=_stub_runtime(), entries=[entry]
+        )
+
+        router._attach_locked(entry)
+        router._active_id = entry.id
+        assert m.heads["atac"] is adapter_head
+
+        router._detach_active_locked()
+        assert m.heads["atac"] is native_head
+
+    def test_two_entries_can_overlay_the_same_head_name(self) -> None:
+        m = _TinyModel()
+        native_head = nn.Linear(8, 8)
+        head_a = nn.Linear(8, 4)
+        head_b = nn.Linear(8, 6)
+        m.heads["atac"] = native_head
+        base = _make_entry(m, id="base", kind="base")
+        entry_a = ServedModelEntry(
+            id="a", label=None, kind="adapter",
+            base_model_hash="sha256:demo",
+            head_modules={"atac": head_a},
+        )
+        entry_b = ServedModelEntry(
+            id="b", label=None, kind="adapter",
+            base_model_hash="sha256:demo",
+            head_modules={"atac": head_b},
+        )
+        router = ServedModelRouter(
+            base_model=m,
+            runtime=_stub_runtime(),
+            entries=[base, entry_a, entry_b],
+            adapter_factory=lambda _router, entry: entry.id,
+        )
+
+        assert router.select("a") == "a"
+        assert m.heads["atac"] is head_a
+        assert router.select("b") == "b"
+        assert m.heads["atac"] is head_b
+        assert router.select("base") == "base"
+        assert m.heads["atac"] is native_head
+
 
 # ---------------------------------------------------------------------------
 # Request-scoped locking (acquire)
