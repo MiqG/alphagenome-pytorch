@@ -22,8 +22,6 @@ from alphagenome.models import dna_output
 from alphagenome.models import junction_data_utils, track_data_utils
 from alphagenome.protos import dna_model_pb2, dna_model_service_pb2, dna_model_service_pb2_grpc, tensor_pb2
 
-from .adapter import LocalDnaModelAdapter
-
 LOGGER = logging.getLogger(__name__)
 
 

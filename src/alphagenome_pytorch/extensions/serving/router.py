@@ -32,7 +32,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import torch
 import torch.nn as nn
 
 from alphagenome_pytorch.extensions.serving.adapter import LocalDnaModelAdapter
