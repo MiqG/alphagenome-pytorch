@@ -303,6 +303,40 @@ def _verify_bundle_base_hash(model, manifest) -> None:
         )
 
 
+def _verify_bundle_base_weights_hash(
+    weights_path: str,
+    manifest,
+    *,
+    actual_hash: str | None = None,
+) -> str | None:
+    """Verify the exact base checkpoint/fold recorded by a bundle.
+
+    Legacy manifests without an exact hash remain loadable, but emit a warning
+    because only structural compatibility can be checked.
+    """
+    expected_hash = manifest.base_model_weights_hash
+    if expected_hash is None:
+        LOGGER.warning(
+            "Bundle %r has no base_model_weights_hash; exact base-weight "
+            "identity cannot be verified (legacy bundle).",
+            manifest.id,
+        )
+        return actual_hash
+
+    if actual_hash is None:
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            compute_base_model_weights_hash_from_file,
+        )
+        actual_hash = compute_base_model_weights_hash_from_file(weights_path)
+    if actual_hash != expected_hash:
+        raise ValueError(
+            f"Bundle {manifest.id!r} declares base_model_weights_hash="
+            f"{expected_hash!r} but --weights hashes to {actual_hash!r}. "
+            "Refusing to serve the adapter on a different base checkpoint/fold."
+        )
+    return actual_hash
+
+
 def _finetuned_default_organism(meta: dict) -> int:
     """Default organism index for a fine-tuned model, from the resolved metadata.
 
@@ -336,6 +370,9 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
             transfer_config = transfer_config_from_dict(json.load(f))
 
     checkpoint_path, manifest = _resolve_checkpoint_and_manifest(args.checkpoint)
+
+    if manifest is not None:
+        _verify_bundle_base_weights_hash(args.weights, manifest)
 
     model, meta = load_finetuned_model(
         checkpoint_path=checkpoint_path,
@@ -433,6 +470,12 @@ def _build_catalog_router(args: argparse.Namespace):
 
     catalog = load_catalog(args.adapter_catalog)
 
+    # Compute the canonical numerical identity once for every catalog bundle.
+    from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        compute_base_model_weights_hash_from_file,
+    )
+    actual_base_weights_hash = compute_base_model_weights_hash_from_file(args.weights)
+
     # Build base model + shared runtime exactly as in singleton-base mode, but
     # without constructing a singleton scorer (each entry brings its own).
     model = AlphaGenome(num_organisms=2)
@@ -467,6 +510,9 @@ def _build_catalog_router(args: argparse.Namespace):
     for spec in catalog.adapters:
         bundle_paths: BundlePaths = resolve_bundle(spec.source)
         manifest = Manifest.load(bundle_paths.manifest)
+        _verify_bundle_base_weights_hash(
+            args.weights, manifest, actual_hash=actual_base_weights_hash
+        )
         if spec.label and not manifest.label:
             manifest.label = spec.label
         # Override the manifest id with the catalog's spec id so users can
@@ -523,6 +569,7 @@ def _build_catalog_router(args: argparse.Namespace):
             scorer=entry_scorer,
             default_organism=organism_ctx.default_organism_index,
             runtime=entry_runtime,
+            base_model_weights_hash=actual_base_weights_hash,
         ))
 
     if not entries:

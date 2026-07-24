@@ -48,10 +48,14 @@ def _register_export(sub: argparse._SubParsersAction) -> None:
                    help="Identifier of the base model (e.g. an HF repo).")
     p.add_argument("--base-weights", default=None,
                    help="Base weights file. Required for safetensors-source exports "
-                        "to compute base_model_hash; optional for .delta.pth sources "
-                        "(hash is read from the checkpoint).")
+                        "to compute base_model_hash; also computes the exact "
+                        "base_model_weights_hash. Optional for .delta.pth sources "
+                        "that already carry both hashes.")
     p.add_argument("--base-model-hash", default=None,
                    help="Override base model hash explicitly (skips loading base weights).")
+    p.add_argument("--base-model-weights-hash", default=None,
+                   help="Override the exact canonical base weights hash. Usually "
+                        "computed automatically from --base-weights.")
     p.add_argument("--genome", default=None)
     p.add_argument("--organism", default=None,
                    choices=["human", "mouse"])
@@ -85,7 +89,7 @@ def _register_validate(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument("bundle_dir", help="Path to a local bundle directory.")
     p.add_argument("--base-weights", default=None,
-                   help="Base weights file to verify base_model_hash against.")
+                   help="Base weights file to verify both base model hashes against.")
 
 
 def _register_pull(sub: argparse._SubParsersAction) -> None:
@@ -180,6 +184,7 @@ def _run_export(args: argparse.Namespace) -> int:
         _apply_organism_override(adapter_out, args.organism)
 
     base_hash = _resolve_base_model_hash(args, summary)
+    base_weights_hash = _resolve_base_model_weights_hash(args, summary)
 
     heads_list: list[str] = []
     if args.heads:
@@ -197,6 +202,7 @@ def _run_export(args: argparse.Namespace) -> int:
     manifest = Manifest(
         id=args.bundle_id,
         base_model_hash=base_hash,
+        base_model_weights_hash=base_weights_hash,
         label=args.label,
         base_model_id=args.base_model_id,
         alphagenome_pytorch_version=summary.get("alphagenome_pytorch_version") or ag_version,
@@ -234,7 +240,8 @@ def _run_export(args: argparse.Namespace) -> int:
             f"  manifest: alphagenome_adapter.json\n"
             f"  weights:  {adapter_out.name}\n"
             f"  id:       {manifest.id}\n"
-            f"  base hash: {manifest.base_model_hash}"
+            f"  structure hash: {manifest.base_model_hash}\n"
+            f"  weights hash:   {manifest.base_model_weights_hash or '—'}"
         )
     return 0
 
@@ -246,7 +253,7 @@ def _materialize_adapter_safetensors(
 
     The summary dict captures fields that we want to surface in the manifest:
     ``adapter_summary``, ``new_head_names``, ``alphagenome_pytorch_version``,
-    ``provenance``, plus ``base_model_hash`` if the source carried one.
+    ``provenance``, plus base structure/weights hashes if the source carried them.
     """
     from alphagenome_pytorch.extensions.finetuning.checkpointing import (
         _read_delta_export_header,
@@ -348,6 +355,11 @@ def _convert_delta_checkpoint_to_export(src: Path, dest: Path) -> dict[str, Any]
         metadata["organism"] = json.dumps(ckpt_meta["organism"])
     if ckpt_meta.get("organism_indices") is not None:
         metadata["organism_indices"] = json.dumps(ckpt_meta["organism_indices"])
+    source_weights_hash = checkpoint.get("base_model_weights_hash")
+    if source_weights_hash is None:
+        source_weights_hash = ckpt_meta.get("base_model_weights_hash")
+    if source_weights_hash is not None:
+        metadata["base_model_weights_hash"] = json.dumps(source_weights_hash)
 
     save_file(
         {k: v.contiguous().cpu() for k, v in weights.items()},
@@ -357,6 +369,7 @@ def _convert_delta_checkpoint_to_export(src: Path, dest: Path) -> dict[str, Any]
 
     summary = _summary_from_header({"transfer_config": transfer_config})
     summary["base_model_hash_from_source"] = checkpoint.get("base_model_hash")
+    summary["base_model_weights_hash_from_source"] = source_weights_hash
     summary["alphagenome_pytorch_version"] = ckpt_meta.get(
         "alphagenome_pytorch_version"
     )
@@ -440,6 +453,9 @@ def _summary_from_header(header: dict[str, Any]) -> dict[str, Any]:
         "new_head_names": new_head_names,
         "modalities": modalities,
         "num_tracks": total_tracks if have_track_counts else None,
+        "base_model_weights_hash_from_source": header.get(
+            "base_model_weights_hash"
+        ),
     }
 
 
@@ -490,6 +506,21 @@ def _hash_from_base_weights(weights_path: Path) -> str:
     return compute_base_model_hash(model)
 
 
+def _resolve_base_model_weights_hash(
+    args: argparse.Namespace, summary: dict[str, Any]
+) -> str | None:
+    """Resolve exact base identity, preserving compatibility with old exports."""
+    explicit = getattr(args, "base_model_weights_hash", None)
+    if explicit:
+        return explicit
+    if args.base_weights:
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            compute_base_model_weights_hash_from_file,
+        )
+        return compute_base_model_weights_hash_from_file(args.base_weights)
+    return summary.get("base_model_weights_hash_from_source")
+
+
 # ---------------------------------------------------------------------------
 # inspect
 # ---------------------------------------------------------------------------
@@ -522,7 +553,8 @@ def _run_inspect(args: argparse.Namespace) -> int:
         f"  id:           {manifest.id}",
         f"  label:        {manifest.label or '—'}",
         f"  base_model:   {manifest.base_model_id or '—'}",
-        f"  base hash:    {manifest.base_model_hash}",
+        f"  structure hash: {manifest.base_model_hash}",
+        f"  weights hash:   {manifest.base_model_weights_hash or '—'}",
         f"  ag version:   {manifest.alphagenome_pytorch_version or '—'}",
         f"  genome:       {manifest.genome or '—'}",
         f"  organism:     {manifest.organism or '—'}",
@@ -557,7 +589,11 @@ def _run_validate(args: argparse.Namespace) -> int:
     if args.base_weights:
         base_model = _build_base_model(Path(args.base_weights))
 
-    report = validate_bundle(args.bundle_dir, base_model=base_model)
+    report = validate_bundle(
+        args.bundle_dir,
+        base_model=base_model,
+        base_weights_path=args.base_weights,
+    )
 
     json_mode = getattr(args, "json_output", False)
     if json_mode:

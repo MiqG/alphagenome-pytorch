@@ -12,8 +12,9 @@ The manifest is **display/provenance only**. The loading truth lives in the
 safetensors metadata (``transfer_config``, optional ``track_names`` and
 ``track_metadata``); the existing ``load_delta_weights`` /
 ``load_finetuned_model`` paths read those directly. The manifest's
-``base_model_hash`` is cross-checked against the live base model at load time
-so users get a clear error on mismatch.
+``base_model_hash`` is cross-checked against the live base model at load time,
+and newer bundles additionally verify ``base_model_weights_hash`` against the
+base weights file so a compatible-but-wrong fold cannot be used silently.
 """
 
 from __future__ import annotations
@@ -76,6 +77,8 @@ class Manifest:
     license: str | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
     adapter_filename: str = DEFAULT_ADAPTER_FILENAME
+    # Appended to preserve the positional constructor order of schema v1.
+    base_model_weights_hash: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -193,6 +196,7 @@ def _read_safetensors_transfer_config(adapter_path: Path) -> dict[str, Any]:
 def validate_bundle(
     bundle_dir: Path | str,
     base_model: Any | None = None,
+    base_weights_path: Path | str | None = None,
 ) -> ValidationReport:
     """Validate a bundle directory.
 
@@ -201,6 +205,8 @@ def validate_bundle(
     - Adapter safetensors file exists and embeds a ``transfer_config``.
     - If ``base_model`` is provided, ``compute_base_model_hash(base_model)``
       matches the manifest's ``base_model_hash``.
+    - If ``base_weights_path`` is provided, its canonical trunk tensor hash
+      matches ``base_model_weights_hash`` when the bundle records one.
     - The manifest's ``adapter_summary`` kinds (if set) are present in the
       ``transfer_config`` mode.
 
@@ -256,6 +262,30 @@ def validate_bundle(
                     f"hashes to {actual_hash!r}"
                 )
 
+    if base_weights_path is not None:
+        if manifest.base_model_weights_hash is None:
+            warnings.append(
+                "Manifest has no base_model_weights_hash; exact base-weight "
+                "identity was not verified (legacy bundle)."
+            )
+        else:
+            try:
+                from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+                    compute_base_model_weights_hash_from_file,
+                )
+                actual_weights_hash = compute_base_model_weights_hash_from_file(
+                    base_weights_path
+                )
+            except Exception as exc:
+                errors.append(f"Could not compute base_model_weights_hash: {exc}")
+            else:
+                if actual_weights_hash != manifest.base_model_weights_hash:
+                    errors.append(
+                        "base_model_weights_hash mismatch: manifest declares "
+                        f"{manifest.base_model_weights_hash!r} but supplied base "
+                        f"weights hash to {actual_weights_hash!r}"
+                    )
+
     return ValidationReport(
         bundle_dir=bundle_dir,
         ok=not errors,
@@ -289,7 +319,8 @@ Adapter bundle exported by `agt adapters export`.
 | Tracks | {n_tracks} |
 | Biosample | {biosample} |
 | Base model | `{base_model_id}` |
-| Base model hash | `{base_model_hash}` |
+| Base model structure hash | `{base_model_hash}` |
+| Base model weights hash | `{base_model_weights_hash}` |
 | alphagenome-pytorch version | `{ag_version}` |
 
 ## Usage
@@ -320,10 +351,11 @@ agt serve --weights base.safetensors --checkpoint "$BUNDLE" --fasta hg38.fa
 
 `agt serve` takes the bundle *directory* (`"$BUNDLE"`), not the inner
 safetensors file, so it can read `alphagenome_adapter.json` and verify the
-manifest's `Base model hash` against `--weights` before serving. The manifest is
+manifest's base structure and exact weights hashes against `--weights` before
+serving. The manifest is
 otherwise display/provenance only: loading reads the embedded `transfer_config`
 from the safetensors metadata via `load_finetuned_model`. Use a base model whose
-hash matches `Base model hash` above.
+hashes match those above.
 """
 
 
@@ -376,6 +408,7 @@ def render_model_card(manifest: Manifest) -> str:
         biosample=manifest.biosample or "—",
         base_model_id=manifest.base_model_id or "—",
         base_model_hash=manifest.base_model_hash,
+        base_model_weights_hash=manifest.base_model_weights_hash or "—",
         ag_version=manifest.alphagenome_pytorch_version or "—",
         adapter_filename=manifest.adapter_filename,
         head=head,

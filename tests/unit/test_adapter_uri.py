@@ -380,6 +380,29 @@ class TestVerifyBundleBaseHash:
             _verify_bundle_base_hash(model, manifest)
 
 
+class TestVerifyBundleBaseWeightsHash:
+    def test_passes_and_rejects_exact_identity(self) -> None:
+        from alphagenome_pytorch.extensions.serving.cli import (
+            _verify_bundle_base_weights_hash,
+        )
+
+        exact = "sha256-tensors-v1:" + "1" * 64
+        manifest = Manifest(
+            id="exact",
+            base_model_hash="sha256:structure",
+            base_model_weights_hash=exact,
+        )
+        assert _verify_bundle_base_weights_hash(
+            "unused.pth", manifest, actual_hash=exact
+        ) == exact
+        with pytest.raises(ValueError, match="different base checkpoint/fold"):
+            _verify_bundle_base_weights_hash(
+                "unused.pth",
+                manifest,
+                actual_hash="sha256-tensors-v1:" + "2" * 64,
+            )
+
+
 # ---------------------------------------------------------------------------
 # CLI wiring: agt adapters pull (with mocked HF)
 # ---------------------------------------------------------------------------

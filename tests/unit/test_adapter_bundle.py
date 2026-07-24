@@ -51,13 +51,19 @@ def _lora_config() -> TransferConfig:
     )
 
 
-def _write_delta_pth(tmp_path: Path, *, base_hash: str | None = None) -> Path:
+def _write_delta_pth(
+    tmp_path: Path,
+    *,
+    base_hash: str | None = None,
+    base_weights_hash: str | None = None,
+) -> Path:
     model = _make_lora_model()
     cfg = _lora_config()
     p = tmp_path / "src.delta.pth"
     save_delta_checkpoint(
         p, model, cfg,
         base_model_hash=base_hash,
+        base_model_weights_hash=base_weights_hash,
         epoch=3, val_loss=0.2,
         track_metadata=[{"head": "atac", "track_name": "demo", "is_padding": False}],
     )
@@ -103,6 +109,7 @@ def _make_export_args(**overrides) -> argparse.Namespace:
         base_model_id=None,
         base_weights=None,
         base_model_hash=None,
+        base_model_weights_hash=None,
         genome=None,
         organism=None,
         modality=None,
@@ -260,6 +267,40 @@ class TestValidateBundle:
         assert report.ok  # still ok; mismatch is a warning
         assert any("houlsby" in w for w in report.warnings)
 
+    def test_exact_base_weights_hash_is_verified(self, tmp_path: Path) -> None:
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            compute_base_model_weights_hash_from_file,
+        )
+
+        bundle = tmp_path / "b"
+        _export_via_cli(tmp_path, bundle, base_model_hash="sha256:demo")
+        weights = tmp_path / "base.pth"
+        torch.save({"trunk.weight": torch.arange(4, dtype=torch.float32)}, weights)
+        manifest = Manifest.load(bundle)
+        manifest.base_model_weights_hash = (
+            compute_base_model_weights_hash_from_file(weights)
+        )
+        manifest.dump(bundle)
+
+        assert validate_bundle(bundle, base_weights_path=weights).ok
+
+        torch.save({"trunk.weight": torch.arange(4, dtype=torch.float32) + 1}, weights)
+        report = validate_bundle(bundle, base_weights_path=weights)
+        assert not report.ok
+        assert any("base_model_weights_hash mismatch" in e for e in report.errors)
+
+    def test_old_bundle_warns_when_exact_verification_requested(
+        self, tmp_path: Path
+    ) -> None:
+        bundle = tmp_path / "b"
+        _export_via_cli(tmp_path, bundle, base_model_hash="sha256:demo")
+        weights = tmp_path / "base.pth"
+        torch.save({"trunk.weight": torch.ones(1)}, weights)
+
+        report = validate_bundle(bundle, base_weights_path=weights)
+        assert report.ok
+        assert any("legacy bundle" in warning for warning in report.warnings)
+
     def test_missing_adapter_file_errors(self, tmp_path: Path) -> None:
         bundle = tmp_path / "b"
         _export_via_cli(tmp_path, bundle, base_model_hash="sha256:demo")
@@ -288,6 +329,28 @@ def _export_via_cli(tmp_path: Path, out: Path, *, base_model_hash: str) -> Path:
 
 
 class TestExportCli:
+    def test_export_carries_exact_base_weights_hash(self, tmp_path: Path) -> None:
+        exact_hash = "sha256-tensors-v1:" + "a" * 64
+        src = _write_delta_pth(
+            tmp_path,
+            base_hash="sha256:structure",
+            base_weights_hash=exact_hash,
+        )
+        out = tmp_path / "bundle"
+
+        assert adapters_cli.run(_make_export_args(
+            checkpoint=str(src), out=str(out), bundle_id="exact",
+        )) == 0
+
+        manifest = Manifest.load(out)
+        assert manifest.base_model_weights_hash == exact_hash
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            _read_delta_export_header,
+        )
+        header = _read_delta_export_header(BundlePaths.resolve(out).adapter_safetensors)
+        assert header["base_model_weights_hash"] == exact_hash
+        assert exact_hash in render_model_card(manifest)
+
     def test_export_from_delta_pth(self, tmp_path: Path) -> None:
         src = _write_delta_pth(tmp_path, base_hash="sha256:from-ckpt")
         out = tmp_path / "bundle"
@@ -805,6 +868,48 @@ class TestCatalogAdapterDevicePlacement:
         assert entry.metadata_catalog is sentinel_catalog
         assert entry.track_names == {"atac": ["t0"]}
         assert entry.default_organism == 1
+
+    def test_precomputed_weights_hash_avoids_live_model_rehash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Catalog construction reuses the source-file hash for every entry."""
+        from alphagenome_pytorch.extensions.finetuning import checkpointing
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            compute_base_model_hash,
+        )
+        from alphagenome_pytorch.extensions.serving.router import (
+            build_adapter_entry,
+        )
+
+        exact_hash = "sha256-tensors-v1:" + "a" * 64
+        base = self._base("cpu")
+        delta = tmp_path / "src.delta.pth"
+        save_delta_checkpoint(
+            delta,
+            _make_lora_model(),
+            _lora_config(),
+            base_model_hash=compute_base_model_hash(base),
+            base_model_weights_hash=exact_hash,
+        )
+        out = tmp_path / "bundle"
+        assert adapters_cli.run(_make_export_args(
+            checkpoint=str(delta), out=str(out), bundle_id="d",
+        )) == 0
+        paths = BundlePaths.resolve(out)
+
+        def _unexpected_live_hash(_model):
+            raise AssertionError("live base model was rehashed")
+
+        monkeypatch.setattr(
+            checkpointing, "compute_base_model_weights_hash", _unexpected_live_hash
+        )
+        entry = build_adapter_entry(
+            base_model=base,
+            bundle_paths=paths,
+            manifest=Manifest.load(paths.manifest),
+            base_model_weights_hash=exact_hash,
+        )
+        assert entry.id == "d"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cuda_placement(self, tmp_path: Path) -> None:
