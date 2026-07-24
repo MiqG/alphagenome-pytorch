@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from alphagenome_pytorch.cli._output import emit_error, emit_json, emit_text
+from alphagenome_pytorch.cli._output import emit_json, emit_text
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:

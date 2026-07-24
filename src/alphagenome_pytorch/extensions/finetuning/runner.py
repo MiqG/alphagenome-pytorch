@@ -70,7 +70,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -100,10 +99,8 @@ from alphagenome_pytorch.extensions.finetuning import (
     GenomicDataset,
     MultimodalDataset,
     compute_track_means,
-    collate_genomic,
     collate_multimodal,
     # Model
-    MODALITY_CONFIGS,
     TransferConfig,
     # Training
     create_lr_scheduler,

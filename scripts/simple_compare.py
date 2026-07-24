@@ -4,14 +4,12 @@ import torch
 import numpy as np
 import jax
 import jax.numpy as jnp
-import haiku as hk
 import argparse
 
 # Add src to path
 sys.path.append(os.path.join(os.getcwd(), 'src'))
 
 from alphagenome_research.model import dna_model
-from alphagenome.models import dna_output
 from alphagenome_pytorch.model import AlphaGenome
 
 def run_compare(jax_checkpoint, torch_weights='model.pth'):
@@ -104,7 +102,7 @@ def compare_outputs(pt_out, jax_out):
         valid_mask = ~np.isnan(jax_arr) & ~np.isnan(pt_arr)
         
         if not valid_mask.any():
-            print(f"    All values are NaN")
+            print("    All values are NaN")
             return
         
         jax_valid = jax_arr[valid_mask]
@@ -146,7 +144,7 @@ def compare_outputs(pt_out, jax_out):
         # Compare 1bp resolution
         jax_key_1bp = 'predictions_1bp'
         if jax_key_1bp in jax_head and 1 in pt_head:
-            print(f"  Resolution 1bp:")
+            print("  Resolution 1bp:")
             compare_arrays(jax_head[jax_key_1bp], pt_head[1].cpu().numpy(), f"{head_name}_1bp")
         else:
             print(f"  Resolution 1bp: Missing (JAX has {list(jax_head.keys())}, PT has {list(pt_head.keys())})")
@@ -154,10 +152,10 @@ def compare_outputs(pt_out, jax_out):
         # Compare 128bp resolution
         jax_key_128bp = 'predictions_128bp'
         if jax_key_128bp in jax_head and 128 in pt_head:
-            print(f"  Resolution 128bp:")
+            print("  Resolution 128bp:")
             compare_arrays(jax_head[jax_key_128bp], pt_head[128].cpu().numpy(), f"{head_name}_128bp")
         else:
-            print(f"  Resolution 128bp: Missing")
+            print("  Resolution 128bp: Missing")
     
     # Compare 128bp-only heads
     for head_name in heads_128bp_only:
@@ -176,7 +174,7 @@ def compare_outputs(pt_out, jax_out):
         if jax_key_128bp in jax_head and 128 in pt_head:
             compare_arrays(jax_head[jax_key_128bp], pt_head[128].cpu().numpy(), f"{head_name}_128bp")
         else:
-            print(f"  Missing predictions")
+            print("  Missing predictions")
 
 
 if __name__ == "__main__":

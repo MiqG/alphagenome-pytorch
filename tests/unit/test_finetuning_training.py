@@ -7,7 +7,6 @@ modality configuration, and utility functions.
 
 import pytest
 import torch
-from torch import Tensor
 
 from alphagenome_pytorch.extensions.finetuning.training import (
     create_lr_scheduler,

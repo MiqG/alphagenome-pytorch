@@ -366,7 +366,6 @@ def _extract_track_means(pytorch_model, organism_index):
 
     Returns dict mapping '{head_name}_{resolution}' to track means array.
     """
-    import torch
 
     track_means_dict = {}
 
@@ -469,7 +468,6 @@ def run_jax_training_per_head_loss(jax_model):
 
     Uses production settings: positional_weight=5.0 and target scaling.
     """
-    import jax
     import jax.numpy as jnp
     import haiku as hk
     import jmp

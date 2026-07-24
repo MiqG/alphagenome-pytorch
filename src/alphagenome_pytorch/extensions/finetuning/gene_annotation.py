@@ -66,10 +66,10 @@ def load_gene_table(
     if filter_protein_coding:
         if "gene_type" not in gene_rows.columns:
             raise ValueError(
-                f"filter_protein_coding=True requires a 'gene_type' column "
-                f"in the GTF, but it was not found. Pass "
-                f"filter_protein_coding=False to disable, or use a GTF with "
-                f"biotype annotations."
+                "filter_protein_coding=True requires a 'gene_type' column "
+                "in the GTF, but it was not found. Pass "
+                "filter_protein_coding=False to disable, or use a GTF with "
+                "biotype annotations."
             )
         gene_rows = gene_rows[gene_rows["gene_type"] == "protein_coding"]
         if gene_rows.empty:

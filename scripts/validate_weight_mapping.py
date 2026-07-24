@@ -123,7 +123,6 @@ def main():
 
     # Load PyTorch model
     print("Initializing PyTorch model...")
-    import torch
     from alphagenome_pytorch.model import AlphaGenome
     pt_model = AlphaGenome(num_organisms=2)
     pt_state_dict = pt_model.state_dict()

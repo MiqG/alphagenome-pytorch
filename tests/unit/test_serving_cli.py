@@ -17,7 +17,6 @@ serving coverage lives in the existing REST/gRPC test files.
 from __future__ import annotations
 
 import argparse
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -188,7 +187,6 @@ def test_checkpoint_without_metadata_yields_no_catalog():
 
 def test_default_organism_uses_resolved_default_index():
     """Serving consumes the loader-resolved ``default_organism_index`` (no re-resolution)."""
-    import pytest
 
     from alphagenome_pytorch.extensions.serving.cli import _finetuned_default_organism
 

@@ -138,7 +138,8 @@ def mock_data_dir(project_root):
 
     if missing:
         # Generate mock data
-        import subprocess, sys
+        import subprocess
+        import sys
         script = project_root / "tests" / "create_mock_data.py"
         result = subprocess.run(
             [sys.executable, str(script), "--output_dir", str(mock_dir)],

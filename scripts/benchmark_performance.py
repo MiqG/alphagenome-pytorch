@@ -14,7 +14,7 @@ from typing import Dict
 
 import numpy as np
 import torch
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import profile, ProfilerActivity
 
 # =============================================================================
 # Hardware Information
@@ -170,7 +170,7 @@ def main():
         with open(f"outputs/model_inference_{seq_length}_table.txt", "w") as f:
             f.write(table)
             # Write the summary as part of the output too
-            f.write(f"\n--- Summary ---")
+            f.write("\n--- Summary ---")
             f.write(f"\nWall-clock time:       {wall_clock_ms:.1f} ms")
             f.write(f"\nTotal GFLOPS:          {total_flops / 1e9:.2f}")
             f.write(f"\nPeak memory allocated: {peak_allocated_gb:.2f} GB")

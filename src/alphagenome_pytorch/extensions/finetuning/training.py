@@ -10,7 +10,6 @@ import math
 import time
 from collections import defaultdict
 from contextlib import nullcontext
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -545,7 +544,7 @@ class ProfilingStats:
         lines.append(f"AVG TIME PER BATCH: {total_time/n_batches*1000:.2f} ms")
 
         # Breakdown percentages
-        lines.append(f"\nBREAKDOWN:")
+        lines.append("\nBREAKDOWN:")
         for name, times in sorted(self.times.items()):
             pct = np.sum(times) / total_time * 100
             lines.append(f"  {name}: {pct:.1f}%")

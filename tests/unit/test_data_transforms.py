@@ -1,7 +1,6 @@
 """Unit tests for data_transforms module."""
 
 import numpy as np
-import pytest
 import torch
 
 from alphagenome_pytorch.extensions.finetuning.data_transforms import (
@@ -13,8 +12,6 @@ from alphagenome_pytorch.extensions.finetuning.data_transforms import (
     smooth_clip_inverse,
     apply_atac_transforms,
     apply_rnaseq_transforms,
-    DEFAULT_SOFT_CLIP_THRESHOLD,
-    DEFAULT_TOTAL_COUNT,
 )
 
 

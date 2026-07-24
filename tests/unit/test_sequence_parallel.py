@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import socket
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch

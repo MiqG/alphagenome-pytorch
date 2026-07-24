@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 from alphagenome_pytorch.cli._deps import require_extra
-from alphagenome_pytorch.cli._output import emit_json, emit_text
+from alphagenome_pytorch.cli._output import emit_json
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
@@ -116,7 +116,6 @@ def _run_scale_bigwig(args: argparse.Namespace) -> int:
 
     json_mode = getattr(args, "json_output", False)
 
-    import numpy as np
 
     target = parse_target(args.target)
     bigwig_files = args.input
