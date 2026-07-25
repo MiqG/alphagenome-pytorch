@@ -11,6 +11,56 @@ from .config import DtypePolicy
 from .named_outputs import NamedOutputs, TrackMetadataCatalog
 from alphagenome_pytorch.utils.splicing import generate_splice_site_positions
 
+
+# --- Sequence-length constraints (imposed by the encoder/decoder + pair path) ---
+# Two geometry constraints stack, and the tighter one binds:
+#   1. Encoder/decoder: the encoder halves the sequence 7 times (one initial pool
+#      + six DownResBlocks) down to 128 bp trunk bins, and the decoder rebuilds
+#      full resolution through U-Net skips. That alone requires a multiple of 128.
+#   2. Transformer pair path: SequenceToPairBlock pools the 128 bp trunk by a
+#      further factor of 16, and AttentionBiasBlock expands the resulting bias
+#      back by 16 (``repeat_interleave``). Those two steps only realign when the
+#      trunk length is a multiple of 16 — i.e. the *input* length is a multiple
+#      of 128 * 16 = 2048. The pair path runs on every transformer block and its
+#      bias is added to the main attention logits, so a length that is a multiple
+#      of 128 but NOT of 2048 crashes the forward pass (shape mismatch in the
+#      attention bias / value matmul) for *all* outputs, not just contact maps.
+# The binding constraint is therefore a multiple of 2048. The model was trained
+# on windows up to 1 Mb; longer is untested.
+#
+# This is the single source of truth for the constraint — the serving layer and
+# the predict CLI both call ``validate_sequence_length``, so relaxing or
+# tightening the rule (e.g. a new max) is a one-line change here.
+SEQUENCE_LENGTH_BIN = 128  # 2**7, from the encoder's seven pooling stages
+PAIR_POOL_FACTOR = 16  # extra pooling in SequenceToPairBlock / AttentionBiasBlock
+SEQUENCE_LENGTH_MULTIPLE = SEQUENCE_LENGTH_BIN * PAIR_POOL_FACTOR  # 2048
+MIN_SEQUENCE_LENGTH = SEQUENCE_LENGTH_MULTIPLE  # one pair bin (16 trunk bins)
+MAX_SEQUENCE_LENGTH = 2 ** 20  # 1_048_576 — trained ceiling
+
+
+def validate_sequence_length(length: int) -> None:
+    """Raise ``ValueError`` unless ``length`` is one the model can process.
+
+    Valid lengths are multiples of :data:`SEQUENCE_LENGTH_MULTIPLE` (2048) within
+    ``[MIN_SEQUENCE_LENGTH, MAX_SEQUENCE_LENGTH]``. The 2048 bp granularity comes
+    from the transformer's pair path, which pools the 128 bp trunk by 16 and
+    expands the attention bias back by 16; a length that is a multiple of 128 but
+    not of 2048 desynchronises those steps and crashes the forward pass (see the
+    module-level note above). At the 2048 bp minimum the contact-map grid is 1x1;
+    track outputs are unaffected.
+    """
+    if (
+        length < MIN_SEQUENCE_LENGTH
+        or length > MAX_SEQUENCE_LENGTH
+        or length % SEQUENCE_LENGTH_MULTIPLE != 0
+    ):
+        raise ValueError(
+            f"Sequence length {length} not supported. Length must be a multiple "
+            f"of {SEQUENCE_LENGTH_MULTIPLE} within "
+            f"[{MIN_SEQUENCE_LENGTH}, {MAX_SEQUENCE_LENGTH}]."
+        )
+
+
 class SequenceEncoder(nn.Module):
     """Encodes DNA sequence to trunk representation. Outputs NCL format (B, C, S)."""
 

@@ -345,6 +345,16 @@ def run(args: argparse.Namespace) -> int:
             "Use it alone for full-chromosome mode, or with --bed to filter regions."
         )
 
+    # The model input window must be a length AlphaGenome can process (a multiple
+    # of 128 within the trained range) — the same rule the serving layer enforces.
+    # Validate early so a bad --window-size fails in milliseconds, before weights
+    # load, rather than as a cryptic shape error mid-forward.
+    from alphagenome_pytorch.model import validate_sequence_length
+    try:
+        validate_sequence_length(args.window_size)
+    except ValueError as exc:
+        raise ValueError(f"--window-size {args.window_size}: {exc}") from exc
+
     needs_fasta = effective_mode in ("chromosomes", "locus", "bed")
     if needs_fasta:
         if not args.fasta:

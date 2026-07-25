@@ -14,6 +14,9 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
 )
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
     compute_base_model_hash,
+    base_model_structure_hashes_match,
+    compute_base_model_weights_hash,
+    compute_base_model_weights_hash_from_file,
     export_delta_weights,
     get_adapter_state_dict,
     get_new_head_state_dict,
@@ -204,6 +207,18 @@ class TestBaseModelHash:
 
         assert hash1 == hash2
         assert hash1.startswith("sha256:")
+        assert len(hash1.removeprefix("sha256:")) == 64
+
+    def test_legacy_short_hash_matches_full_hash(self):
+        model = nn.Sequential(nn.Linear(64, 64), nn.ReLU())
+        full_hash = compute_base_model_hash(model)
+        legacy_hash = full_hash[:len("sha256:") + 16]
+
+        assert base_model_structure_hashes_match(full_hash, legacy_hash)
+        assert base_model_structure_hashes_match(legacy_hash, full_hash)
+        assert not base_model_structure_hashes_match(
+            full_hash, "sha256:" + "0" * 16
+        )
 
     def test_hash_changes_with_different_model(self):
         """Different models should produce different hashes."""
@@ -214,6 +229,65 @@ class TestBaseModelHash:
         hash2 = compute_base_model_hash(model2)
 
         assert hash1 != hash2
+
+
+class TestBaseModelWeightsHash:
+    """Test exact, serialization-independent base weight identity."""
+
+    def test_v1_golden_digest(self):
+        """Lock the public v1 byte-level hashing contract."""
+        model = nn.Module()
+        model.trunk = nn.Linear(2, 2)
+        with torch.no_grad():
+            model.trunk.weight.copy_(
+                torch.tensor([[1.0, -2.0], [3.5, 0.0]])
+            )
+            model.trunk.bias.copy_(torch.tensor([0.25, -0.5]))
+
+        assert compute_base_model_weights_hash(model) == (
+            "sha256-tensors-v1:"
+            "f071874bc653cf4903b69c88ba1ce0b65059e30f680c437d2ddbe0f3bbe8150a"
+        )
+
+    def test_changes_with_tensor_values_not_just_structure(self):
+        model1 = nn.Sequential(nn.Linear(4, 3), nn.ReLU())
+        model2 = nn.Sequential(nn.Linear(4, 3), nn.ReLU())
+        model2.load_state_dict(model1.state_dict())
+
+        hash1 = compute_base_model_weights_hash(model1)
+        assert hash1 == compute_base_model_weights_hash(model2)
+        assert hash1.startswith("sha256-tensors-v1:")
+
+        with torch.no_grad():
+            model2[0].weight[0, 0] += 1
+        assert hash1 != compute_base_model_weights_hash(model2)
+        # Structural compatibility deliberately remains unchanged.
+        assert compute_base_model_hash(model1) == compute_base_model_hash(model2)
+
+    def test_excludes_heads(self):
+        model = nn.Module()
+        model.trunk = nn.Linear(4, 3)
+        model.heads = nn.ModuleDict({"test": nn.Linear(3, 2)})
+        before = compute_base_model_weights_hash(model)
+        with torch.no_grad():
+            model.heads["test"].weight.add_(10)
+        assert compute_base_model_weights_hash(model) == before
+
+    def test_same_digest_for_pth_and_safetensors(self, tmp_path: Path):
+        from safetensors.torch import save_file
+
+        state = {
+            "trunk.weight": torch.arange(12, dtype=torch.float32).reshape(3, 4),
+            "trunk.bias": torch.tensor([1, 2, 3], dtype=torch.float32),
+            "heads.demo.weight": torch.randn(2, 3),
+        }
+        pth = tmp_path / "base.pth"
+        safe = tmp_path / "base.safetensors"
+        torch.save(state, pth)
+        save_file(state, safe)
+
+        pth_hash = compute_base_model_weights_hash_from_file(pth)
+        assert pth_hash == compute_base_model_weights_hash_from_file(safe)
 
 
 class TestNewHeadStateDict:

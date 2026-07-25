@@ -62,6 +62,10 @@ Checkpointing
 
 .. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.compute_base_model_hash
 
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.compute_base_model_weights_hash
+
+.. autofunction:: alphagenome_pytorch.extensions.finetuning.checkpointing.compute_base_model_weights_hash_from_file
+
 .. autofunction:: alphagenome_pytorch.extensions.finetuning.transfer.transfer_config_to_dict
 
 .. autofunction:: alphagenome_pytorch.extensions.finetuning.transfer.transfer_config_from_dict

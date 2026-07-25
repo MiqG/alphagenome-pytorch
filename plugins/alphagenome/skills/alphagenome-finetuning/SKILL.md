@@ -77,6 +77,10 @@ Training: `--epochs 10`, `--batch-size 1`, `--lr 1e-4`, `--weight-decay 0.1`,
 --save-delta [--no-full-checkpoint]
 ```
 Works with every mode **except `full`** (which trains all parameters).
+Saving or exporting an adapter (`--save-delta`, `export_delta_weights`, or
+`agt adapters export` for a shareable bundle) works only from delta
+weights/checkpoints — merged adapters or a full-model fine-tune have no adapter
+weights to extract.
 
 **Multi-GPU** — DDP, or sequence parallelism to split one long sequence across GPUs.
 `torchrun` needs a module or script target, so use `-m`:
