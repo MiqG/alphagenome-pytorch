@@ -244,6 +244,37 @@ def _pt_metadata_to_track_df(
     return df
 
 
+def _drop_padding_tracks(df: pd.DataFrame) -> tuple[pd.DataFrame, np.ndarray | None]:
+    """Drop reserved padding tracks from a metadata frame.
+
+    Checkpoint heads are wider than the number of real assays: the unused
+    channels carry the reserved track name ``Padding`` (89 of the 256 ATAC
+    channels, for example). Upstream never exposes them — its own metadata
+    carries a boolean ``padding`` column that is filtered out before building
+    a ``TrackData`` — and here they are actively harmful, because
+    ``TrackData`` rejects the duplicated ``(name, strand)`` rows they create.
+
+    When *every* track is padding the head has no metadata at all (a
+    placeholder frame). Dropping them all would yield an empty response, so
+    keep the channels and give them unique synthetic names instead.
+
+    Returns:
+        ``(metadata, keep_mask)``, where ``keep_mask`` is ``None`` when no
+        columns need to be dropped from the accompanying values array.
+    """
+    if df.empty or 'name' not in df.columns:
+        return df, None
+    padding = df['name'].astype(str).str.strip().str.lower().eq('padding').to_numpy()
+    if not padding.any():
+        return df, None
+    if padding.all():
+        df = df.copy()
+        df['name'] = [f'track_{i}' for i in range(len(df))]
+        return df, None
+    keep = ~padding
+    return df.loc[keep].reset_index(drop=True), keep
+
+
 def _pt_metadata_to_junction_df(
     metadata: Sequence[PTTrackMetadata],
     num_tracks: int | None = None,
@@ -554,9 +585,12 @@ class LocalDnaModelAdapter:
             if not entries:
                 continue
             if official_output_type == dna_output.OutputType.SPLICE_JUNCTIONS:
-                metadata_kwargs[field_name] = self._pt_metadata_to_junction_df(entries)
+                frame = self._pt_metadata_to_junction_df(entries)
             else:
-                metadata_kwargs[field_name] = self._pt_metadata_to_track_df(entries)
+                frame = self._pt_metadata_to_track_df(entries)
+            # Keep the advertised metadata aligned with the tracks that
+            # predictions actually return (see ``_drop_padding_tracks``).
+            metadata_kwargs[field_name] = _drop_padding_tracks(frame)[0]
         return dna_output.OutputMetadata(**metadata_kwargs)
 
     def _extract_head_output(
@@ -631,6 +665,10 @@ class LocalDnaModelAdapter:
                 num_tracks=values.shape[-1],
             )
 
+            metadata, keep_padding_mask = _drop_padding_tracks(metadata)
+            if keep_padding_mask is not None:
+                values = values[..., keep_padding_mask]
+
             if ontology_terms and 'ontology_curie' in metadata.columns:
                 keep_mask = metadata['ontology_curie'].isin(ontology_terms).to_numpy()
                 metadata = metadata.loc[keep_mask].reset_index(drop=True)
@@ -687,6 +725,9 @@ class LocalDnaModelAdapter:
             organism_index=organism_index,
             num_tracks=scores.shape[-1],
         )
+        metadata, keep_padding_mask = _drop_padding_tracks(metadata)
+        if keep_padding_mask is not None:
+            scores = scores[:, keep_padding_mask]
         if ontology_terms and 'ontology_curie' in metadata.columns:
             keep_mask = metadata['ontology_curie'].isin(ontology_terms).to_numpy()
             metadata = metadata.loc[keep_mask].reset_index(drop=True)
