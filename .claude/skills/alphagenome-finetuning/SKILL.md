@@ -49,6 +49,9 @@ Gotchas:
 - `--locon-targets` is empty by default and **must** be set when Locon is enabled
   (e.g. `down_blocks.5`, or `down_blocks.4,down_blocks.5`).
 - `--save-delta` works with every mode except `full`.
+- Saving/exporting an adapter (`--save-delta`, `export_delta_weights`, or
+  `agt adapters export`) works only from delta weights/checkpoints — merged
+  adapters or a full-model fine-tune have no adapter weights to extract.
 - There is no `--overlap-lowres` flag; it is computed as `overlap_highres // 128`.
 
 For running predictions rather than training, see the `alphagenome-predictions`

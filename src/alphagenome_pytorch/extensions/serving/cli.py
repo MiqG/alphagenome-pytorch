@@ -212,6 +212,132 @@ def _resolve_finetuned_metadata_catalog(
     return None
 
 
+def _resolve_checkpoint_and_manifest(checkpoint: str):
+    """Resolve a ``--checkpoint`` value to ``(weights_path, manifest)``.
+
+    ``weights_path`` is the concrete file the loader consumes; ``manifest`` is
+    the bundle's parsed :class:`~...bundle.Manifest` when the checkpoint is a
+    bundle (a directory or URI carrying ``alphagenome_adapter.json``), otherwise
+    ``None``. The manifest is surfaced — not discarded — so the caller can
+    cross-check ``base_model_hash`` before serving, the same compatibility
+    guarantee catalog mode enforces in ``build_adapter_entry``.
+
+    Accepts:
+    - a path to a `.delta.pth` checkpoint or `.safetensors` delta-weights export,
+    - a local bundle directory (one with ``alphagenome_adapter.json``),
+    - any URI parseable by :func:`parse_bundle_uri` (``local:``, ``file:``,
+      ``hf://``).
+
+    Bundle directories resolve to the bundle's adapter safetensors path. Any
+    other input — including missing files — is returned unchanged (with a
+    ``None`` manifest) so the downstream loader can surface its native error.
+    """
+    from pathlib import Path
+
+    from alphagenome_pytorch.extensions.serving.bundle import (
+        BundlePaths,
+        MANIFEST_FILENAME,
+        Manifest,
+    )
+    from alphagenome_pytorch.extensions.serving.uri import (
+        parse_bundle_uri,
+        resolve_bundle,
+    )
+
+    # Plain filesystem paths (no URI scheme): just check if it's a bundle dir.
+    if "://" not in checkpoint and not checkpoint.startswith(
+        ("local:", "file:", "hf:")
+    ):
+        p = Path(checkpoint)
+        if p.is_dir() and (p / MANIFEST_FILENAME).is_file():
+            paths = BundlePaths.resolve(p)
+            return str(paths.adapter_safetensors), Manifest.load(paths.manifest)
+        return checkpoint, None
+
+    parsed = parse_bundle_uri(checkpoint)
+    if parsed.is_local:
+        local = Path(parsed.path)
+        if local.is_file():
+            return str(local), None
+        if local.is_dir() and (local / MANIFEST_FILENAME).is_file():
+            paths = resolve_bundle(parsed)
+            return str(paths.adapter_safetensors), Manifest.load(paths.manifest)
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+
+    # Remote URI (hf://). Resolve to a local bundle and return its adapter file.
+    paths = resolve_bundle(parsed)
+    return str(paths.adapter_safetensors), Manifest.load(paths.manifest)
+
+
+def _resolve_checkpoint_arg(checkpoint: str) -> str:
+    """Map a ``--checkpoint`` value to a concrete weights path.
+
+    Thin wrapper over :func:`_resolve_checkpoint_and_manifest` for callers that
+    only need the weights path.
+    """
+    return _resolve_checkpoint_and_manifest(checkpoint)[0]
+
+
+def _verify_bundle_base_hash(model, manifest) -> None:
+    """Refuse to serve a bundle whose base model is incompatible.
+
+    Mirrors the check ``build_adapter_entry`` runs in catalog mode: the bundle's
+    manifest records the ``base_model_hash`` (trunk structure) it was trained
+    against; if the base ``model`` we just loaded hashes to something else, the
+    adapter/head weights were built for a different architecture and would load
+    incorrectly. ``compute_base_model_hash`` is structural and invariant to the
+    applied adapters/merge, so it is safe to call on the fully-loaded model.
+    """
+    from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        base_model_structure_hashes_match,
+        compute_base_model_hash,
+    )
+
+    actual_hash = compute_base_model_hash(model)
+    if not base_model_structure_hashes_match(actual_hash, manifest.base_model_hash):
+        raise ValueError(
+            f"Bundle {manifest.id!r} declares base_model_hash="
+            f"{manifest.base_model_hash!r} but the base model hashes to "
+            f"{actual_hash!r}. Refusing to serve an adapter on an incompatible "
+            f"base — check that --weights matches the model the bundle was "
+            f"trained against, or rebuild the bundle."
+        )
+
+
+def _verify_bundle_base_weights_hash(
+    weights_path: str,
+    manifest,
+    *,
+    actual_hash: str | None = None,
+) -> str | None:
+    """Verify the exact base checkpoint/fold recorded by a bundle.
+
+    Legacy manifests without an exact hash remain loadable, but emit a warning
+    because only structural compatibility can be checked.
+    """
+    expected_hash = manifest.base_model_weights_hash
+    if expected_hash is None:
+        LOGGER.warning(
+            "Bundle %r has no base_model_weights_hash; exact base-weight "
+            "identity cannot be verified (legacy bundle).",
+            manifest.id,
+        )
+        return actual_hash
+
+    if actual_hash is None:
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            compute_base_model_weights_hash_from_file,
+        )
+        actual_hash = compute_base_model_weights_hash_from_file(weights_path)
+    if actual_hash != expected_hash:
+        raise ValueError(
+            f"Bundle {manifest.id!r} declares base_model_weights_hash="
+            f"{expected_hash!r} but --weights hashes to {actual_hash!r}. "
+            "Refusing to serve the adapter on a different base checkpoint/fold."
+        )
+    return actual_hash
+
+
 def _finetuned_default_organism(meta: dict) -> int:
     """Default organism index for a fine-tuned model, from the resolved metadata.
 
@@ -244,14 +370,25 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         with open(args.transfer_config) as f:
             transfer_config = transfer_config_from_dict(json.load(f))
 
+    checkpoint_path, manifest = _resolve_checkpoint_and_manifest(args.checkpoint)
+
+    if manifest is not None:
+        _verify_bundle_base_weights_hash(args.weights, manifest)
+
     model, meta = load_finetuned_model(
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=checkpoint_path,
         pretrained_weights=args.weights,
         device=args.device,
         dtype_policy=DtypePolicy.default(),
         transfer_config=transfer_config,
         merge=not args.no_merge_adapters,
     )
+    # Bundle serving must honour the same base-model compatibility guarantee as
+    # catalog mode (documented in docs/serving/adapters.rst). The manifest holds
+    # the only copy of base_model_hash — the delta safetensors does not embed it
+    # — so verify here now that resolution no longer discards the manifest.
+    if manifest is not None:
+        _verify_bundle_base_hash(model, manifest)
     metadata_catalog = _resolve_finetuned_metadata_catalog(args, meta)
     runtime = AlphaGenomePredictionRuntime(
         model=model,
@@ -268,9 +405,9 @@ def _build_checkpoint_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
         metadata_catalog=metadata_catalog,
     )
     LOGGER.info(
-        'Loaded fine-tuned checkpoint %s; variant scoring routes enabled '
-        'for heads supported by the checkpoint.',
-        args.checkpoint,
+        'Loaded fine-tuned checkpoint %s (resolved to %s); variant scoring '
+        'routes enabled for heads supported by the checkpoint.',
+        args.checkpoint, checkpoint_path,
     )
     return LocalDnaModelAdapter(runtime, scorer=scorer)
 
@@ -314,6 +451,150 @@ def _build_adapter(args: argparse.Namespace) -> LocalDnaModelAdapter:
     return _build_weights_adapter(args)
 
 
+def _load_catalog_base_weights(model, weights_path: str):
+    """Load all base weights for catalog serving in pth or safetensors format."""
+    from alphagenome_pytorch.extensions.finetuning.transfer import load_trunk
+
+    return load_trunk(
+        model,
+        weights_path,
+        exclude_heads=False,
+        strict=False,
+    )
+
+
+def _build_catalog_router(args: argparse.Namespace):
+    """Construct a :class:`ServedModelRouter` from ``--adapter-catalog``."""
+    from alphagenome_pytorch.extensions.serving.bundle import (
+        BundlePaths,
+        Manifest,
+    )
+    from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        _read_delta_export_header,
+        resolve_finetuned_organism,
+    )
+    from alphagenome_pytorch.extensions.serving.router import (
+        ServedModelRouter,
+        build_adapter_entry,
+        build_base_entry,
+        load_catalog,
+    )
+    from alphagenome_pytorch.extensions.serving.uri import resolve_bundle
+
+    catalog = load_catalog(args.adapter_catalog)
+
+    # Compute the canonical numerical identity once for every catalog bundle.
+    from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+        compute_base_model_weights_hash_from_file,
+    )
+    actual_base_weights_hash = compute_base_model_weights_hash_from_file(args.weights)
+
+    # Build base model + shared runtime exactly as in singleton-base mode, but
+    # without constructing a singleton scorer (each entry brings its own).
+    model = AlphaGenome(num_organisms=2)
+    model = _load_catalog_base_weights(model, args.weights)
+    model.to(args.device)
+    model.eval()
+
+    base_metadata_catalog = _load_metadata_catalog(args, include_bundled=True)
+    runtime = AlphaGenomePredictionRuntime(
+        model=model,
+        fasta_path=args.fasta,
+        metadata_catalog=base_metadata_catalog,
+        device=args.device,
+    )
+
+    entries = []
+    if catalog.base.enabled:
+        base_scorer = _make_variant_scorer(
+            runtime=runtime, model=model, args=args,
+            metadata_catalog=base_metadata_catalog,
+        )
+        entries.append(build_base_entry(
+            base_model=model,
+            id=catalog.base.id,
+            label=catalog.base.label,
+            metadata_catalog=base_metadata_catalog,
+            scorer=base_scorer,
+            runtime=runtime,
+        ))
+
+    for spec in catalog.adapters:
+        bundle_paths: BundlePaths = resolve_bundle(spec.source)
+        manifest = Manifest.load(bundle_paths.manifest)
+        _verify_bundle_base_weights_hash(
+            args.weights, manifest, actual_hash=actual_base_weights_hash
+        )
+        if spec.label and not manifest.label:
+            manifest.label = spec.label
+        # Override the manifest id with the catalog's spec id so users can
+        # alias bundles in their catalog file without rebuilding them.
+        manifest.id = spec.id
+
+        # Each served adapter describes itself: read its embedded delta header so
+        # the entry gets its OWN track metadata, track names, organism default,
+        # and variant scorer — not the base model's. An explicit --track-metadata
+        # still overrides (via _resolve_finetuned_metadata_catalog).
+        header = _read_delta_export_header(bundle_paths.adapter_safetensors)
+        entry_catalog = _resolve_finetuned_metadata_catalog(args, header)
+        entry_track_names = header.get("track_names")
+        organism_ctx = resolve_finetuned_organism(
+            organism_indices=header.get("organism_indices"),
+            checkpoint_organism=header.get("organism"),
+            track_metadata=header.get("track_metadata"),
+            num_organisms=model.num_organisms,
+        )
+        if organism_ctx.default_organism_index is None:
+            raise SystemExit(
+                f"agt serve: adapter {spec.id!r} was fine-tuned on multiple "
+                f"organisms {list(organism_ctx.organism_indices or [])}; "
+                "multi-organism serving is not supported. Serve a "
+                "single-organism bundle instead."
+            )
+        # One runtime per entry, shared by its service adapter AND its scorer so
+        # the predict and score paths resolve organism/metadata identically —
+        # in particular an organism-omitted request defaults to this bundle's
+        # organism (e.g. mouse), not human. Reuse the base runtime's sequence
+        # source (no second FASTA open) but carry this bundle's own metadata,
+        # track names, and default organism.
+        entry_runtime = AlphaGenomePredictionRuntime(
+            model=model,
+            sequence_source=runtime.sequence_source,
+            metadata_catalog=entry_catalog,
+            track_names=entry_track_names,
+            device=args.device,
+            default_organism=organism_ctx.default_organism_index,
+        )
+        entry_scorer = _make_variant_scorer(
+            runtime=entry_runtime,
+            model=model,
+            args=args,
+            metadata_catalog=entry_catalog,
+        )
+        # NB: build_adapter_entry mutates `model` and detaches before returning.
+        entries.append(build_adapter_entry(
+            base_model=model,
+            bundle_paths=bundle_paths,
+            manifest=manifest,
+            metadata_catalog=entry_catalog,
+            track_names=entry_track_names,
+            scorer=entry_scorer,
+            default_organism=organism_ctx.default_organism_index,
+            runtime=entry_runtime,
+            base_model_weights_hash=actual_base_weights_hash,
+        ))
+
+    if not entries:
+        raise ValueError(
+            "Adapter catalog produced no entries. Add a 'base:' block or at "
+            "least one adapter to the catalog file."
+        )
+
+    return ServedModelRouter(
+        base_model=model, runtime=runtime, entries=entries,
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     """Start the serving process based on parsed *args*."""
     logging.basicConfig(
@@ -321,16 +602,26 @@ def run(args: argparse.Namespace) -> int:
         format='%(asctime)s %(levelname)s %(name)s - %(message)s',
     )
 
-    adapter = _build_adapter(args)
+    catalog_path = getattr(args, "adapter_catalog", None)
+    if catalog_path and args.checkpoint:
+        raise SystemExit(
+            "agt serve: --adapter-catalog and --checkpoint are mutually exclusive."
+        )
+
+    if catalog_path:
+        target = _build_catalog_router(args)
+        LOGGER.info("Catalog mode: serving %d models", len(target.model_ids))
+    else:
+        target = _build_adapter(args)
 
     grpc_server = None
     if not args.disable_grpc:
-        grpc_server = serve_grpc(adapter, host=args.host, port=args.grpc_port, wait=False)
+        grpc_server = serve_grpc(target, host=args.host, port=args.grpc_port, wait=False)
         LOGGER.info('gRPC ready at %s:%d', args.host, args.grpc_port)
 
     rest_server = None
     if args.rest_port is not None:
-        rest_server = serve_rest(adapter, host=args.host, port=args.rest_port, wait=False)
+        rest_server = serve_rest(target, host=args.host, port=args.rest_port, wait=False)
         LOGGER.info('REST ready at http://%s:%d', args.host, args.rest_port)
 
     if grpc_server is None and rest_server is None:

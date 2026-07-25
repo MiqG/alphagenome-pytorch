@@ -125,6 +125,7 @@ from alphagenome_pytorch.extensions.finetuning import (
 )
 from alphagenome_pytorch.extensions.finetuning.adapters import get_adapter_params
 from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+    compute_base_model_weights_hash_from_file,
     save_checkpoint, load_checkpoint, save_delta_checkpoint,
     load_delta_checkpoint, is_delta_checkpoint,
 )
@@ -796,6 +797,16 @@ def main(args: argparse.Namespace | None = None) -> None:
     organism_index = organism_index_from_args(args)
     organism_name = "mouse" if organism_index == 1 else "human"
 
+    # Hash the pristine base file before any training mutation. Rank 0 performs
+    # the I/O once; all ranks receive the identity so every save path records
+    # the same exact fold/checkpoint provenance.
+    base_model_weights_hash = None
+    if is_main_process(rank):
+        base_model_weights_hash = compute_base_model_weights_hash_from_file(
+            args.pretrained_weights
+        )
+    base_model_weights_hash = broadcast_object(base_model_weights_hash, src=0)
+
     # Track identity embedded into every checkpoint/delta save below. Defined
     # once and spread as **metadata_kwargs so a new save site cannot silently
     # drop the embedded metadata. ``organism`` is the compatibility scalar;
@@ -807,6 +818,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         track_metadata=track_metadata_rows,
         organism=organism_name,
         organism_indices=[organism_index],
+        base_model_weights_hash=base_model_weights_hash,
     )
 
     # Build resolution weights per modality.
