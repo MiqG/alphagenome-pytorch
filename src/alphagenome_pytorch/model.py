@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 from pathlib import Path
 import warnings
 
@@ -8,7 +8,58 @@ from torch.utils.checkpoint import checkpoint
 
 from . import layers, convolutions, attention, embeddings, heads
 from .config import DtypePolicy
+from .named_outputs import NamedOutputs, TrackMetadataCatalog
 from alphagenome_pytorch.utils.splicing import generate_splice_site_positions
+
+
+# --- Sequence-length constraints (imposed by the encoder/decoder + pair path) ---
+# Two geometry constraints stack, and the tighter one binds:
+#   1. Encoder/decoder: the encoder halves the sequence 7 times (one initial pool
+#      + six DownResBlocks) down to 128 bp trunk bins, and the decoder rebuilds
+#      full resolution through U-Net skips. That alone requires a multiple of 128.
+#   2. Transformer pair path: SequenceToPairBlock pools the 128 bp trunk by a
+#      further factor of 16, and AttentionBiasBlock expands the resulting bias
+#      back by 16 (``repeat_interleave``). Those two steps only realign when the
+#      trunk length is a multiple of 16 — i.e. the *input* length is a multiple
+#      of 128 * 16 = 2048. The pair path runs on every transformer block and its
+#      bias is added to the main attention logits, so a length that is a multiple
+#      of 128 but NOT of 2048 crashes the forward pass (shape mismatch in the
+#      attention bias / value matmul) for *all* outputs, not just contact maps.
+# The binding constraint is therefore a multiple of 2048. The model was trained
+# on windows up to 1 Mb; longer is untested.
+#
+# This is the single source of truth for the constraint — the serving layer and
+# the predict CLI both call ``validate_sequence_length``, so relaxing or
+# tightening the rule (e.g. a new max) is a one-line change here.
+SEQUENCE_LENGTH_BIN = 128  # 2**7, from the encoder's seven pooling stages
+PAIR_POOL_FACTOR = 16  # extra pooling in SequenceToPairBlock / AttentionBiasBlock
+SEQUENCE_LENGTH_MULTIPLE = SEQUENCE_LENGTH_BIN * PAIR_POOL_FACTOR  # 2048
+MIN_SEQUENCE_LENGTH = SEQUENCE_LENGTH_MULTIPLE  # one pair bin (16 trunk bins)
+MAX_SEQUENCE_LENGTH = 2 ** 20  # 1_048_576 — trained ceiling
+
+
+def validate_sequence_length(length: int) -> None:
+    """Raise ``ValueError`` unless ``length`` is one the model can process.
+
+    Valid lengths are multiples of :data:`SEQUENCE_LENGTH_MULTIPLE` (2048) within
+    ``[MIN_SEQUENCE_LENGTH, MAX_SEQUENCE_LENGTH]``. The 2048 bp granularity comes
+    from the transformer's pair path, which pools the 128 bp trunk by 16 and
+    expands the attention bias back by 16; a length that is a multiple of 128 but
+    not of 2048 desynchronises those steps and crashes the forward pass (see the
+    module-level note above). At the 2048 bp minimum the contact-map grid is 1x1;
+    track outputs are unaffected.
+    """
+    if (
+        length < MIN_SEQUENCE_LENGTH
+        or length > MAX_SEQUENCE_LENGTH
+        or length % SEQUENCE_LENGTH_MULTIPLE != 0
+    ):
+        raise ValueError(
+            f"Sequence length {length} not supported. Length must be a multiple "
+            f"of {SEQUENCE_LENGTH_MULTIPLE} within "
+            f"[{MIN_SEQUENCE_LENGTH}, {MAX_SEQUENCE_LENGTH}]."
+        )
+
 
 class SequenceEncoder(nn.Module):
     """Encodes DNA sequence to trunk representation. Outputs NCL format (B, C, S)."""
@@ -278,7 +329,7 @@ class AlphaGenome(nn.Module):
         elif num_organisms == 2:
             # Human/mouse defaults matching the current pretrained setup.
             splice_usage_tracks_per_organism = (734, 180)
-            splice_junction_tracks_per_organism = (367, 90)
+            splice_junction_tracks_per_organism = (367, 367)
         else:
             warnings.warn(
                 "AlphaGenome currently only supports num_organisms in {1, 2}. "
@@ -302,6 +353,8 @@ class AlphaGenome(nn.Module):
             num_tracks_per_organism=splice_junction_tracks_per_organism,
             rope_init=rope_init,
         )
+
+        self._track_metadata_catalog: TrackMetadataCatalog | None = None
 
         # Convert model parameters to params_dtype
         # JAX keeps params in float32 even when computing in bfloat16
@@ -400,6 +453,170 @@ class AlphaGenome(nn.Module):
 
         return model
 
+    def set_track_metadata_catalog(self, catalog: TrackMetadataCatalog) -> None:
+        """Attach a metadata catalog used by named output views."""
+        self._track_metadata_catalog = catalog
+
+    def load_track_metadata(
+        self,
+        metadata_path: str | Path,
+        *,
+        default_organism: int = 0,
+        default_output_name: str | None = None,
+    ) -> TrackMetadataCatalog:
+        """Load track metadata (parquet/csv/tsv) and attach it to the model."""
+        catalog = TrackMetadataCatalog.from_file(
+            metadata_path,
+            default_organism=default_organism,
+            default_output_name=default_output_name,
+        )
+        self._track_metadata_catalog = catalog
+        return catalog
+
+    def named_outputs(
+        self,
+        outputs: dict,
+        *,
+        organism: int | str | torch.Tensor | None = None,
+        strict_metadata: bool = False,
+        metadata_catalog: TrackMetadataCatalog | None = None,
+        channels_last: bool = True,
+        include_padding: bool = False,
+    ) -> NamedOutputs:
+        """Wrap raw model outputs with metadata-aware named views.
+
+        Args:
+            outputs: Raw model output dict.
+            organism: Organism index or name.
+            strict_metadata: If True, raise on missing/mismatched metadata.
+            metadata_catalog: Override the model's attached catalog.
+            channels_last: If True, track axis is last dimension.
+            include_padding: If True, keep padding tracks. If False
+                (default), padding tracks are stripped.
+        """
+        catalog = metadata_catalog if metadata_catalog is not None else self._track_metadata_catalog
+        if catalog is None and not include_padding:
+            catalog = TrackMetadataCatalog.load_builtin()
+            self._track_metadata_catalog = catalog
+        return NamedOutputs.from_raw(
+            outputs,
+            organism=organism,
+            catalog=catalog,
+            strict_metadata=strict_metadata,
+            channels_last=channels_last,
+            include_padding=include_padding,
+        )
+
+    @classmethod
+    def from_delta(
+        cls,
+        delta_path: Union[str, Path],
+        base_path: Union[str, Path],
+        dtype_policy: Optional[DtypePolicy] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        **kwargs,
+    ) -> "AlphaGenome":
+        """Load a finetuned AlphaGenome model from delta weights and base weights.
+
+        This is the simplest way to load a finetuned model. It reconstructs the
+        full model from a small delta weights file (adapters + heads) and the
+        base pretrained weights.
+
+        Args:
+            delta_path: Path to the delta weights file (.safetensors or .pth)
+                created by ``export_delta_weights()``.
+            base_path: Path to the base pretrained weights file (.pth or
+                .safetensors) created by ``convert_weights.py``.
+            dtype_policy: DtypePolicy for precision control. Defaults to
+                DtypePolicy.full_float32().
+            device: Device to load the model onto ('cuda', 'cpu', etc.).
+                If None, loads to CPU.
+            **kwargs: Additional arguments passed to AlphaGenome constructor
+                (e.g., num_organisms, gradient_checkpointing).
+
+        Returns:
+            AlphaGenome model with base weights, adapters, and finetuned heads.
+
+        Example:
+            >>> model = AlphaGenome.from_delta(
+            ...     'colleague_lora.safetensors',
+            ...     'alphagenome_pretrained.pth',
+            ...     device='cuda',
+            ... )
+        """
+        from alphagenome_pytorch.extensions.finetuning.checkpointing import (
+            _read_delta_export_header,
+            finalize_finetuned_organism_context,
+            load_delta_weights,
+        )
+        from alphagenome_pytorch.extensions.finetuning.transfer import (
+            load_trunk,
+            prepare_for_transfer,
+            transfer_config_from_dict,
+        )
+
+        if dtype_policy is None:
+            dtype_policy = DtypePolicy.default()
+
+        # 1. Create base model and load pretrained trunk. Note ``cls(**kwargs)`` is
+        #    built here (preserving subclass + constructor kwargs like num_organisms),
+        #    so from_delta must NOT delegate to the canonical loader — it only shares
+        #    the organism-context finalizer below.
+        model = cls(dtype_policy=dtype_policy, **kwargs)
+        model = load_trunk(model, base_path, exclude_heads=True)
+
+        # 2. Read the exported header once (config + organism provenance) and set up
+        #    adapters/heads.
+        header = _read_delta_export_header(delta_path)
+        config = transfer_config_from_dict(header["transfer_config"])
+        model = prepare_for_transfer(model, config)
+
+        # 3. Load delta weights
+        load_delta_weights(model, delta_path)
+
+        # 4. Move to target device
+        if device:
+            model.to(device)
+
+        # 5. Attach the fine-tune organism context (same helper the canonical loader
+        #    uses) so from_delta and load_finetuned_model behave consistently.
+        finalize_finetuned_organism_context(
+            model,
+            {
+                "organism": header.get("organism"),
+                "organism_indices": header.get("organism_indices"),
+                "track_metadata": header.get("track_metadata"),
+            },
+        )
+
+        return model
+
+    @staticmethod
+    def _normalize_organism_index(organism_index, dna_sequence):
+        """Coerce ``organism_index`` to a (B,) long tensor on ``dna_sequence``'s device.
+
+        ``organism_index`` may be passed as a Python int for single-organism
+        batches, but downstream code (embedding lookups, named-output metadata
+        selection, head dispatch) expects a per-batch long tensor. Tensor
+        inputs are moved to ``dna_sequence``'s device, cast to ``torch.long``,
+        and scalar / ``(1,)`` shapes are broadcast to ``(B,)``.
+        """
+        batch_size = dna_sequence.shape[0]
+        device = dna_sequence.device
+        if isinstance(organism_index, int):
+            return torch.full((batch_size,), organism_index, dtype=torch.long, device=device)
+
+        organism_index = organism_index.to(device=device, dtype=torch.long)
+        if organism_index.ndim == 0:
+            organism_index = organism_index.unsqueeze(0)
+        if organism_index.shape == (1,):
+            organism_index = organism_index.expand(batch_size)
+        elif organism_index.shape != (batch_size,):
+            raise ValueError(
+                f"organism_index has shape {tuple(organism_index.shape)}, expected (), (1,), or ({batch_size},)"
+            )
+        return organism_index
+
     def _compute_embeddings_ncl(self, dna_sequence, organism_index, resolutions=None):
         """Internal method to compute embeddings in NCL format.
 
@@ -465,7 +682,8 @@ class AlphaGenome(nn.Module):
 
         Args:
             dna_sequence: One-hot encoded DNA sequence (B, S, 4) - NLC input format.
-            organism_index: Organism index per batch (B,). 0=human, 1=mouse.
+            organism_index: Organism index. Either a (B,) long tensor or an int
+                (broadcast to the full batch). 0=human, 1=mouse.
             resolutions: Tuple of resolutions to compute, e.g. (1, 128) or (128,).
                          If None, computes all resolutions. When 1bp is not needed,
                          the expensive decoder is skipped for faster computation.
@@ -480,25 +698,37 @@ class AlphaGenome(nn.Module):
                 - 'embeddings_128bp': (B, S//128, 3072) or (B, 3072, S//128) at 128bp.
                 - 'embeddings_pair': (B, S//2048, S//2048, 128) pair embeddings.
 
+        Note:
+            Unlike ``predict()`` (wrapped in ``torch.no_grad()``), ``encode()``
+            honors the ambient autograd context so gradients can flow into the
+            backbone for end-to-end fine-tuning. Wrap the call in
+            ``torch.no_grad()`` for pure inference/analysis to avoid retaining
+            the activation graph; omit it when you intend to backpropagate.
+
         Example:
-            # Get embeddings for fine-tuning with a custom head
             model = AlphaGenome.from_pretrained('model.pth', device='cuda')
             model.eval()
 
-            # Freeze backbone
-            for param in model.parameters():
-                param.requires_grad = False
-
-            # Get embeddings (128bp only for efficiency)
+            # Inference / analysis: no gradients, lower memory
             with torch.no_grad():
                 emb = model.encode(dna_seq, organism_idx, resolutions=(128,))
 
-            # Use with custom head (NCL format for Conv1d)
+            # Fine-tuning: switch to train mode and omit no_grad so gradients
+            # reach the backbone (NCL format for Conv1d heads)
+            model.train()
             emb = model.encode(dna_seq, organism_idx, channels_last=False)
             custom_output = my_conv_head(emb['embeddings_128bp'])
         """
-        embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
-            self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
+        organism_index = self._normalize_organism_index(organism_index, dna_sequence)
+
+        # Derive autocast device_type from the actual tensor device so non-CUDA
+        # accelerators (e.g. "mps") are passed through rather than collapsed to "cpu".
+        device_type = dna_sequence.device.type
+        use_amp = self.dtype_policy.compute_dtype != torch.float32
+
+        with torch.autocast(device_type=device_type, dtype=self.dtype_policy.compute_dtype, enabled=use_amp):
+            embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
+                self._compute_embeddings_ncl(dna_sequence, organism_index, resolutions)
 
         # Build output dict with requested format
         # Use contiguous() after transpose to ensure memory layout is optimal
@@ -522,10 +752,12 @@ class AlphaGenome(nn.Module):
         self,
         dna_sequence,
         organism_index,
+        *,
         splice_site_positions=None,
         return_embeddings=False,
         return_scaled_predictions=False,
         resolutions=None,
+        heads: Optional[Tuple[str, ...]] = None,
         channels_last=True,
         embeddings_only=False,
         encoder_only=False,
@@ -542,6 +774,9 @@ class AlphaGenome(nn.Module):
                                        If False, return experimental space (for inference).
             resolutions: Tuple of resolutions to compute, e.g. (1, 128) or (128,).
                          If None, computes all resolutions.
+            heads: Tuple of head names to compute, e.g. ('atac',) or ('atac', 'dnase').
+                   If None, computes all heads. Use this to skip expensive unused heads
+                   during inference.
             channels_last: Format for embeddings and head outputs.
                 - True (default): NLC format (B, S, C) - user-friendly, matches JAX
                 - False: NCL format (B, C, S) - for training efficiency (0 transposes)
@@ -556,14 +791,42 @@ class AlphaGenome(nn.Module):
             Dict of predictions from each head. Keys are head names
             (atac, dnase, cage, etc.), values are dicts mapping
             resolution (1 or 128) to prediction tensors.
-            If return_embeddings is True, also contains 'embeddings_1bp' and 'embeddings_128bp'.
+            If return_embeddings is True, also contains 'embeddings_1bp',
+            'embeddings_128bp', and 'embeddings_pair'.
             If encoder_only is True, returns ``{"encoder_output": tensor}`` only.
+
+        Raises:
+            ValueError: If unknown head names are specified in ``heads``.
         """
         if encoder_only:
             # Return raw CNN encoder output before organism embedding and transformer.
             trunk, _intermediates = self.encoder(dna_sequence)
             outputs = {"encoder_output": trunk}
             return self._cast_outputs(outputs)
+
+        # Validate heads parameter
+        if heads is not None:
+            # Build set of all valid head names
+            valid_heads = set(self.heads.keys())
+            if self.contact_maps_head is not None:
+                valid_heads.add('contact_maps')
+            if self.splice_sites_classification_head is not None:
+                valid_heads.add('splice_sites')
+            if self.splice_sites_usage_head is not None:
+                valid_heads.add('splice_site_usage')
+            if self.splice_sites_junction_head is not None:
+                valid_heads.add('splice_sites_junction')
+
+            # Check for unknown heads
+            unknown_heads = set(heads) - valid_heads
+            if unknown_heads:
+                raise ValueError(
+                    f"Unknown head names: {sorted(unknown_heads)}. "
+                    f"Available heads: {sorted(valid_heads)}"
+                )
+            head_set = set(heads)
+        else:
+            head_set = None
 
         # Compute embeddings (NCL format internally)
         embeddings_1bp, embeddings_128bp, embeddings_pair, need_1bp = \
@@ -579,56 +842,85 @@ class AlphaGenome(nn.Module):
 
         if not embeddings_only:
             for name, head in self.heads.items():
+                if head_set is not None and name not in head_set:
+                    continue
                 outputs[name] = head(
                     embeddings_dict, organism_index,
                     return_scaled=return_scaled_predictions,
                     channels_last=channels_last,
                 )
 
-            # Contact Maps (pair activations format)
+            # Contact Maps
             if self.contact_maps_head is not None:
-                outputs['pair_activations'] = self.contact_maps_head(
-                    embeddings_pair, organism_index, channels_last=channels_last
-                )
+                if head_set is None or 'contact_maps' in head_set:
+                    outputs['contact_maps'] = self.contact_maps_head(
+                        embeddings_pair, organism_index, channels_last=channels_last
+                    )
 
             # Splice predictions (require 1bp embeddings)
-            if need_1bp:
-                if self.splice_sites_classification_head is not None:
-                    outputs['splice_sites_classification'] = self.splice_sites_classification_head(
+            need_splice = head_set is None or any(
+                k in head_set for k in ('splice_sites', 'splice_site_usage', 'splice_sites_junction')
+            )
+            if need_1bp and need_splice:
+                # Also compute classification when junction needs it for position generation
+                classification_output = None
+                need_classification = (
+                    head_set is None
+                    or 'splice_sites' in head_set
+                    or (
+                        'splice_sites_junction' in head_set
+                        and splice_site_positions is None
+                    )
+                )
+                if self.splice_sites_classification_head is not None and need_classification:
+                    classification_output = self.splice_sites_classification_head(
                         embeddings_1bp, organism_index, channels_last=channels_last
                     )
+                    if head_set is None or 'splice_sites' in head_set:
+                        outputs['splice_sites'] = classification_output
                 if self.splice_sites_usage_head is not None:
-                    outputs['splice_sites_usage'] = self.splice_sites_usage_head(
-                        embeddings_1bp, organism_index, channels_last=channels_last
-                    )
+                    if head_set is None or 'splice_site_usage' in head_set:
+                        outputs['splice_site_usage'] = self.splice_sites_usage_head(
+                            embeddings_1bp, organism_index, channels_last=channels_last
+                        )
 
                 if self.splice_sites_junction_head is not None:
-                    # Use provided positions if given, otherwise generate from classification
-                    if splice_site_positions is not None:
-                        top_k_positions = splice_site_positions
-                    else:
-                        # probs: (B, S, 5) NLC - already correct format for generate_splice_site_positions
-                        splice_site_probs = outputs['splice_sites_classification']['probs']
+                    if head_set is None or 'splice_sites_junction' in head_set:
+                        # Use provided positions if given, otherwise generate from classification
+                        if splice_site_positions is not None:
+                            top_k_positions = splice_site_positions
+                        else:
+                            if classification_output is None:
+                                raise ValueError(
+                                    "splice_sites_junction requires either splice_site_positions "
+                                    "or an available splice_sites classification head"
+                                )
+                            # probs: (B, S, 5) NLC - already correct format for generate_splice_site_positions
+                            splice_site_probs = classification_output['probs']
 
-                        # If NCL (channels_last=False), transpose back to NLC for generate_splice_site_positions
-                        if not channels_last:
-                            splice_site_probs = splice_site_probs.transpose(1, 2)
+                            # If NCL (channels_last=False), transpose back to NLC for generate_splice_site_positions
+                            if not channels_last:
+                                splice_site_probs = splice_site_probs.transpose(1, 2)
 
-                        top_k_positions = generate_splice_site_positions(
-                            ref=splice_site_probs,
-                            alt=None,
-                            true_splice_sites=None,
-                            k=512,
-                            pad_to_length=512,
-                            threshold=0.1,
+                            top_k_positions = generate_splice_site_positions(
+                                ref=splice_site_probs,
+                                alt=None,
+                                true_splice_sites=None,
+                                k=512,
+                                pad_to_length=512,
+                                threshold=0.1,
+                            )
+                        # embeddings_1bp is always NCL from _compute_embeddings_ncl, regardless
+                        # of the outer channels_last flag — unlike its sibling heads,
+                        # SpliceSitesJunctionHead.forward's channels_last also gates an input
+                        # transpose, so this must stay hardcoded False to avoid corrupting
+                        # already-NCL data.
+                        outputs['splice_sites_junction'] = self.splice_sites_junction_head(
+                            embeddings_1bp,
+                            organism_index,
+                            channels_last=False,
+                            splice_site_positions=top_k_positions,
                         )
-                    # embeddings_1bp is always NCL from _compute_embeddings_ncl
-                    outputs['splice_sites_junction'] = self.splice_sites_junction_head(
-                        embeddings_1bp,
-                        organism_index,
-                        channels_last=False,
-                        splice_site_positions=top_k_positions,
-                    )
 
         if return_embeddings or embeddings_only:
             if channels_last:
@@ -639,6 +931,9 @@ class AlphaGenome(nn.Module):
                 if need_1bp:
                     outputs['embeddings_1bp'] = embeddings_1bp
                 outputs['embeddings_128bp'] = embeddings_128bp
+            # Pair embeddings have a (B, S, S, D) layout, not NCL, so they are
+            # added independently of channels_last (matching encode()).
+            outputs['embeddings_pair'] = embeddings_pair
 
         return self._cast_outputs(outputs)
 
@@ -679,8 +974,11 @@ class AlphaGenome(nn.Module):
         self,
         dna_sequence: torch.Tensor,
         organism_index: Union[torch.Tensor, int],
+        named_outputs: bool = False,
+        strict_metadata: bool = False,
+        include_padding: bool = False,
         **kwargs,
-    ) -> dict:
+    ) -> dict | NamedOutputs:
         """Inference-mode forward pass with automatic dtype handling.
 
         Wraps forward() with:
@@ -696,27 +994,38 @@ class AlphaGenome(nn.Module):
             dna_sequence: One-hot encoded DNA sequence (B, S, 4). Can be any
                 float dtype — autocast handles weight/input casting.
             organism_index: Organism index per batch (B,). 0=human, 1=mouse.
+            named_outputs: If True, return a ``NamedOutputs`` wrapper instead
+                of a raw dict.
+            strict_metadata: If True, raise when metadata is missing or
+                mismatched for named outputs. If False, fallback placeholders
+                are used.
+            include_padding: If True, keep padding tracks in named outputs.
+                If False (default), padding tracks are stripped. Only applies
+                when ``named_outputs=True``.
             **kwargs: Additional arguments passed to forward()
                 (e.g., return_embeddings, resolutions).
 
         Returns:
-            Dict of predictions with all floating-point tensors in float32.
+            Dict of predictions with all floating-point tensors in float32, or
+            ``NamedOutputs`` when ``named_outputs=True``.
         """
-        device_type = "cuda" if dna_sequence.is_cuda else "cpu"
+        # Derive autocast device_type from the actual tensor device so non-CUDA
+        # accelerators (e.g. "mps") are passed through rather than collapsed to "cpu".
+        device_type = dna_sequence.device.type
         use_amp = self.dtype_policy.compute_dtype != torch.float32
 
-        # Handle integer organism_index by converting to tensor of shape (B,)
-        # forward() expects a tensor for embedding lookups.
-        if isinstance(organism_index, int):
-            batch_size = dna_sequence.shape[0]
-            organism_index = torch.full(
-                (batch_size,),
-                organism_index,
-                dtype=torch.long,
-                device=dna_sequence.device
-            )
+        organism_index = self._normalize_organism_index(organism_index, dna_sequence)
 
         with torch.autocast(device_type=device_type, dtype=self.dtype_policy.compute_dtype, enabled=use_amp):
             outputs = self.forward(dna_sequence, organism_index, **kwargs)
 
-        return self._upcast_outputs(outputs)
+        upcast_outputs = self._upcast_outputs(outputs)
+        if named_outputs:
+            return self.named_outputs(
+                upcast_outputs,
+                organism=organism_index,
+                strict_metadata=strict_metadata,
+                channels_last=kwargs.get("channels_last", True),
+                include_padding=include_padding,
+            )
+        return upcast_outputs
