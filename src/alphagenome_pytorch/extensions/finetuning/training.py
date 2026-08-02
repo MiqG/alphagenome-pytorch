@@ -287,8 +287,8 @@ def _call_splice_head(
     org = organism_idx[:, 0] if organism_idx.ndim > 1 else organism_idx
     org = torch.zeros_like(org)
 
-    # Debug: Check embedding shape
-    assert emb.ndim == 3, f"Expected 3D embeddings, got shape {emb.shape}"
+    if emb.ndim != 3:
+        raise ValueError(f"Expected 3D embeddings for splice heads, got shape {emb.shape}")
 
     if isinstance(head, SpliceSitesJunctionHead):
         if junction_top_k is not None:
@@ -2773,13 +2773,12 @@ def validate_multihead(
                         if result is not None and result != (None, None):
                             # For junction head: result is a dict of variants
                             if isinstance(head_module, SpliceSitesJunctionHead):
-                                if result != (None, None):
-                                    for variant_name, variant_data in result.items():
-                                        if variant_name not in accumulated_splice[modality]:
-                                            accumulated_splice[modality][variant_name] = {"pred": [], "true": []}
-                                        if variant_data:
-                                            accumulated_splice[modality][variant_name]["pred"].append(variant_data["pred"].float().cpu())
-                                            accumulated_splice[modality][variant_name]["true"].append(variant_data["true"].float().cpu())
+                                for variant_name, variant_data in result.items():
+                                    if variant_name not in accumulated_splice[modality]:
+                                        accumulated_splice[modality][variant_name] = {"pred": [], "true": []}
+                                    if variant_data:
+                                        accumulated_splice[modality][variant_name]["pred"].append(variant_data["pred"].float().cpu())
+                                        accumulated_splice[modality][variant_name]["true"].append(variant_data["true"].float().cpu())
                                 if compute_per_sample:
                                     ps_junc = _extract_junction_pearson_per_sample(
                                         predictions_scaled, targets_dict, device
