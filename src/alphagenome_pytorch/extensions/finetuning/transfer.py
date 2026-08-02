@@ -26,7 +26,7 @@ Example:
     model = prepare_for_transfer(model, config)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,12 @@ SPLICE_HEAD_TYPES = (
     SpliceSitesJunctionHead,
 )
 
+_ALPHAGENOME_LOCON_PRESETS = (
+    "Locon2=['down_blocks.5'], "
+    "Locon4=['down_blocks.4', 'down_blocks.5'], "
+    "Locon6=['down_blocks.3', 'down_blocks.4', 'down_blocks.5']"
+)
+
 
 @dataclass
 class TransferConfig:
@@ -68,6 +74,9 @@ class TransferConfig:
             Options:
             - 'full': Train all weights (lower LR recommended). Cannot combine.
             - 'linear': Freeze trunk, train only heads (linear probing)
+            - 'encoder-only': Freeze trunk, train heads on raw CNN encoder
+              output at 128bp. Cannot combine. Use with ``encoder_only=True``
+              in head configs and ``model.forward(encoder_only=True)``.
             - 'lora': Apply LoRA adapters to attention
             - 'locon': Apply Locon adapters to conv layers
             - 'ia3': Apply IA3 scaling adapters
@@ -78,6 +87,9 @@ class TransferConfig:
         locon_rank: Locon rank (default: 4).
         locon_alpha: Locon alpha scaling factor (default: 1).
         locon_targets: Module name substrings to apply Locon to.
+            Required when Locon is enabled.
+            For AlphaGenome, block-level targets like ``['down_blocks.5']``
+            adapt the last two encoder conv layers before attention.
         ia3_targets: Module name substrings for IA3 output-scaling.
         ia3_ff_targets: Module name substrings for IA3 input-scaling
             (feed-forward down-projections).
@@ -117,10 +129,10 @@ class TransferConfig:
     # Locon settings
     locon_rank: int = 4
     locon_alpha: int = 1
-    locon_targets: list[str] = field(default_factory=lambda: ['conv_tower'])
+    locon_targets: list[str] = field(default_factory=list)
     
     # IA3 settings
-    ia3_targets: list[str] = field(default_factory=lambda: ['to_k', 'to_v'])
+    ia3_targets: list[str] = field(default_factory=lambda: ['k_proj', 'v_proj'])
     ia3_ff_targets: list[str] = field(default_factory=list)
     
     # Houlsby settings
@@ -280,6 +292,47 @@ def _freeze_trunk(
     return model
 
 
+def _get_conv1d_module_names(model: nn.Module) -> list[str]:
+    """Return all Conv1d-like module names available for Locon targeting."""
+    return [
+        name for name, module in model.named_modules()
+        if isinstance(module, nn.Conv1d)
+    ]
+
+
+def validate_locon_targets(
+    model: nn.Module,
+    target_modules: list[str],
+) -> list[str]:
+    """Validate Locon target patterns and return matching conv module names."""
+    if not target_modules:
+        raise ValueError(
+            "locon mode requires explicit locon_targets. "
+            "For AlphaGenome, common presets are "
+            f"{_ALPHAGENOME_LOCON_PRESETS}."
+        )
+
+    conv_names = _get_conv1d_module_names(model)
+    matched = [
+        name for name in conv_names
+        if any(target in name for target in target_modules)
+    ]
+    if matched:
+        return matched
+
+    sample_names = conv_names[:8]
+    sample_text = ", ".join(repr(name) for name in sample_names) or "none"
+    if len(conv_names) > len(sample_names):
+        sample_text += ", ..."
+
+    raise ValueError(
+        "locon_targets did not match any Conv1d modules. "
+        f"Requested patterns: {target_modules}. "
+        f"Available Conv1d module examples: {sample_text}. "
+        f"For AlphaGenome, common presets are {_ALPHAGENOME_LOCON_PRESETS}."
+    )
+
+
 def prepare_for_transfer(
     model: nn.Module,
     config: TransferConfig,
@@ -333,13 +386,38 @@ def prepare_for_transfer(
         if isinstance(track_means, (str, Path)):
             track_means = torch.load(track_means, weights_only=True)
 
+        # Determine encoder_only flag: infer from mode, validate consistency
+        is_encoder_only_mode = (
+            config.mode == 'encoder-only'
+            or (isinstance(config.mode, list) and 'encoder-only' in config.mode)
+        )
+        head_encoder_only = head_config.get('encoder_only', None)
+        if is_encoder_only_mode:
+            if head_encoder_only is not None and not head_encoder_only:
+                raise ValueError(
+                    f"Head '{head_name}' sets encoder_only=False, but "
+                    f"mode is 'encoder-only'. All heads must use "
+                    f"encoder_only=True in encoder-only mode."
+                )
+            head_encoder_only = True
+        else:
+            if head_encoder_only is None:
+                head_encoder_only = False
+
+        # Let create_finetuning_head pick the default resolution when
+        # the caller didn't specify one (encoder_only defaults to 128bp).
+        resolutions = head_config.get('resolutions')
+        if resolutions is None and not head_encoder_only:
+            resolutions = [1, 128]
+
         head = create_finetuning_head(
             assay_type=head_config['modality'],
             n_tracks=head_config['num_tracks'],
-            resolutions=head_config.get('resolutions', [1, 128]),
+            resolutions=resolutions,
             num_organisms=head_config.get('num_organisms', 1),
             track_means=track_means,
             init_scheme=head_config.get('init_scheme', 'truncated_normal'),
+            encoder_only=head_encoder_only,
         )
         add_head(model, head_name, head, replace=True)
     
@@ -347,7 +425,7 @@ def prepare_for_transfer(
     modes = config.mode if isinstance(config.mode, list) else [config.mode]
     
     # Validate modes
-    valid_modes = {'full', 'linear', 'lora', 'locon', 'ia3', 'houlsby'}
+    valid_modes = {'full', 'linear', 'encoder-only', 'lora', 'locon', 'ia3', 'houlsby'}
     for m in modes:
         if m not in valid_modes:
             raise ValueError(
@@ -359,7 +437,13 @@ def prepare_for_transfer(
             "'full' mode cannot be combined with other modes. "
             f"Got: {modes}"
         )
-    
+
+    if 'encoder-only' in modes and len(modes) > 1:
+        raise ValueError(
+            "'encoder-only' mode cannot be combined with other modes. "
+            f"Got: {modes}"
+        )
+
     if 'full' in modes:
         # Train everything - no freezing
         return model
@@ -377,9 +461,10 @@ def prepare_for_transfer(
         )
     
     if 'locon' in modes:
+        matched_locon_targets = validate_locon_targets(model, config.locon_targets)
         model = apply_locon(
             model,
-            config.locon_targets,
+            matched_locon_targets,
             rank=config.locon_rank,
             alpha=config.locon_alpha,
         )
@@ -714,6 +799,63 @@ def load_pretrained_head_weights(
     return loaded
 
 
+def transfer_config_to_dict(config: TransferConfig) -> dict[str, Any]:
+    """Serialize TransferConfig to a JSON-compatible dict.
+
+    Non-serializable values in ``new_heads`` (e.g. tensors, Path objects)
+    are dropped so the result is safe for ``json.dumps`` and safetensors
+    metadata.
+
+    Args:
+        config: TransferConfig instance.
+
+    Returns:
+        Dict representation suitable for JSON serialization and checkpoints.
+
+    Example:
+        >>> config = TransferConfig(mode='lora', lora_rank=16)
+        >>> data = transfer_config_to_dict(config)
+        >>> data['lora_rank']
+        16
+    """
+    import torch
+
+    data = asdict(config)
+
+    # Sanitize new_heads: drop values that are not JSON-serializable
+    # (e.g. track_means tensors, Path objects)
+    for head_config in data.get("new_heads", {}).values():
+        for key in list(head_config.keys()):
+            val = head_config[key]
+            if isinstance(val, (torch.Tensor, Path)):
+                del head_config[key]
+
+    return data
+
+
+def transfer_config_from_dict(data: dict[str, Any]) -> TransferConfig:
+    """Reconstruct TransferConfig from a dict.
+
+    Filters to known fields for forward compatibility (ignores unknown keys
+    from future versions).
+
+    Args:
+        data: Dict from checkpoint or config file.
+
+    Returns:
+        TransferConfig instance.
+
+    Example:
+        >>> data = {'mode': 'lora', 'lora_rank': 16, 'future_field': 'ignored'}
+        >>> config = transfer_config_from_dict(data)
+        >>> config.mode
+        'lora'
+    """
+    known_fields = {f.name for f in fields(TransferConfig)}
+    filtered = {k: v for k, v in data.items() if k in known_fields}
+    return TransferConfig(**filtered)
+
+
 __all__ = [
     'TransferConfig',
     'load_trunk',
@@ -722,4 +864,7 @@ __all__ = [
     'remove_all_heads',
     'prepare_for_transfer',
     'count_trainable_params',
+    'validate_locon_targets',
+    'transfer_config_to_dict',
+    'transfer_config_from_dict',
 ]
