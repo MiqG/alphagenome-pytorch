@@ -19,7 +19,7 @@ class TestSpliceSitesClassification:
 
     NUM_CLASSES = 5
     JAX_OUTPUT_NAME = "splice_sites_classification"
-    PT_OUTPUT_NAME = "splice_sites_classification"
+    PT_OUTPUT_NAME = "splice_sites"
 
     @pytest.mark.parametrize("organism", ["human", "mouse"])
     def test_classification_comparison(
@@ -84,7 +84,7 @@ class TestSpliceSitesUsage:
 
     NUM_TRACKS = 734
     JAX_OUTPUT_NAME = "splice_sites_usage"
-    PT_OUTPUT_NAME = "splice_sites_usage"
+    PT_OUTPUT_NAME = "splice_site_usage"
 
     @pytest.mark.parametrize("organism", ["human", "mouse"])
     def test_usage_comparison(
@@ -134,7 +134,7 @@ class TestSpliceSitesJunction:
 
     NUM_TRACKS = 734
     JAX_OUTPUT_NAME = "splice_sites_junction"
-    PT_OUTPUT_NAME = "splice_sites_junction"
+    PT_OUTPUT_NAME = "splice_junctions"
 
     @pytest.mark.parametrize("organism", ["human", "mouse"])
     def test_junction_comparison(
@@ -155,7 +155,21 @@ class TestSpliceSitesJunction:
 
         jax_arr = jax_out[self.JAX_OUTPUT_NAME]["predictions"]
         pt_arr = pt_out[self.PT_OUTPUT_NAME]["pred_counts"]
+        jax_mask = jax_out[self.JAX_OUTPUT_NAME]["splice_junction_mask"]
+        pt_mask = pt_out[self.PT_OUTPUT_NAME]["splice_junction_mask"]
 
+        assert jax_mask.any(), "Synthetic junction positions should create valid JAX cells"
+        assert pt_mask.any(), "Synthetic junction positions should create valid PyTorch cells"
+        assert jax_arr.max() > 0, "JAX junction output should be non-zero"
+        assert pt_arr.max() > 0, "PyTorch junction output should be non-zero"
+
+        # Junction predictions are softplus counts (range ~0 to hundreds)
+        # accumulated through a pairwise einsum over 192M elements. Bulk
+        # parity is excellent (mean rel diff ~5e-5), but a few isolated
+        # outliers — both small-magnitude (where one side rounds to ~0)
+        # and high-magnitude (where 1% rtol leaves <1 absolute headroom)
+        # — fail np.allclose's all-elements check. Use a generous atol
+        # floor plus a modest rtol bump for this head specifically.
         result = compare_arrays(
             f"splice_junction_{organism}",
             pt_arr,

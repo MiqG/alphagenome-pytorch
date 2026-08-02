@@ -140,10 +140,20 @@ def mock_data_dir(project_root):
         # Generate mock data
         import subprocess, sys
         script = project_root / "tests" / "create_mock_data.py"
-        subprocess.run(
+        result = subprocess.run(
             [sys.executable, str(script), "--output_dir", str(mock_dir)],
-            check=True
+            capture_output=True,
+            text=True,
         )
+        still_missing = [f for f in required_files if not (mock_dir / f).exists()]
+        if result.returncode != 0 or still_missing:
+            raise RuntimeError(
+                f"Mock data regeneration failed (exit {result.returncode}).\n"
+                f"Initially missing: {missing}\n"
+                f"Still missing after regen: {still_missing}\n"
+                f"--- stdout ---\n{result.stdout}\n"
+                f"--- stderr ---\n{result.stderr}"
+            )
 
     return mock_dir
 
@@ -245,18 +255,15 @@ def pytorch_model(torch_weights_path):
     return model
 
 
-# Lightweight Model Fixture
+# Session-scoped Model Fixture
 
 
 @pytest.fixture(scope="session")
-def small_model():
-    """Create a lightweight AlphaGenome model for unit tests.
+def model():
+    """Create an AlphaGenome model for tests that don't need pretrained weights.
 
-    This creates a minimal model instance (1 organism, float32) without
-    loading any pretrained weights. Useful for testing model behavior,
-    determinism, checkpointing, etc. without requiring weight files.
-
-    Note: Session-scoped so the model is only created once per test session.
+    Session-scoped so the model is only constructed once per test session.
+    Uses 1 organism and float32 for simplicity.
     """
     from alphagenome_pytorch import AlphaGenome
     from alphagenome_pytorch.config import DtypePolicy

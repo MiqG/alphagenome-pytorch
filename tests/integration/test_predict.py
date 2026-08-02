@@ -9,6 +9,7 @@ import torch
 
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
+from alphagenome_pytorch.named_outputs import NamedOutputs
 
 
 @pytest.mark.integration
@@ -194,3 +195,89 @@ class TestPredict:
                     pred_outputs[key], manual_outputs[key]
                 )
 
+    def test_return_named_outputs(self, model_fp32):
+        """predict() can return metadata-aware named output wrappers."""
+        x = torch.randn(1, 2048, 4)
+        named = model_fp32.predict(
+            x,
+            0,
+            named_outputs=True,
+            resolutions=(128,),
+        )
+
+        assert isinstance(named, NamedOutputs)
+        assert "atac" in named.heads()
+        # Default: padding stripped — only real tracks remain
+        assert named.atac[128].tensor.shape[-1] < 256
+        assert all(not t.is_padding for t in named.atac[128].tracks)
+
+    def test_return_named_outputs_include_padding(self, model_fp32):
+        """predict(include_padding=True) keeps all tracks including padding."""
+        x = torch.randn(1, 2048, 4)
+        named = model_fp32.predict(
+            x,
+            0,
+            named_outputs=True,
+            include_padding=True,
+            resolutions=(128,),
+        )
+
+        assert isinstance(named, NamedOutputs)
+        assert named.atac[128].tensor.shape[-1] == 256
+
+
+@pytest.mark.integration
+class TestEncode:
+    """Tests for AlphaGenome.encode() method."""
+
+    @pytest.fixture(scope="class")
+    def model_fp32(self):
+        """Shared full_float32 model instance for the test class."""
+        model = AlphaGenome(dtype_policy=DtypePolicy.full_float32())
+        yield model
+        del model
+        gc.collect()
+
+    @pytest.fixture(scope="class")
+    def model_mixed(self):
+        """Shared mixed_precision model instance for the test class."""
+        model = AlphaGenome(dtype_policy=DtypePolicy.mixed_precision())
+        yield model
+        del model
+        gc.collect()
+
+    def test_mixed_precision_does_not_raise(self, model_mixed):
+        """Regression: encode() under mixed_precision must wrap compute in
+        autocast so the float32 params match the bfloat16-cast input.
+
+        Without the autocast wrapper this raises
+        ``RuntimeError: Input type (...BFloat16...) and weight type
+        (...Float...) should be the same`` at the first Conv1d in DnaEmbedder.
+        """
+        x = torch.randn(1, 2048, 4)
+        org = torch.tensor([0])
+
+        # Should not raise — the 128bp-only path still runs the encoder convs.
+        outputs = model_mixed.encode(x, org, resolutions=(128,))
+        assert 'embeddings_128bp' in outputs
+
+    def test_mixed_precision_1bp_does_not_raise(self, model_mixed):
+        """Regression: the 1bp path also runs the decoder convs under autocast."""
+        x = torch.randn(1, 2048, 4)
+        org = torch.tensor([0])
+
+        outputs = model_mixed.encode(x, org, resolutions=(1, 128))
+        assert 'embeddings_1bp' in outputs
+        assert 'embeddings_128bp' in outputs
+
+    def test_output_dtype_tracks_policy(self, model_fp32, model_mixed):
+        """encode() outputs follow the policy's output_dtype:
+        float32 for full_float32, bfloat16 for mixed_precision."""
+        x = torch.randn(1, 2048, 4)
+        org = torch.tensor([0])
+
+        fp32_out = model_fp32.encode(x, org, resolutions=(128,))
+        mixed_out = model_mixed.encode(x, org, resolutions=(128,))
+
+        assert fp32_out['embeddings_128bp'].dtype == torch.float32
+        assert mixed_out['embeddings_128bp'].dtype == torch.bfloat16

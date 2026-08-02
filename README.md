@@ -1,5 +1,9 @@
 # AlphaGenome PyTorch
 
+[![PyPI](https://img.shields.io/pypi/v/alphagenome-pytorch)](https://pypi.org/project/alphagenome-pytorch/)
+[![Documentation](https://readthedocs.org/projects/alphagenome-pytorch/badge/?version=latest)](https://alphagenome-pytorch.readthedocs.io)
+[![Weights](https://img.shields.io/badge/%F0%9F%A4%97-Weights-yellow)](https://huggingface.co/gtca/alphagenome_pytorch)
+
 A PyTorch port of [AlphaGenome](https://www.nature.com/articles/s41586-025-10014-0), the DNA sequence model from Google DeepMind that predicts hundreds of genomic tracks at single base-pair resolution from sequences up to 1M bp.
 
 We strive to make it an accessible, readable, and hackable implementation — for integrating into existing PyTorch pipelines, fine-tuning on custom datasets, and building on top of.
@@ -24,9 +28,30 @@ For fine-tuning (incl. BigWig data loading):
 pip install alphagenome-pytorch[finetuning]  # adds pyBigWig, pyfaidx
 ```
 
+### Use with coding agents
+
+If you use a coding agent, [`docs/alphagenome-usage.md`](docs/alphagenome-usage.md) is an
+agent-agnostic guide to running the model and pulling out predictions for a specific
+assay, cell type, or resolution, and [`docs/finetuning/`](docs/finetuning/index.rst)
+covers fine-tuning.
+
+For Claude Code, install them as a plugin so the agent picks them up automatically in any
+project:
+
+```
+/plugin marketplace add genomicsxai/alphagenome-pytorch
+/plugin install alphagenome@alphagenome
+```
+
+This adds two skills — one for predictions, one for fine-tuning — so you can ask things
+like *"get DNase predictions from GM12878 at 128bp"*, *"write a wrapper to get all the
+K562 predictions"*, or *"fine-tune on my ATAC BigWigs with LoRA"*.
+
 ## Quick Start
 
 ```python
+import torch
+import numpy as np
 from alphagenome_pytorch import AlphaGenome
 
 # Load pretrained model
@@ -35,17 +60,57 @@ model = AlphaGenome.from_pretrained('alphagenome.pt', device='cuda')
 # Create one-hot encoded DNA sequence in NLC format (batch=1, length=131072, channels=4)
 # Channels: A=0, C=1, G=2, T=3
 sequence = np.random.randint(0, 4, size=(1, 131072))
-dna_onehot = torch.tensor(np.eye(4)[sequence], dtype=torch.float32)
+dna_onehot = torch.tensor(np.eye(4)[sequence], dtype=torch.float32).cuda()
 
 # Inference (handles dtype casting, returns float32 outputs)
 outputs = model.predict(dna_onehot, organism_index=0)  # organism: 0=human, 1=mouse
-
-# outputs['atac'][1]   -> (B, 131072, 256) ATAC at 1bp
-# outputs['atac'][128] -> (B, 1024, 256) ATAC at 128bp
-# outputs['contact_maps'] -> (B, 28, 64, 64) 3D contact
 ```
 
 The weights for this port are [available on Hugging Face](https://huggingface.co/gtca/alphagenome_pytorch).
+
+### Output structure
+Each genomic-track head returns a dict mapping resolution → tensor:
+
+```python
+outputs['atac'][1]           # (1, 131072, 256)   ATAC-seq  at 1 bp
+outputs['atac'][128]         # (1, 1024,   256)   ATAC-seq  at 128 bp
+outputs['dnase'][1]          # (1, 131072, 384)   DNase     at 1 bp
+outputs['cage'][128]         # (1, 1024,   640)   CAGE      at 128 bp
+outputs['chip_histone'][128] # (1, 1024,   1152)  ChIP-hist at 128 bp only
+```
+
+Contact maps are returned as a single tensor (no resolution dict):
+
+```python
+outputs['contact_maps']      # (1, 64, 64, 28)   3D chromatin contacts
+```
+
+Splice heads return dicts of tensors:
+
+```python
+outputs['splice_sites']['probs']  # (1, 131072, 5)  splice site classes
+```
+
+### Padding
+
+Track dimensions are padded (e.g. ATAC has 167 real human
+tracks but the tensor has 256 channels).  Real tracks come first; the rest
+are zeros.  Use `named_outputs=True` to auto-strip padding:
+
+```python
+from alphagenome_pytorch.named_outputs import NamedOutputs, TrackMetadataCatalog
+catalog = TrackMetadataCatalog.load_builtin(organism=0)
+model.set_track_metadata_catalog(catalog)
+
+named = model.predict(dna_onehot, organism_index=0, named_outputs=True)
+named.atac[1].shape                  # (1, 131072, 167)  — padding removed
+named.atac[1].tracks[-1].track_name  # 'UBERON:0015143 ATAC-seq'
+
+# Filter by metadata
+named.rna_seq[128].select(strand='+')
+named.chip_tf[128].select(transcription_factor='CTCF')
+named.atac[1].select(biosample_type='tissue', ontology_curie='UBERON:0015143')
+```
 
 ## Extracting Embeddings
 
@@ -63,7 +128,9 @@ emb['embeddings_128bp']  # (B, 1024, 3072) at 128bp
 Train a new head on your data with frozen trunk (linear probing) or with LoRA adapters:
 
 ```python
-from alphagenome_pytorch import AlphaGenome, TransferConfig, load_trunk, prepare_for_transfer
+from alphagenome_pytorch import (
+    AlphaGenome, TransferConfig, load_trunk, prepare_for_transfer,
+)
 
 # Load trunk, freeze, add custom heads
 model = AlphaGenome()
@@ -75,18 +142,32 @@ model = prepare_for_transfer(model, TransferConfig(
 ))
 ```
 
-The easiest way to start with fine-tuning is to use [`scripts/finetune.py`](scripts/finetune.py) that implements a flexible CLI interface:
+The easiest way to start with fine-tuning is the `agt finetune` CLI (installed with the
+package):
 
 ```bash
 # LoRA fine-tuning
-python scripts/finetune.py --mode lora --lora-rank 8 \
+agt finetune --mode lora --lora-rank 8 \
     --genome hg38.fa --modality atac --bigwig *.bw \
     --train-bed train.bed --val-bed val.bed \
     --pretrained-weights alphagenome.pt
 
-# Multi-GPU
-torchrun --nproc_per_node=4 scripts/finetune.py --mode lora ...
+# LoRA + Locon on the last 4 encoder convs before attention
+agt finetune --mode lora+locon --lora-rank 8 \
+    --locon-rank 4 --locon-targets down_blocks.4,down_blocks.5 \
+    --genome hg38.fa --modality atac --bigwig *.bw \
+    --train-bed train.bed --val-bed val.bed \
+    --pretrained-weights alphagenome.pt
+
+# Multi-GPU (torchrun needs a module target)
+torchrun --nproc_per_node=4 -m alphagenome_pytorch.cli finetune --mode lora ...
 ```
+
+`agt finetune` and `python scripts/finetune.py` are the same code path with the same
+flags; the script is kept as a compatibility shim (it only works from a repo clone).
+
+Note that Locon targets are explicit by design. You can use the syntax 
+`down_blocks.3,down_blocks.4,down_blocks.5` to choose targets.
 
 See [`examples/notebooks/finetune_linear_probe.ipynb`](examples/notebooks/finetune_linear_probe.ipynb) for an example of linear probing on ATAC-seq data.
 
@@ -98,19 +179,21 @@ See a compiled [ARCHITECTURE_COMPARISON.md](ARCHITECTURE_COMPARISON.md) for some
 
 ## Model Outputs
 
-| Head | Tracks | Resolutions | Description |
-|------|--------|-------------|-------------|
-| atac | 256 | 1bp, 128bp | Chromatin accessibility |
-| dnase | 384 | 1bp, 128bp | DNase-seq |
-| procap | 128 | 1bp, 128bp | Transcription initiation |
-| cage | 640 | 1bp, 128bp | 5' cap RNA |
-| rnaseq | 768 | 1bp, 128bp | RNA expression |
-| chip_tf | 1664 | 128bp | TF binding |
-| chip_histone | 1152 | 128bp | Histone modifications |
-| contact_maps | 28 | 64×64 | 3D chromatin contacts |
-| splice_sites | 4 | 1bp | Splice site classification (D+, A+, D−, A−) |
-| splice_junctions | 734 | pairwise | Junction read counts (367 tissues × 2 strands) |
-| splice_site_usage | 734 | 1bp | Fraction of transcripts using splice site |
+| Head | Tracks (human) | Dimension (padded) | Resolutions | Description |
+|------|--------|-----------|-------------|-------------|
+| atac | 167 | 256 | 1bp, 128bp | Chromatin accessibility |
+| dnase | 305 | 384 | 1bp, 128bp | DNase-seq |
+| procap | 12 | 128 | 1bp, 128bp | Transcription initiation |
+| cage | 546 | 640 | 1bp, 128bp | 5' cap RNA |
+| rna_seq | 667 | 768 | 1bp, 128bp | RNA expression |
+| chip_tf | 1617 | 1664 | 128bp | TF binding |
+| chip_histone | 1116 | 1152 | 128bp | Histone modifications |
+| contact_maps | 28 | 28 | 64×64 | 3D chromatin contacts |
+| splice_sites | 4 | 5 | 1bp | Splice site classification (D+, A+, D−, A−, none) |
+| splice_junctions | 734 | 734 | pairwise | Junction read counts (367 tissues × 2 strands) |
+| splice_site_usage | 734 | 734 | 1bp | Fraction of transcripts using splice site |
+
+Tracks column shows the number of real human tracks (without padding). Dimension is the raw output tensor size — padding fills the gap. When using `named_outputs=True`, padding is stripped by default. See [named outputs guide](docs/named_outputs.rst) for details.
 
 See more information about model outputs [in the official AlphaGenome documentation](https://www.alphagenomedocs.com/exploring_model_metadata.html).
 
@@ -171,4 +254,3 @@ This port is licensed under the Apache License, Version 2.0 (Apache 2.0):
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this except in compliance with the License.
 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
-

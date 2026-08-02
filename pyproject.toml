@@ -11,7 +11,11 @@ requires-python = ">=3.12"
 dependencies = [
     "torch>=2.0.0",
     "numpy",
+    "safetensors"
 ]
+
+[project.scripts]
+agt = "alphagenome_pytorch.cli:main"
 
 [project.optional-dependencies]
 test = [
@@ -26,7 +30,6 @@ test = [
     "aiohttp",
     "requests",
     "pybigwig",
-    "pysam",
     "pyfaidx",
     "tqdm",
     "logomaker",
@@ -36,6 +39,21 @@ jax = [
     "jaxlib",
     "dm-haiku",
     "orbax-checkpoint",
+]
+inference = [
+    "pybigwig",
+    "pyfaidx",
+    "tqdm",
+]
+# Whole-chromosome gene-count / AnnData export (predict_full_chromosome.py --anndata):
+# adds pandas (metadata), anndata (.h5ad), and annotation readers (pyranges for
+# GTF, pyarrow for parquet) on top of the base inference deps.
+inference-anndata = [
+    "alphagenome-pytorch[inference]",
+    "pandas",
+    "anndata",
+    "pyranges",
+    "pyarrow",
 ]
 finetuning = [
     "pybigwig",
@@ -49,7 +67,16 @@ scoring = [
     "tqdm",
     "pyranges",
     "alphagenome",
-    "safetensors",
+]
+serving = [
+    "grpcio",
+    "pandas",
+    "pyfaidx",
+    "alphagenome",
+    "PyYAML",
+]
+hf = [
+    "huggingface_hub>=0.24",
 ]
 docs = [
     "sphinx>=7.0.0",
@@ -67,6 +94,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = ["-v", "--strict-markers"]
+
 markers = [
     "unit: Unit tests (no external dependencies)",
     "integration: Integration tests with full model (PyTorch only, no JAX required)",
@@ -80,6 +108,11 @@ markers = [
 
 [tool.hatch.version]
 source = "vcs"
+
+[tool.hatch.build]
+artifacts = [
+    "src/alphagenome_pytorch/data/*.parquet",
+]
 
 [tool.hatch.build.hooks.vcs]
 version-file = "src/alphagenome_pytorch/_version.py"

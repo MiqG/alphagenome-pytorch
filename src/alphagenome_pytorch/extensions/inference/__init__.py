@@ -32,8 +32,25 @@ from .full_chromosome import (
     GenomeSequenceProvider,
     predict_full_chromosome,
     predict_full_chromosomes_to_bigwig,
+    predict_full_chromosomes_to_anndata,
     write_bigwig,
     HEAD_CONFIGS,
+)
+from .regions import (
+    BedRegion,
+    RegionInfo,
+    center_crop,
+    pad_to_window,
+    parse_bed,
+    parse_locus,
+    predict_region,
+    predict_region_auto,
+    predict_sequence_auto,
+    predict_single_window,
+    read_fasta_sequences,
+    write_region_bigwig,
+    write_regions_merged_bigwig,
+    write_sequence_npz,
 )
 
 __all__ = [
@@ -41,6 +58,22 @@ __all__ = [
     'GenomeSequenceProvider',
     'predict_full_chromosome',
     'predict_full_chromosomes_to_bigwig',
+    'predict_full_chromosomes_to_anndata',
     'write_bigwig',
     'HEAD_CONFIGS',
+    # Region / locus / sequence prediction
+    'BedRegion',
+    'RegionInfo',
+    'center_crop',
+    'pad_to_window',
+    'parse_bed',
+    'parse_locus',
+    'predict_region',
+    'predict_region_auto',
+    'predict_sequence_auto',
+    'predict_single_window',
+    'read_fasta_sequences',
+    'write_region_bigwig',
+    'write_regions_merged_bigwig',
+    'write_sequence_npz',
 ]
