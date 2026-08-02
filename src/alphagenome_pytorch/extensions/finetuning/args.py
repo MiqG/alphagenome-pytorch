@@ -20,6 +20,11 @@ from typing import Any
 
 from alphagenome_pytorch.extensions.finetuning.modalities import MODALITY_CONFIGS
 
+# Splice modalities are handled separately from MODALITY_CONFIGS: they have no
+# bigwig files and no fixed resolution/embedding_dim (their heads take
+# star-junctions/ssu inputs instead). See create_finetuning_head's assay_type.
+SPLICE_MODALITIES = {'splice_site', 'splice_usage', 'splice_junctions'}
+
 
 DEFAULTS = {
     # Data
@@ -367,8 +372,16 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         type=str,
         action="append",
         dest="modalities",
-        choices=list(MODALITY_CONFIGS.keys()),
-        help="Assay modality type. Repeat --modality for each --bigwig group in multi-modality mode.",
+        help=(
+            "Assay modality type. Genomic (bigwig-backed): "
+            + ", ".join(sorted(MODALITY_CONFIGS.keys()))
+            + ". Splice (star-junctions/ssu-backed): "
+            + ", ".join(sorted(SPLICE_MODALITIES))
+            + ". Repeat --modality for each --bigwig group in multi-modality mode. "
+            "Splice modalities can be comma-separated in one entry (e.g. "
+            "'splice_site,splice_usage,splice_junctions') to share one "
+            "--star-junctions/--ssu group; they do not require --bigwig."
+        ),
     )
     model.add_argument(
         "--modality-weights",
@@ -761,7 +774,7 @@ def postprocess_args(
 
     modality_specs: dict[str, dict[str, Any]] = {}
     for modality, mod_cfg in raw_modalities.items():
-        if modality not in MODALITY_CONFIGS:
+        if modality not in MODALITY_CONFIGS and modality not in SPLICE_MODALITIES:
             parser.error(f"Unknown modality in config: {modality}")
         if not isinstance(mod_cfg, dict):
             parser.error(f"modalities.{modality} must be a mapping")
@@ -800,24 +813,55 @@ def postprocess_args(
                 "--modality is required when --bigwig is provided. "
                 f"Pass one of: {sorted(MODALITY_CONFIGS.keys())}."
             )
-        if len(args.modalities) != len(args.bigwigs):
+        # Splice modalities (splice_site, splice_usage, splice_junctions) do not
+        # take --bigwig -- they use --star-junctions/--ssu instead. A single
+        # --modality entry may bundle several splice sub-modalities via commas
+        # (e.g. 'splice_site,splice_usage,splice_junctions') to share one
+        # --star-junctions/--ssu group; only genomic (bigwig-backed) entries
+        # are counted against --bigwig groups here.
+        genomic_modality_count = sum(
+            1 for m in args.modalities if not any(s in SPLICE_MODALITIES for s in m.split(","))
+        )
+        if genomic_modality_count != len(args.bigwigs):
             parser.error(
-                f"Number of --modality ({len(args.modalities)}) must match number of --bigwig groups ({len(args.bigwigs)}). "
-                "Each --modality should be followed by --bigwig FILES."
+                f"Number of genomic --modality entries ({genomic_modality_count}) must match "
+                f"number of --bigwig groups ({len(args.bigwigs)}). Splice modalities "
+                "(splice_site, splice_usage, splice_junctions) do not require --bigwig."
             )
-        for modality, bigwigs in zip(args.modalities, args.bigwigs):
-            if modality in cli_modality_to_bigwigs:
-                parser.error(f"Duplicate modality: {modality}")
-            cli_modality_to_bigwigs[modality] = bigwigs
+        bigwig_idx = 0
+        for modality_entry in args.modalities:
+            sub_mods = [m.strip() for m in modality_entry.split(",")]
+            is_genomic = not any(m in SPLICE_MODALITIES for m in sub_mods)
+            if is_genomic:
+                if bigwig_idx >= len(args.bigwigs):
+                    parser.error(f"Not enough --bigwig groups for modality {modality_entry}")
+                for sub_mod in sub_mods:
+                    if sub_mod in cli_modality_to_bigwigs:
+                        parser.error(f"Duplicate modality: {sub_mod}")
+                    cli_modality_to_bigwigs[sub_mod] = args.bigwigs[bigwig_idx]
+                bigwig_idx += 1
     elif args.modalities is not None and "--modality" in cli_flags:
-        parser.error("--modality requires matching --bigwig entries")
+        if any(any(s in SPLICE_MODALITIES for s in m.split(",")) for m in args.modalities):
+            pass  # splice-only modalities are allowed without --bigwig
+        else:
+            parser.error("--modality requires matching --bigwig entries")
 
     for modality, bigwigs in cli_modality_to_bigwigs.items():
         merged = dict(modality_specs.get(modality, {}))
         merged["bigwig"] = list(bigwigs)
         modality_specs[modality] = merged
 
-    args.modalities = list(modality_specs.keys())
+    # Preserve original CLI modality entries (which may be comma-separated
+    # splice groups); add any config-only (genomic) modalities not on the CLI.
+    cli_modalities = list(args.modalities or [])
+    config_only_modalities = [
+        m for m in modality_specs
+        if m not in cli_modality_to_bigwigs
+        and m not in {s.strip() for entry in cli_modalities for s in entry.split(",")}
+    ]
+    cli_modalities.extend(config_only_modalities)
+
+    args.modalities = cli_modalities if cli_modalities else list(modality_specs.keys())
     if not args.modalities:
         parser.error("--bigwig is required (or provide modalities in --config)")
 
@@ -838,13 +882,53 @@ def postprocess_args(
     args.modality_weight_dict = {}
     args.modality_strands: dict[str, str] = {}
     args.modality_strand_pairs = {}
+    args.modality_to_star_junctions: dict[str, list[str]] = {}
+    args.modality_to_ssu_files: dict[str, list[str] | None] = {}
+
+    # Expand comma-separated modality entries: "splice_site,splice_junctions"
+    # -> ["splice_site", "splice_junctions"]. All sub-modalities from one entry
+    # share the same --star-junctions/--ssu group (matched by entry order).
+    flat_modalities: list[str] = []
+    flat_modality_specs: dict[str, dict[str, Any]] = {}
+    junc_group_idx = 0
+    for mod_entry in args.modalities:
+        sub_mods = [m.strip() for m in mod_entry.split(",")]
+        spec = modality_specs.get(mod_entry, {})
+        junc_group = None
+        ssu_group = None
+        if any(m in SPLICE_MODALITIES for m in sub_mods):
+            star_junction_groups = args.star_junctions or []
+            ssu_groups = args.ssu or []
+            if junc_group_idx < len(star_junction_groups):
+                junc_group = star_junction_groups[junc_group_idx]
+            if junc_group_idx < len(ssu_groups):
+                ssu_group = ssu_groups[junc_group_idx]
+            junc_group_idx += 1
+        for sub_mod in sub_mods:
+            flat_modalities.append(sub_mod)
+            flat_modality_specs[sub_mod] = {**spec, "junc_group": junc_group, "ssu_group": ssu_group}
+    args.modalities = flat_modalities
+
     for modality in args.modalities:
-        spec = modality_specs.get(modality, {})
-        if "bigwig" not in spec or not spec["bigwig"]:
-            parser.error(f"No bigwig files specified for modality '{modality}'")
-        args.modality_to_bigwigs[modality] = list(spec["bigwig"])
+        spec = flat_modality_specs.get(modality, modality_specs.get(modality, {}))
+        junc_group = spec.get("junc_group")
+        ssu_group = spec.get("ssu_group")
+        if modality in SPLICE_MODALITIES:
+            # Splice modalities require junction files (no BigWig required).
+            if junc_group is None:
+                parser.error(f"Modality '{modality}' requires --star-junctions files.")
+            args.modality_to_star_junctions[modality] = junc_group
+            args.modality_to_ssu_files[modality] = ssu_group  # None if not provided
+            args.modality_to_bigwigs[modality] = []
+        else:
+            if "bigwig" not in spec or not spec["bigwig"]:
+                parser.error(f"No bigwig files specified for modality '{modality}'")
+            args.modality_to_bigwigs[modality] = list(spec["bigwig"])
         args.modality_resolutions[modality] = spec.get("resolutions", args.global_resolutions)
         args.modality_weight_dict[modality] = float(spec.get("task_weight", 1.0))
+        if modality in SPLICE_MODALITIES:
+            # Strand/strand-pairs config only applies to bigwig-backed tracks.
+            continue
         if spec.get("strand"):
             # str ('+-+-') or a YAML list (['+','-',...]); normalized below.
             args.modality_strands[modality] = spec["strand"]
@@ -944,7 +1028,43 @@ def postprocess_args(
                 parser.error(f"Unknown modality in --modality-weights: {mod}")
             args.modality_weight_dict[mod] = float(weight.strip())
 
+    # Parse --pretrained-head-samples: comma-separated 'modality:idx' pairs.
+    # idx is either a single int (broadcast) or '|'-separated ints (per-track).
+    args.pretrained_head_sample_dict: dict[str, int | list[int | None] | None] = {}
+    if args.pretrained_head_samples:
+        for item in args.pretrained_head_samples.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" in item:
+                modality, idx_str = item.rsplit(":", 1)
+            else:
+                modality, idx_str = item, "0"
+            modality = modality.strip()
+            try:
+                if "|" in idx_str:
+                    def _parse_idx(x):
+                        x = x.strip()
+                        return None if x.upper() == "NA" else int(x)
+                    args.pretrained_head_sample_dict[modality] = [_parse_idx(x) for x in idx_str.split("|")]
+                else:
+                    args.pretrained_head_sample_dict[modality] = None if idx_str.strip().upper() == "NA" else int(idx_str)
+            except ValueError:
+                parser.error(
+                    f"--pretrained-head-samples: invalid index '{idx_str}' in '{item}', "
+                    f"expected integer, 'NA', or '|'-separated integers/NAs."
+                )
+
     args.is_multimodal = len(args.modalities) > 1
+
+    # We need the splice site classification head to derive junction positions.
+    if args.junction_position_source == "predicted":
+        all_modalities = {m for group in args.modalities for m in group.split(",")}
+        if "splice_site" not in all_modalities:
+            parser.error(
+                "--junction-position-source=predicted requires the 'splice_site' modality "
+                "so the classification head is available to score positions."
+            )
 
     return args
 

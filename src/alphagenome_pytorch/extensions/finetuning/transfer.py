@@ -418,6 +418,7 @@ def prepare_for_transfer(
             track_means=track_means,
             init_scheme=head_config.get('init_scheme', 'truncated_normal'),
             encoder_only=head_encoder_only,
+            rope_init=head_config.get('rope_init', 'truncated_normal'),
         )
         add_head(model, head_name, head, replace=True)
     
