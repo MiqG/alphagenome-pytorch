@@ -70,6 +70,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -1021,6 +1022,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     start_epoch = 1
     best_val_loss = float("inf")
     wandb_run_id = None
+    skip_batches = 0
 
     if resume_path and resume_path.exists():
         print_rank0(f"Resuming from: {resume_path}", rank)
@@ -1050,9 +1052,14 @@ def main(args: argparse.Namespace | None = None) -> None:
                 device="cpu",
             )
             start_epoch = ckpt["epoch"] + 1
+            skip_batches = ckpt.get("batch_idx", 0)
             best_val_loss = ckpt.get("best_val_loss", ckpt.get("val_loss", float("inf")))
             wandb_run_id = ckpt.get("wandb_run_id")
             print_rank0(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
+            # ckpt holds a full CPU copy of model_state_dict/optimizer_state_dict;
+            # its values have already been loaded into model/optimizer, so drop it
+            # before DataLoader workers fork to avoid duplicating it across workers.
+            del ckpt
 
     # Config for logging
     config = {
@@ -1100,6 +1107,8 @@ def main(args: argparse.Namespace | None = None) -> None:
     }
 
     # Logger (rank 0 only)
+    steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
+    resume_step = (start_epoch - 1) * steps_per_epoch + skip_batches // args.gradient_accumulation_steps
     logger = TrainingLogger(
         output_dir=output_dir,
         rank=rank,
@@ -1109,12 +1118,14 @@ def main(args: argparse.Namespace | None = None) -> None:
         run_name=run_name,
         config=config,
         resume_id=wandb_run_id if resume_path else None,
+        initial_step=resume_step,
     )
 
     use_amp = not args.no_amp
 
     # Preemption handler state
     current_epoch = start_epoch
+    _save_state: dict = {"batch_idx": 0}
 
     def _save_preempt():
         """Save preemption checkpoint, honoring --save-delta / --no-full-checkpoint."""
@@ -1132,6 +1143,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 scheduler=scheduler,
                 best_val_loss=best_val_loss,
                 wandb_run_id=logger.wandb_run_id,
+                batch_idx=_save_state["batch_idx"],
                 **transfer_config_kwargs,
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
@@ -1151,6 +1163,54 @@ def main(args: argparse.Namespace | None = None) -> None:
             print(f"Preemption delta checkpoint saved to {output_dir / 'checkpoint_preempt.delta.pth'}")
 
     handler = setup_preemption_handler(_save_preempt, rank, world_size)
+
+    # Eval-only mode: load checkpoint and run validation, then exit.
+    if args.eval_only:
+        import json
+        if resume_path is None or not resume_path.exists():
+            print_rank0("ERROR: --eval-only requires a checkpoint via --resume; none found", rank)
+            sys.exit(1)
+        print_rank0(f"\n{'=' * 60}", rank)
+        print_rank0(f"Eval-only mode: loaded checkpoint from {resume_path}", rank)
+        print_rank0(f"{'=' * 60}", rank)
+
+        _eval_encoder_only = args.mode == "encoder-only"
+        _eval_validate_kwargs = dict(
+            model=model, heads=heads, device=device,
+            modality_weights=args.modality_weight_dict,
+            resolution_weights=resolution_weights_per_modality,
+            positional_weight=args.positional_weight,
+            count_weight=args.count_weight,
+            compute_pearson=True,  # eval-only mode always computes Pearson
+            num_segments=args.num_segments,
+            min_segment_size=args.min_segment_size,
+            rank=rank, world_size=world_size,
+            encoder_only=_eval_encoder_only,
+            organism_idx=organism_index,
+            junction_top_k=args.junction_top_k,
+            junction_loss=args.junction_loss,
+            compute_per_sample=args.metrics_per_sample,
+            min_alpha_juncs=args.min_alpha_juncs,
+            gene_annotation=gene_expr_annotation,
+            gene_expr_track_strands=gene_expr_track_strands,
+            gene_expr_window_cache=gene_expr_window_cache,
+        )
+
+        val_loss, val_metrics = validate_multihead(val_loader=val_loader, **_eval_validate_kwargs)
+
+        train_metrics = {}
+        if args.eval_train_pearson:
+            _, train_metrics = validate_multihead(val_loader=train_loader, **_eval_validate_kwargs)
+            train_metrics = {f"train_{k}": v for k, v in train_metrics.items()}
+
+        all_metrics = {**val_metrics, **train_metrics}
+        metrics_file = output_dir / "eval_only_metrics.json"
+        metrics_file.parent.mkdir(parents=True, exist_ok=True)
+        if is_main_process(rank):
+            with open(metrics_file, "w") as f:
+                json.dump(all_metrics, f, indent=2)
+            print(f"\nEval metrics saved to {metrics_file}")
+        sys.exit(0)
 
     # Training loop
     print_rank0("\n" + "=" * 60, rank)
@@ -1184,6 +1244,8 @@ def main(args: argparse.Namespace | None = None) -> None:
                 break
 
             current_epoch = epoch
+            epoch_skip = skip_batches if epoch == start_epoch else 0
+            global_step_offset = (epoch - 1) * steps_per_epoch + epoch_skip // args.gradient_accumulation_steps
 
             # Clear GPU cache between epochs for robustness
             if torch.cuda.is_available():
@@ -1226,6 +1288,11 @@ def main(args: argparse.Namespace | None = None) -> None:
                     junction_loss=args.junction_loss,
                     min_alpha_juncs=args.min_alpha_juncs,
                     handler=handler,
+                    save_every_steps=args.save_every_steps,
+                    save_fn=_save_preempt if not args.no_save_checkpoints else None,
+                    global_step_offset=global_step_offset,
+                    skip_batches=epoch_skip,
+                    save_state=_save_state,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
@@ -1262,6 +1329,11 @@ def main(args: argparse.Namespace | None = None) -> None:
                     junction_loss=args.junction_loss,
                     min_alpha_juncs=args.min_alpha_juncs,
                     handler=handler,
+                    save_every_steps=args.save_every_steps,
+                    save_fn=_save_preempt if not args.no_save_checkpoints else None,
+                    global_step_offset=global_step_offset,
+                    skip_batches=epoch_skip,
+                    save_state=_save_state,
                 )
 
             if handler.preempted:
@@ -1367,6 +1439,12 @@ def main(args: argparse.Namespace | None = None) -> None:
                             wandb_run_id=logger.wandb_run_id,
                         )
                         print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
+
+                # Epoch complete: reset mid-epoch batch tracking so a preemption
+                # signal firing between epochs (before any batch of the next
+                # epoch has run) doesn't report a stale non-zero batch_idx that
+                # would cause the next resume to skip into the wrong epoch.
+                _save_state["batch_idx"] = 0
 
                 if epoch % args.save_every == 0:
                     if write_full:
