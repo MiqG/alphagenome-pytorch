@@ -1,8 +1,8 @@
 """Fine-tuning heads for AlphaGenome.
 
-Provides a factory function to create GenomeTracksHead instances
-configured for fine-tuning on specific assay types, plus a dedicated
-SpliceSitesFinetuningAdapter for splice junction training (wraps original heads).
+Provides a factory function to create GenomeTracksHead instances configured
+for fine-tuning on specific assay types. Splice modalities return the
+original heads from alphagenome_pytorch.heads directly (no adapter).
 """
 from __future__ import annotations
 
