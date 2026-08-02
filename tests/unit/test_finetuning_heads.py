@@ -117,7 +117,10 @@ class TestAssayTypes:
 
     def test_all_assay_types_present(self):
         """Test all expected assay types are defined."""
-        expected = {'rna_seq', 'atac', 'dnase', 'procap', 'cage', 'chip_tf', 'chip_histone'}
+        expected = {
+            'rna_seq', 'atac', 'dnase', 'procap', 'cage', 'chip_tf', 'chip_histone',
+            'splice_site', 'splice_usage', 'splice_junctions',
+        }
         assert set(ASSAY_TYPES.keys()) == expected
 
     def test_only_rnaseq_has_squashing(self):
@@ -204,9 +207,14 @@ class TestCreateFinetuningHeadAllModalities:
         with pytest.raises(ValueError, match="Invalid resolution"):
             create_finetuning_head('atac', n_tracks=5, resolutions=(64,))
 
-    @pytest.mark.parametrize("assay_type", list(ASSAY_TYPES.keys()))
+    _GENOME_TRACKS_ASSAY_TYPES = [
+        a for a in ASSAY_TYPES
+        if a not in ('splice_site', 'splice_usage', 'splice_junctions')
+    ]
+
+    @pytest.mark.parametrize("assay_type", _GENOME_TRACKS_ASSAY_TYPES)
     def test_all_modalities_output_non_negative(self, assay_type):
-        """Test all modalities produce non-negative outputs."""
+        """Test all GenomeTracksHead-backed modalities produce non-negative outputs."""
         head = create_finetuning_head(assay_type, n_tracks=3, resolutions=(128,))
         # Input NCL format: (B, C, S)
         embeddings_dict = {128: torch.randn(2, 3072, 100)}
@@ -215,6 +223,39 @@ class TestCreateFinetuningHeadAllModalities:
         outputs = head(embeddings_dict, organism_index)
 
         assert (outputs[128] >= 0).all()
+
+    def test_splice_site_output_non_negative(self):
+        """Splice heads return original head instances with a raw-tensor (not dict) calling
+        convention at fixed resolution 1 — see create_finetuning_head docstring."""
+        head = create_finetuning_head('splice_site', n_tracks=3)
+        embeddings_1bp = torch.randn(2, 1536, 100)  # NCL: (B, C, S)
+        organism_index = torch.tensor([0, 0])
+
+        outputs = head(embeddings_1bp, organism_index)
+
+        assert (outputs['probs'] >= 0).all()
+
+    def test_splice_usage_output_non_negative(self):
+        head = create_finetuning_head('splice_usage', n_tracks=3)
+        embeddings_1bp = torch.randn(2, 1536, 100)  # NCL: (B, C, S)
+        organism_index = torch.tensor([0, 0])
+
+        outputs = head(embeddings_1bp, organism_index)
+
+        assert (outputs['predictions'] >= 0).all()
+
+    def test_splice_junctions_output_non_negative(self):
+        head = create_finetuning_head('splice_junctions', n_tracks=3)
+        embeddings_1bp = torch.randn(2, 1536, 100)  # NCL: (B, C, S)
+        organism_index = torch.tensor([0, 0])
+        positions = torch.randint(0, 100, (2, 4, 5))
+
+        outputs = head(
+            embeddings_1bp, organism_index,
+            splice_site_positions=positions, channels_last=False,
+        )
+
+        assert (outputs['pred_counts'] >= 0).all()
 
 
 @pytest.mark.unit
@@ -246,3 +287,37 @@ class TestFinetuningHeadGradients:
 
         outputs = head(embeddings_dict, organism_index)
         assert outputs[128].shape == (1, 100, n_tracks)
+
+
+class TestOrganismAgnosticHead:
+    """A single-organism fine-tuned head ignores the organism index.
+
+    The trunk forward selects the organism embedding (mouse -> index 1), but a
+    num_organisms=1 head has one slot and must use it regardless of the index.
+    """
+
+    def _emb(self):
+        return {128: torch.randn(1, 3072, 16)}
+
+    def test_single_organism_head_ignores_organism_index(self):
+        torch.manual_seed(0)
+        head = create_finetuning_head('atac', n_tracks=3, resolutions=(128,))
+        assert head.num_organisms == 1
+        emb = self._emb()
+        out_human = head(emb, torch.tensor([0]))[128]
+        out_mouse = head(emb, torch.tensor([1]))[128]  # trunk at mouse, head slot 0
+        assert torch.allclose(out_human, out_mouse)
+
+    def test_multi_organism_head_uses_distinct_slots(self):
+        torch.manual_seed(0)
+        head = create_finetuning_head('atac', n_tracks=3, resolutions=(128,), num_organisms=2)
+        emb = self._emb()
+        out0 = head(emb, torch.tensor([0]))[128]
+        out1 = head(emb, torch.tensor([1]))[128]
+        assert not torch.allclose(out0, out1)
+
+    def test_multi_organism_head_rejects_out_of_range_index(self):
+        head = create_finetuning_head('atac', n_tracks=3, resolutions=(128,), num_organisms=2)
+        # Index 3 is genuinely invalid and must raise, not be silently masked.
+        with pytest.raises(IndexError):
+            head(self._emb(), torch.tensor([3]))

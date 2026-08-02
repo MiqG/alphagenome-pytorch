@@ -392,7 +392,8 @@ class TestSpliceSitesJunctionHead:
         embeddings = torch.randn(B, in_channels, S)
         organism_index = torch.tensor([0, 1])
 
-        output = head(embeddings, organism_index, splice_site_positions=torch.randint(0, S, (B, 4, P)))
+        output = head(embeddings, organism_index, splice_site_positions=torch.randint(0, S, (B, 4, P)),
+                      channels_last=False)
         assert output['pred_counts'].shape == (B, P, P, 2 * T)
 
     def test_no_splice_site_positions(self):
@@ -414,7 +415,7 @@ class TestSpliceSitesJunctionHead:
         ("num_organisms", "num_tracks_per_organism"),
         [
             (1, (367,)),
-            (2, (367, 90)),
+            (2, (367, 367)),
         ],
     )
     def test_track_mask_for_one_and_two_organisms(
@@ -438,8 +439,8 @@ class TestSpliceSitesJunctionHead:
         for org_idx, expected_tissues in enumerate(num_tracks_per_organism):
             assert int(head.tissue_mask[org_idx].sum().item()) == expected_tissues
 
-    def test_forward_applies_per_organism_mask(self):
-        """Mouse channels should be masked beyond its configured tissue count."""
+    def test_forward_uses_configured_per_organism_mask(self):
+        """Channels beyond each organism's configured tissue count are masked."""
         from alphagenome_pytorch.heads import SpliceSitesJunctionHead
 
         B, S, P, T = 2, 512, 8, 367
@@ -454,7 +455,7 @@ class TestSpliceSitesJunctionHead:
         organism_index = torch.tensor([0, 1])
         positions = torch.randint(0, S, (B, 4, P))
 
-        output = head(embeddings, organism_index, splice_site_positions=positions)
+        output = head(embeddings, organism_index, splice_site_positions=positions, channels_last=False)
         mask = output['splice_junction_mask']
 
         # Organism 0 (human): all tissues valid in both strands.
@@ -463,6 +464,51 @@ class TestSpliceSitesJunctionHead:
         # Organism 1 (mouse): channels >=90 are masked in both concatenated halves.
         assert not bool(mask[1, :, :, 90:T].any())
         assert not bool(mask[1, :, :, T + 90:2 * T].any())
+
+    def test_forward_default_two_organism_junction_mask_is_unpadded(self):
+        """Current JAX metadata exposes 367 junction tissues for both species."""
+        from alphagenome_pytorch.heads import SpliceSitesJunctionHead
+
+        B, S, P, T = 2, 512, 8, 367
+        head = SpliceSitesJunctionHead(
+            in_channels=128,
+            hidden_dim=64,
+            num_tissues=T,
+            num_organisms=2,
+            num_tracks_per_organism=(367, 367),
+        )
+        embeddings = torch.randn(B, 128, S)
+        organism_index = torch.tensor([0, 1])
+        positions = torch.randint(0, S, (B, 4, P))
+
+        output = head(embeddings, organism_index, splice_site_positions=positions, channels_last=False)
+        mask = output['splice_junction_mask']
+
+        assert bool(mask[0].all())
+        assert bool(mask[1].all())
+
+    def test_rope_params_initialized_nonzero(self):
+        # Upstream switched zero-init → trunc-normal so the junction head
+        # converges when fine-tuned from scratch.
+        from alphagenome_pytorch.heads import SpliceSitesJunctionHead
+
+        num_organisms, T, in_channels, hidden_dim = 2, 367, 128, 64
+        head = SpliceSitesJunctionHead(
+            in_channels=in_channels,
+            hidden_dim=hidden_dim,
+            num_tissues=T,
+            num_organisms=num_organisms,
+        )
+
+        expected_shape = (num_organisms, 2, T, hidden_dim)
+        for key in ("pos_donor", "pos_acceptor", "neg_donor", "neg_acceptor"):
+            param = head.rope_params[key]
+            assert param.shape == expected_shape
+            assert torch.isfinite(param).all()
+            assert torch.any(param != 0), f"rope_params[{key!r}] should not be all zeros"
+            assert param.abs().max().item() < 1.0, (
+                f"trunc_normal_(std=0.1) produced unexpectedly large values for {key!r}"
+            )
 
 
 @pytest.mark.unit
