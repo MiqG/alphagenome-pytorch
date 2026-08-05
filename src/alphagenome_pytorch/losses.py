@@ -243,8 +243,9 @@ def cross_entropy_loss(
     """Cross entropy loss on counts.
 
     Mirrors upstream JAX `cross_entropy_loss` post-fix (see
-    google-deepmind/alphagenome_research@de264f5): adds eps smoothing to
-    targets and predictions, and skips fully-masked reduction axes so they
+    google-deepmind/alphagenome_research@de264f5): eps is used only for
+    normalization/log-stability at each sum()/log() site, not added to the
+    raw counts upfront, and fully-masked reduction axes are skipped so they
     do not propagate NaNs from 0/0 normalization.
 
     Args:
@@ -257,8 +258,8 @@ def cross_entropy_loss(
     Returns:
         Scalar loss.
     """
-    y_true = y_true.float() + eps
-    y_pred = y_pred.float() + eps
+    y_true = y_true.float()
+    y_pred = y_pred.float()
     mask = mask.expand_as(y_true).bool()
     assert y_true.shape == y_pred.shape == mask.shape
 
