@@ -368,32 +368,67 @@ def _soft_clip_counts(counts: torch.Tensor, clip: float = 10.0) -> torch.Tensor:
     return torch.where(counts > clip, 2.0 * torch.sqrt(counts * clip) - clip, counts)
 
 
-def _compute_junction_strand_loss(pred_counts, target_counts, donor_pos, accept_pos, device,
-                                   junction_loss: str = "original"):
-    """Strand-specific junction loss matching JAX SpliceSitesJunctionHead.loss.
+def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
+                            neg_pred, neg_target, neg_donor_pos, neg_accept_pos,
+                            device, junction_loss: str = "original"):
+    """Junction loss over both strands combined, matching JAX SpliceSitesJunctionHead.loss.
 
     loss = 0.2 * (CE(axis=donor) + CE(axis=acceptor)) + 0.04 * (Poisson(axis=donor) + Poisson(axis=acceptor))
 
-    pairs_mask[b,d,a,s] = (donor_pos[b,d] >= 0) & (accept_pos[b,a] >= 0)
+    Both strands are concatenated along the channel axis (pos channels first,
+    then neg) into one [B, D, A, 2*n_s] tensor before the CE/Poisson calls --
+    NOT computed as two separate per-strand calls and summed. This matters
+    because cross_entropy_loss/poisson_loss end in a *global* masked mean
+    (alphagenome_research.model.losses.safe_masked_mean: sum over every
+    unmasked element, including the channel axis, divided by the unmasked
+    count) -- the same reduction the real JAX head applies to its own
+    [B, D, A, 2*num_tissues] tensor (both strands' channels together, in one
+    call). Computing two independently-normalized n_s-channel means and
+    summing them instead of one jointly-normalized 2*n_s-channel mean roughly
+    doubles the result whenever the two strands have similar per-channel
+    magnitude (mean_pos + mean_neg ≈ 2 × mean_combined) -- confirmed to
+    account for the JAX-vs-PyTorch splice_junctions gap (JAX ~0.44 vs PyTorch
+    ~0.88-0.91 val loss, almost exactly 2x) found cross-checking a JAX
+    reproduction of this same fine-tuning run against this codebase.
+
+    pairs_mask[b,d,a,c] = (donor_pos[b,d] >= 0) & (accept_pos[b,a] >= 0), using
+    the positive-strand donor/accept positions for the first n_s channels and
+    the negative-strand ones for the last n_s -- each strand's donor/acceptor
+    axis indices are meaningful only within that strand's own channel group
+    (see star_junctions.py's junctions_to_junction_matrix), exactly as in the
+    real JAX head's tensor; the shared CE/Poisson calls handle this correctly
+    since their per-(acceptor,channel) or per-(donor,channel) reductions never
+    mix positions across channels.
 
     Args:
         junction_loss: "original" uses cross_entropy_loss (JAX pre-de264f5);
                        "normalized" uses cross_entropy_loss_normalized (JAX post-de264f5,
                        both targets and predictions normalized to ratios within mask).
     """
-    assert pred_counts.shape == target_counts.shape, (
-        f"pred_counts {tuple(pred_counts.shape)} and target_counts {tuple(target_counts.shape)} must match"
+    assert pos_pred.shape == pos_target.shape, (
+        f"pos_pred {tuple(pos_pred.shape)} and pos_target {tuple(pos_target.shape)} must match"
     )
-    assert donor_pos.shape[-1] == pred_counts.shape[1], (
-        f"donor positions K={donor_pos.shape[-1]} must equal pred_counts dim-1={pred_counts.shape[1]}"
+    assert neg_pred.shape == neg_target.shape, (
+        f"neg_pred {tuple(neg_pred.shape)} and neg_target {tuple(neg_target.shape)} must match"
     )
-    assert accept_pos.shape[-1] == pred_counts.shape[2], (
-        f"acceptor positions K={accept_pos.shape[-1]} must equal pred_counts dim-2={pred_counts.shape[2]}"
+    assert pos_donor_pos.shape[-1] == pos_pred.shape[1], (
+        f"pos donor positions K={pos_donor_pos.shape[-1]} must equal pos_pred dim-1={pos_pred.shape[1]}"
     )
-    valid_d = (donor_pos >= 0).float()
-    valid_a = (accept_pos >= 0).float()
-    pairs_mask = torch.einsum('bd,ba->bda', valid_d, valid_a).bool()
-    pairs_mask = pairs_mask.unsqueeze(-1).expand_as(pred_counts)
+    assert pos_accept_pos.shape[-1] == pos_pred.shape[2], (
+        f"pos acceptor positions K={pos_accept_pos.shape[-1]} must equal pos_pred dim-2={pos_pred.shape[2]}"
+    )
+
+    def _strand_mask(donor_pos, accept_pos, like):
+        valid_d = (donor_pos >= 0).float()
+        valid_a = (accept_pos >= 0).float()
+        return torch.einsum('bd,ba->bda', valid_d, valid_a).bool().unsqueeze(-1).expand_as(like)
+
+    pred_counts = torch.cat([pos_pred, neg_pred], dim=-1)
+    target_counts = torch.cat([pos_target, neg_target], dim=-1)
+    pairs_mask = torch.cat([
+        _strand_mask(pos_donor_pos, pos_accept_pos, pos_pred),
+        _strand_mask(neg_donor_pos, neg_accept_pos, neg_pred),
+    ], dim=-1)
 
     if not pairs_mask.any():
         return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
@@ -506,7 +541,7 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
 
     Returns:
         (loss_tensor, components_dict) where components_dict has keys like
-        'cls_loss', 'usage_loss', 'junction_pos_loss', 'junction_neg_loss'.
+        'cls_loss', 'usage_loss', 'junction_loss'.
     """
     N_CLASSES = 5
     label_smoothing = 1e-7
@@ -576,18 +611,14 @@ def _compute_splice_loss(head, predictions, targets_dict, device, num_segments: 
             return torch.tensor(0.0, device=device), {}
         junc_matrix, positions = _get_junction_targets(predictions, targets_dict, device)
         n_s = head._num_tissues
-        pos_loss = _compute_junction_strand_loss(
+        loss = _compute_junction_loss(
             predictions["pos_counts"], junc_matrix[..., :n_s],
-            positions[:, 0, :].long(), positions[:, 1, :].long(), device,
-            junction_loss=junction_loss,
-        )
-        neg_loss = _compute_junction_strand_loss(
+            positions[:, 0, :].long(), positions[:, 1, :].long(),
             predictions["neg_counts"], junc_matrix[..., n_s:],
-            positions[:, 2, :].long(), positions[:, 3, :].long(), device,
-            junction_loss=junction_loss,
+            positions[:, 2, :].long(), positions[:, 3, :].long(),
+            device, junction_loss=junction_loss,
         )
-        loss = pos_loss + neg_loss
-        return loss, {"junction_pos_loss": pos_loss.item(), "junction_neg_loss": neg_loss.item()}
+        return loss, {"junction_loss": loss.item()}
 
     return torch.tensor(0.0, device=device), {}
 
