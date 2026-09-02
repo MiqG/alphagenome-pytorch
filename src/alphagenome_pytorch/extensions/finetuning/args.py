@@ -503,14 +503,18 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     train.add_argument(
         "--junction-loss",
         type=str,
-        default="original",
+        default="normalized",
         choices=["original", "normalized", "sparse"],
         help=(
             "Cross-entropy variant for the splice junction head loss. "
-            "'original' (default) matches JAX pre-de264f5: log-space decomposition, "
-            "y_pred not explicitly normalized. "
-            "'normalized' matches JAX post-de264f5: both targets and predictions "
-            "normalized to ratios within masked positions before computing CE. "
+            "'original' matches JAX pre-de264f5: log-space decomposition, "
+            "y_pred not explicitly normalized -- this is the pre-648357d bug "
+            "that computed per-strand losses independently normalized and "
+            "summed them, ~2x-inflating the loss relative to a joint "
+            "normalization; kept only for ablation, not recommended. "
+            "'normalized' (default) matches JAX post-de264f5: both targets and "
+            "predictions normalized to ratios within masked positions before "
+            "computing CE -- this is the fixed/correct formula (648357d). "
             "'sparse' restricts CE and Poisson to donors/acceptors that have at least "
             "one observed junction count, avoiding the suppression gradient from the "
             "many zero-target positions in sparse training data."
