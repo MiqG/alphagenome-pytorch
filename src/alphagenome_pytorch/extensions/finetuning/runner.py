@@ -1391,13 +1391,16 @@ def main(args: argparse.Namespace | None = None) -> None:
             # Log epoch
             extra = {}
             histograms = {}
+            for mod, mod_loss in per_modality_train_loss.items():
+                extra[f"train_{mod}_loss"] = mod_loss
             for key, val in val_metrics.items():
                 if key.endswith("_values"):
                     histograms[key] = val
                 elif "pearson" in key:
                     extra[key] = val
                 else:
-                    extra[f"val_loss_{key}"] = val
+                    head = key.removesuffix("_loss")
+                    extra[f"val_{head}_loss"] = val
 
             logger.log_epoch(epoch, train_loss, val_loss, current_lr, is_best, extra, histograms)
 
