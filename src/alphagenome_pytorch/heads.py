@@ -140,8 +140,17 @@ class MultiOrganismLinear(nn.Module):
         stdv = 1.0 / math.sqrt(self.in_features)
 
         if self._init_scheme == 'truncated_normal':
-            # Match JAX: TruncatedNormal for weights, zeros for bias
-            nn.init.trunc_normal_(self.weight, std=stdv)
+            # Match JAX: TruncatedNormal for weights, zeros for bias. Bounds
+            # must be scaled by stdv (not left at trunc_normal_'s default
+            # a=-2.0/b=2.0, which are absolute values, not units of stdv) --
+            # otherwise at this scale (stdv ~= 1/sqrt(fan_in), e.g. ~0.0255)
+            # the truncation never binds and this silently degrades to an
+            # ordinary untruncated Normal(0, stdv**2), unlike JAX's Haiku
+            # TruncatedNormal(stddev=stdv), which truncates a standard normal
+            # to +/-2 THEN scales by stdv. Same pattern already used
+            # correctly below in SpliceSitesJunctionHead.make_rope_params's
+            # a=-2*std, b=2*std.
+            nn.init.trunc_normal_(self.weight, std=stdv, a=-2 * stdv, b=2 * stdv)
             nn.init.zeros_(self.bias)
         else:  # 'uniform'
             # Legacy PyTorch-style uniform initialization
@@ -182,7 +191,16 @@ class MultiOrganismConv1d(nn.Module):
         stdv = 1.0 / math.sqrt(self.in_channels)
 
         if self._init_scheme == 'truncated_normal':
-            nn.init.trunc_normal_(self.weight, std=stdv)
+            # Bounds must be scaled by stdv (not left at trunc_normal_'s
+            # default a=-2.0/b=2.0, which are absolute values, not units of
+            # stdv) -- otherwise at this scale (stdv ~= 1/sqrt(fan_in), e.g.
+            # ~0.0255) the truncation never binds and this silently degrades
+            # to an ordinary untruncated Normal(0, stdv**2), unlike JAX's
+            # Haiku TruncatedNormal(stddev=stdv), which truncates a standard
+            # normal to +/-2 THEN scales by stdv. Same pattern already used
+            # correctly in SpliceSitesJunctionHead.make_rope_params's
+            # a=-2*std, b=2*std.
+            nn.init.trunc_normal_(self.weight, std=stdv, a=-2 * stdv, b=2 * stdv)
             nn.init.zeros_(self.bias)
         else:  # 'uniform'
             self.weight.data.uniform_(-stdv, stdv)
