@@ -73,7 +73,7 @@ def test_track_metadata_loader_does_not_depend_on_cli_args(monkeypatch):
 
 
 @pytest.mark.parametrize("source", ["annotated", "predicted"])
-def test_main_resolves_routing_before_loading_base_weights(monkeypatch, tmp_path):
+def test_main_resolves_routing_before_loading_base_weights(monkeypatch, tmp_path, source):
     args = SimpleNamespace(seed=None, run_name="routing-smoke", output_dir=str(tmp_path),
                            resume=None, track_metadata=None, organism="human",
                            junction_position_source=source, junction_top_k=256,
