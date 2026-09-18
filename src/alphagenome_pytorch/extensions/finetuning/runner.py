@@ -359,6 +359,30 @@ def organism_index_from_args(args: argparse.Namespace) -> int:
     return ORGANISM_NAME_TO_INDEX.get(getattr(args, "organism", None) or "human", 0)
 
 
+def junction_prediction_top_k(
+    junction_position_source: str,
+    junction_top_k: int,
+) -> int | None:
+    """Return top-k only when junction positions are prediction-derived.
+
+    ``_call_splice_head`` historically treated any non-``None`` top-k as a
+    request to replace annotated positions with classification-head top-k
+    positions. Passing the CLI's positive default unconditionally therefore
+    made ``--junction-position-source annotated`` behave as ``predicted``.
+    Resolve that overloaded argument once at the runner boundary.
+    """
+    if junction_position_source == "annotated":
+        return None
+    if junction_position_source == "predicted":
+        if junction_top_k <= 0:
+            raise ValueError("junction_top_k must be positive in predicted mode")
+        return int(junction_top_k)
+    raise ValueError(
+        "junction_position_source must be 'annotated' or 'predicted', got "
+        f"{junction_position_source!r}"
+    )
+
+
 def load_track_metadata_for_finetune(
     path: str | None,
     modality_track_names: Mapping[str, Sequence[str]],
@@ -874,6 +898,15 @@ def main(args: argparse.Namespace | None = None) -> None:
     # (not args.organism) — otherwise a new human checkpoint records "unknown".
     organism_index = organism_index_from_args(args)
     organism_name = "mouse" if organism_index == 1 else "human"
+    junction_forward_top_k = junction_prediction_top_k(
+        args.junction_position_source, args.junction_top_k,
+    )
+    print_rank0(
+        "Junction positions: "
+        f"source={args.junction_position_source}, matrix_k={args.junction_top_k}, "
+        f"prediction_top_k={junction_forward_top_k}",
+        rank,
+    )
 
     # Hash the pristine base file before any training mutation. Rank 0 performs
     # the I/O once; all ranks receive the identity so every save path records
@@ -1082,6 +1115,9 @@ def main(args: argparse.Namespace | None = None) -> None:
         "locon_alpha": args.locon_alpha if args.mode in ("locon", "lora+locon") else None,
         "locon_targets": args.locon_targets if args.mode in ("locon", "lora+locon") else None,
         "head_init_scheme": args.head_init_scheme,
+        "junction_position_source": args.junction_position_source,
+        "junction_top_k": args.junction_top_k,
+        "junction_prediction_top_k": junction_forward_top_k,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
@@ -1187,7 +1223,7 @@ def main(args: argparse.Namespace | None = None) -> None:
             rank=rank, world_size=world_size,
             encoder_only=_eval_encoder_only,
             organism_idx=organism_index,
-            junction_top_k=args.junction_top_k,
+            junction_top_k=junction_forward_top_k,
             junction_loss=args.junction_loss,
             compute_per_sample=args.metrics_per_sample,
             min_alpha_juncs=args.min_alpha_juncs,
@@ -1284,7 +1320,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     gene_cross_track_weight=args.gene_cross_track_weight,
                     strand_channel_masks=gene_strand_channel_masks,
                     organism_idx=organism_index,
-                    junction_top_k=args.junction_top_k,
+                    junction_top_k=junction_forward_top_k,
                     junction_loss=args.junction_loss,
                     min_alpha_juncs=args.min_alpha_juncs,
                     handler=handler,
@@ -1325,7 +1361,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     gene_cross_track_weight=args.gene_cross_track_weight,
                     strand_channel_masks=gene_strand_channel_masks,
                     organism_idx=organism_index,
-                    junction_top_k=args.junction_top_k,
+                    junction_top_k=junction_forward_top_k,
                     junction_loss=args.junction_loss,
                     min_alpha_juncs=args.min_alpha_juncs,
                     handler=handler,
@@ -1359,7 +1395,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 world_size=world_size,
                 encoder_only=encoder_only,
                 organism_idx=organism_index,
-                junction_top_k=args.junction_top_k,
+                junction_top_k=junction_forward_top_k,
                 junction_loss=args.junction_loss,
                 compute_per_sample=args.metrics_per_sample,
                 min_alpha_juncs=args.min_alpha_juncs,
