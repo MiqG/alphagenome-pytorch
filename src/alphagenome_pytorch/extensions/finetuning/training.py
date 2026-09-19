@@ -54,6 +54,23 @@ if TYPE_CHECKING:
     from torch.optim import Optimizer
 
 
+def _completed_accumulation_boundary(
+    next_batch_idx: int, accumulation_steps: int
+) -> int:
+    """Return the next batch after the last fully-applied optimizer window.
+
+    Model/optimizer checkpoints do not serialize partially accumulated
+    ``parameter.grad`` buffers.  A signal observed after (say) 5 of 16
+    microbatches must therefore replay those 5 microbatches after resume, not
+    skip them.  Periodic saves occur on a complete window and are unchanged.
+    """
+    if next_batch_idx < 0:
+        raise ValueError("next_batch_idx must be non-negative")
+    if accumulation_steps < 1:
+        raise ValueError("accumulation_steps must be positive")
+    return next_batch_idx - next_batch_idx % accumulation_steps
+
+
 def collate_genomic(
     batch: list[tuple[Tensor, dict[int, Tensor]]],
 ) -> tuple[Tensor, dict[int, Tensor]]:
@@ -2108,6 +2125,7 @@ def train_epoch_multihead(
     global_step_offset: int = 0,
     skip_batches: int = 0,
     save_state: dict | None = None,
+    checkpoint_sync_group: Any | None = None,
     organism_idx: int = 0,
     junction_top_k: int | None = None,
     junction_loss: str = "original",
@@ -2195,19 +2213,19 @@ def train_epoch_multihead(
         if batch_idx < skip_batches:
             continue
 
-        # Kept current so an async preemption signal (which can fire between any
-        # two batches, not just on save_every_steps boundaries) always saves an
-        # accurate resume position instead of the stale value from the last
-        # periodic checkpoint.
+        # A checkpoint contains model/optimizer state but not a partially
+        # accumulated ``.grad`` buffer.  Keep the resume point at the last
+        # complete optimizer boundary so a signal between microbatches safely
+        # replays only the unfinished accumulation window.
         if save_state is not None:
-            save_state["batch_idx"] = batch_idx
+            save_state["batch_idx"] = _completed_accumulation_boundary(
+                batch_idx, accumulation_steps
+            )
 
         # Break as soon as a preemption signal is seen instead of only at
         # epoch boundaries. The signal handler's own save runs in a background
-        # thread concurrently with this loop, which can race and capture a
-        # stale batch_idx/model state; stopping here promptly shrinks that
-        # race window and lets the caller's post-loop save_and_exit() (which
-        # joins the background thread) capture a consistent, current state.
+        # thread only sets a flag; stopping here lets the caller's synchronous
+        # post-loop save_and_exit() capture a consistent state.
         if handler is not None and handler.preempted:
             break
 
@@ -2543,8 +2561,43 @@ def train_epoch_multihead(
                 global_step = global_step_offset + opt_step
                 if global_step % save_every_steps == 0:
                     if save_state is not None:
-                        save_state["batch_idx"] = batch_idx + 1
-                    save_fn()
+                        save_state["batch_idx"] = _completed_accumulation_boundary(
+                            batch_idx + 1, accumulation_steps
+                        )
+                    if world_size > 1 and dist.is_initialized():
+                        # Finish every rank's asynchronous optimizer/NCCL work
+                        # before rank 0 starts reading CUDA tensors for a save.
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                        dist.barrier(group=checkpoint_sync_group)
+                    save_error: Exception | None = None
+                    try:
+                        save_fn()
+                    except Exception as exc:  # coordinate failure across ranks
+                        save_error = exc
+                        import traceback
+
+                        traceback.print_exc()
+
+                    if world_size > 1 and dist.is_initialized():
+                        # This CPU collective both waits for rank 0's save and
+                        # propagates a rank-local serialization failure.  A
+                        # plain barrier would strand the other ranks forever
+                        # if rank 0 raised before reaching it.
+                        save_ok = torch.tensor(
+                            [0 if save_error is not None else 1], dtype=torch.int32
+                        )
+                        dist.all_reduce(
+                            save_ok,
+                            op=dist.ReduceOp.MIN,
+                            group=checkpoint_sync_group,
+                        )
+                        if save_ok.item() == 0:
+                            raise RuntimeError(
+                                "Checkpoint save failed on at least one DDP rank"
+                            ) from save_error
+                    elif save_error is not None:
+                        raise save_error
 
         raw_loss = loss.item()
         total_loss_accum += raw_loss
@@ -3191,6 +3244,7 @@ def train_epoch_sequence_parallel(
     global_step_offset: int = 0,
     skip_batches: int = 0,
     save_state: dict | None = None,
+    checkpoint_sync_group: Any | None = None,
     junction_top_k: int | None = None,
     junction_loss: str = "original",
     gene_loss_weights: dict[str, float] | None = None,
@@ -3213,7 +3267,8 @@ def train_epoch_sequence_parallel(
         max_grad_norm=max_grad_norm, profile_batches=profile_batches, log_fn=log_fn,
         encoder_only=encoder_only, save_every_steps=save_every_steps, save_fn=save_fn,
         global_step_offset=global_step_offset, skip_batches=skip_batches,
-        save_state=save_state, junction_top_k=junction_top_k, junction_loss=junction_loss,
+        save_state=save_state, checkpoint_sync_group=checkpoint_sync_group,
+        junction_top_k=junction_top_k, junction_loss=junction_loss,
         sequence_parallel=sequence_parallel, gene_loss_weights=gene_loss_weights,
         gene_cross_track_weight=gene_cross_track_weight,
         strand_channel_masks=strand_channel_masks, organism_idx=organism_idx,

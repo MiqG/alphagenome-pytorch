@@ -464,6 +464,15 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
         default=DEFAULTS["gradient_accumulation_steps"],
         help="Accumulate gradients over N batches",
     )
+    train.add_argument(
+        "--drop-incomplete-accumulation",
+        action="store_true",
+        help=(
+            "Drop the final per-rank microbatches when they do not fill one complete "
+            "gradient-accumulation window. This makes every optimizer update use the "
+            "declared effective batch size."
+        ),
+    )
     train.add_argument("--lr", type=float, default=DEFAULTS["lr"], help="Learning rate")
     train.add_argument("--weight-decay", type=float, default=DEFAULTS["weight_decay"])
     train.add_argument("--warmup-steps", type=int, default=DEFAULTS["warmup_steps"])
@@ -494,10 +503,13 @@ def add_finetune_arguments(parser: argparse.ArgumentParser) -> None:
     train.add_argument(
         "--junction-top-k",
         type=int,
-        default=512,
+        default=256,
         help=(
-            "Number of top-scoring splice sites per role (Donor+/-, Acceptor+/-) "
-            "to select when --junction-position-source=predicted. Default: 512."
+            "Maximum splice-site capacity per role (Donor+/-, Acceptor+/-). "
+            "In predicted mode this is the top-k selected by the classification "
+            "head; in annotated mode it sizes/truncates the dataset positions "
+            "and junction matrix too. Default: 256, matching the JAX workflow "
+            "and AlphaGenome's splice-junction scoring constant."
         ),
     )
     train.add_argument(
@@ -722,6 +734,7 @@ def postprocess_args(
         "epochs",
         "batch_size",
         "gradient_accumulation_steps",
+        "drop_incomplete_accumulation",
         "lr",
         "weight_decay",
         "warmup_steps",

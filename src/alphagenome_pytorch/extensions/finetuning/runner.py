@@ -70,6 +70,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
 import math
 import sys
 from collections.abc import Mapping, Sequence
@@ -149,6 +150,27 @@ from alphagenome_pytorch.extensions.finetuning.args import parse_args, SPLICE_MO
 # =============================================================================
 
 
+class _BatchLimitedLoader:
+    """Reusable length-aware prefix view over a DataLoader.
+
+    The underlying DistributedSampler still owns deterministic shuffling and
+    ``set_epoch``.  This view merely stops each rank after the same number of
+    microbatches so a trailing partial accumulation window is never stepped.
+    """
+
+    def __init__(self, loader, limit: int):
+        if limit < 0 or limit > len(loader):
+            raise ValueError(f"Invalid loader limit {limit} for {len(loader)} batches")
+        self.loader = loader
+        self.limit = limit
+
+    def __len__(self) -> int:
+        return self.limit
+
+    def __iter__(self):
+        return itertools.islice(iter(self.loader), self.limit)
+
+
 def unwrap_training_model(model: nn.Module) -> nn.Module:
     """Unwrap the exact wrapper stack used in this training script.
 
@@ -161,6 +183,23 @@ def unwrap_training_model(model: nn.Module) -> nn.Module:
     if isinstance(inner, DDP):
         return inner.module
     return inner
+
+
+_SPLICE_HEAD_ATTRS = {
+    "splice_site": "splice_sites_classification_head",
+    "splice_usage": "splice_sites_usage_head",
+    "splice_junctions": "splice_sites_junction_head",
+}
+
+
+def get_training_head(model: nn.Module, modality: str) -> nn.Module:
+    """Return a genomic-track or splice head from its canonical location."""
+    if modality in _SPLICE_HEAD_ATTRS:
+        head = getattr(model, _SPLICE_HEAD_ATTRS[modality], None)
+        if head is None:
+            raise KeyError(f"Model has no registered head for modality {modality!r}.")
+        return head
+    return model.heads[modality]
 
 
 # =============================================================================
@@ -367,9 +406,11 @@ def junction_prediction_top_k(
 
     ``_call_splice_head`` historically treated any non-``None`` top-k as a
     request to replace annotated positions with classification-head top-k
-    positions. Passing the CLI's positive default unconditionally therefore
-    made ``--junction-position-source annotated`` behave as ``predicted``.
-    Resolve that overloaded argument once at the runner boundary.
+    positions.  Passing the CLI's positive default unconditionally therefore
+    made ``--junction-position-source annotated`` behave as ``predicted`` while
+    the saved config still claimed ``annotated``.  Resolve that overloaded
+    low-level argument once at the runner boundary so runtime behavior and
+    provenance cannot diverge.
     """
     if junction_position_source == "annotated":
         return None
@@ -676,16 +717,6 @@ def create_model(
                 rank,
             )
 
-    # Optionally initialize head weights from pretrained organism slice.
-    if getattr(args, "pretrained_head_sample_dict", None) and rank == 0:
-        print_rank0("Loading pretrained head weights:", rank)
-        loaded = load_pretrained_head_weights(
-            model, args.pretrained_weights, args.pretrained_head_sample_dict,
-            organism_idx=organism_index_from_args(args),
-        )
-        if not loaded:
-            print_rank0("  Warning: no pretrained head weights were loaded.", rank)
-
     # Configure trainable params based on mode
     trainable_params: list[torch.nn.Parameter] = []
     transfer_config: TransferConfig | None = None  # For delta checkpoints
@@ -740,7 +771,7 @@ def create_model(
             )
             model = prepare_for_transfer(model, transfer_config)
             heads = {
-                modality: model.heads[modality]
+                modality: get_training_head(model, modality)
                 for modality in modality_track_names
             }
             for modality, track_names in modality_track_names.items():
@@ -772,17 +803,37 @@ def create_model(
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
+    # Active adapter modes create their heads in prepare_for_transfer(), so
+    # pretrained head slices must be loaded after mode setup rather than before.
+    if getattr(args, "pretrained_head_sample_dict", None) and rank == 0:
+        print_rank0("Loading pretrained head weights:", rank)
+        loaded = load_pretrained_head_weights(
+            model,
+            args.pretrained_weights,
+            args.pretrained_head_sample_dict,
+            organism_idx=organism_index_from_args(args),
+        )
+        if not loaded:
+            print_rank0("  Warning: no pretrained head weights were loaded.", rank)
+
     # Move to device
     model = model.to(device)
 
     # Wrap with DDP if multi-GPU
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            # Splice-head control flow can differ by interval/rank, so a
+            # parameter used on one step is not guaranteed to be used on all.
+            find_unused_parameters=True,
+        )
         print_rank0("Model wrapped with DistributedDataParallel", rank)
 
     # Get head references from the underlying model before optional compile.
     model_module = unwrap_training_model(model)
-    heads = {modality: model_module.heads[modality] for modality in heads}
+    heads = {modality: get_training_head(model_module, modality) for modality in heads}
 
     # Optionally compile
     if args.compile:
@@ -812,6 +863,10 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     # Setup distributed
     rank, world_size, local_rank, device = setup_distributed()
+    # Keep checkpoint synchronization off the CUDA/NCCL streams used by DDP.
+    checkpoint_sync_group = (
+        torch.distributed.new_group(backend="gloo") if world_size > 1 else None
+    )
 
     # Set seed
     if args.seed is not None:
@@ -954,7 +1009,24 @@ def main(args: argparse.Namespace | None = None) -> None:
         is_multimodal=True,  # Always multimodal now
         sequence_parallel_mode=args.sequence_parallel,
     )
-    print_rank0(f"Train batches: {len(train_loader):,}, Val batches: {len(val_loader):,}", rank)
+    raw_train_batches = len(train_loader)
+    dropped_train_batches = 0
+    if args.drop_incomplete_accumulation and args.gradient_accumulation_steps > 1:
+        usable_train_batches = (
+            raw_train_batches // args.gradient_accumulation_steps
+        ) * args.gradient_accumulation_steps
+        if usable_train_batches == 0:
+            raise ValueError(
+                "Training loader is smaller than one complete gradient-accumulation window"
+            )
+        dropped_train_batches = raw_train_batches - usable_train_batches
+        train_loader = _BatchLimitedLoader(train_loader, usable_train_batches)
+    print_rank0(
+        f"Train batches: {len(train_loader):,} usable / {raw_train_batches:,} raw "
+        f"({dropped_train_batches:,} tail batch(es) dropped); "
+        f"Val batches: {len(val_loader):,}",
+        rank,
+    )
 
     # Compute track means for each modality (rank 0 computes, then broadcast)
     modality_track_means: dict[str, torch.Tensor | None] = {}
@@ -1072,9 +1144,17 @@ def main(args: argparse.Namespace | None = None) -> None:
                 skip_prepare=True,
             )
             start_epoch = metadata.get("epoch", 0) + 1
+            # A preemption/periodic delta records the next dataloader batch in
+            # the unfinished epoch.  Epoch-boundary deltas omit it and retain
+            # the historical behavior (start the following epoch at batch 0).
+            skip_batches = int(metadata.get("batch_idx", 0) or 0)
             best_val_loss = metadata.get("best_val_loss", metadata.get("val_loss", float("inf")))
             wandb_run_id = metadata.get("wandb_run_id")
-            print_rank0(f"  Resumed from delta checkpoint at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
+            print_rank0(
+                f"  Resumed from delta checkpoint at epoch {start_epoch}, "
+                f"batch {skip_batches}, best_val_loss={best_val_loss:.4f}",
+                rank,
+            )
         else:
             # Full checkpoint
             ckpt = load_checkpoint(
@@ -1115,12 +1195,22 @@ def main(args: argparse.Namespace | None = None) -> None:
         "locon_alpha": args.locon_alpha if args.mode in ("locon", "lora+locon") else None,
         "locon_targets": args.locon_targets if args.mode in ("locon", "lora+locon") else None,
         "head_init_scheme": args.head_init_scheme,
+        "rope_init": args.rope_init,
+        "pretrained_head_samples": args.pretrained_head_sample_dict,
         "junction_position_source": args.junction_position_source,
         "junction_top_k": args.junction_top_k,
         "junction_prediction_top_k": junction_forward_top_k,
+        "junction_loss": args.junction_loss,
+        "min_alpha_juncs": args.min_alpha_juncs,
+        "gtf": args.gtf,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "drop_incomplete_accumulation": args.drop_incomplete_accumulation,
+        "raw_train_batches_per_epoch": raw_train_batches,
+        "train_batches_per_epoch": len(train_loader),
+        "dropped_train_batches_per_epoch": dropped_train_batches,
+        "optimizer_steps_per_epoch": len(train_loader) // args.gradient_accumulation_steps,
         "effective_batch_size": effective_batch_size,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
@@ -1184,6 +1274,7 @@ def main(args: argparse.Namespace | None = None) -> None:
             )
             print(f"Preemption checkpoint saved to {output_dir / 'checkpoint_preempt.pth'}")
         if args.save_delta and transfer_config is not None:
+            print("Saving delta checkpoint...", flush=True)
             save_delta_checkpoint(
                 path=output_dir / "checkpoint_preempt.delta.pth",
                 model=model_module,
@@ -1195,10 +1286,13 @@ def main(args: argparse.Namespace | None = None) -> None:
                 best_val_loss=best_val_loss,
                 **metadata_kwargs,
                 wandb_run_id=logger.wandb_run_id,
+                batch_idx=_save_state["batch_idx"],
             )
             print(f"Preemption delta checkpoint saved to {output_dir / 'checkpoint_preempt.delta.pth'}")
 
-    handler = setup_preemption_handler(_save_preempt, rank, world_size)
+    handler = setup_preemption_handler(
+        _save_preempt, rank, world_size, sync_group=checkpoint_sync_group
+    )
 
     # Eval-only mode: load checkpoint and run validation, then exit.
     if args.eval_only:
@@ -1213,11 +1307,12 @@ def main(args: argparse.Namespace | None = None) -> None:
         _eval_encoder_only = args.mode == "encoder-only"
         _eval_validate_kwargs = dict(
             model=model, heads=heads, device=device,
+            use_amp=use_amp,
             modality_weights=args.modality_weight_dict,
             resolution_weights=resolution_weights_per_modality,
             positional_weight=args.positional_weight,
             count_weight=args.count_weight,
-            compute_pearson=True,  # eval-only mode always computes Pearson
+            compute_pearson=not args.no_val_pearson,
             num_segments=args.num_segments,
             min_segment_size=args.min_segment_size,
             rank=rank, world_size=world_size,
@@ -1329,6 +1424,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     global_step_offset=global_step_offset,
                     skip_batches=epoch_skip,
                     save_state=_save_state,
+                    checkpoint_sync_group=checkpoint_sync_group,
                 )
             else:
                 # Standard multimodal training (uses multihead functions)
@@ -1370,6 +1466,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     global_step_offset=global_step_offset,
                     skip_batches=epoch_skip,
                     save_state=_save_state,
+                    checkpoint_sync_group=checkpoint_sync_group,
                 )
 
             if handler.preempted:
@@ -1513,7 +1610,8 @@ def main(args: argparse.Namespace | None = None) -> None:
                             wandb_run_id=logger.wandb_run_id,
                         )
 
-            barrier()
+            if world_size > 1 and torch.distributed.is_initialized():
+                torch.distributed.barrier(group=checkpoint_sync_group)
 
     except KeyboardInterrupt:
         print_rank0("\nTraining interrupted by user", rank)
