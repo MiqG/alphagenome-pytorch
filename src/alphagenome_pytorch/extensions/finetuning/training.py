@@ -246,6 +246,7 @@ def _call_splice_junction_head_sp(
         "pos_counts": pred_counts[..., :n_tissues],
         "neg_counts": pred_counts[..., n_tissues:],
         "positions":  positions,
+        "positions_are_predicted": junction_top_k is not None,
     }
 
 
@@ -316,7 +317,8 @@ def _call_splice_head(
         return {
             "pos_counts": out["pred_counts"][..., :n_tissues],
             "neg_counts": out["pred_counts"][..., n_tissues:],
-            "positions":  positions,  # (B, 4, K) — present only in predicted mode
+            "positions":  positions,
+            "positions_are_predicted": junction_top_k is not None,
         }
     else:
         out = head(emb, org, channels_last=channels_last)
@@ -484,12 +486,12 @@ def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
 def _get_junction_targets(predictions, targets_dict, device):
     """Return (junc_matrix, positions) aligned to the current predictions.
 
-    In predicted mode (``"positions"`` key present in predictions): builds the
+    In predicted mode (``positions_are_predicted=True``): builds the
     junction matrix on-the-fly from pre-filtered DataFrames in
     ``targets_dict["all_junctions"]`` and the predicted splice-site positions.
     In annotated mode: uses the pre-built tensors from ``targets_dict``.
     """
-    if "positions" in predictions:
+    if predictions.get("positions_are_predicted", False):
         from alphagenome_pytorch.extensions.finetuning.star_junctions import (
             junctions_to_junction_matrix,
         )
