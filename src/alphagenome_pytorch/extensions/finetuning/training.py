@@ -435,14 +435,22 @@ def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
     ], dim=-1)
 
     if not pairs_mask.any():
+        if junction_loss == "normalized":
+            # A masked example contributes zero, but keep the autograd graph
+            # connected, matching the JAX loss and supporting junction-only
+            # training batches that happen to have no valid pairs.
+            return torch.where(pairs_mask, pred_counts, torch.zeros_like(pred_counts)).sum() * 0.0
         return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
 
     target = torch.where(pairs_mask, target_counts, torch.zeros_like(target_counts))
     pred   = torch.where(pairs_mask, pred_counts,   torch.zeros_like(pred_counts))
 
-    # Skip intervals with no observed junction counts — the JAX cross-entropy
-    # goes negative when targets are all zero, polluting the loss with noise.
-    if not (target > 0).any():
+    # Preserve legacy original/sparse behavior. The normalized formulation
+    # has well-defined smoothed ratios even for zero observed counts and must
+    # still apply the Poisson penalty to positive predictions, as JAX does.
+    # Skipping it here would make the objective depend on whether this sample
+    # shares a batch with a nonempty sample.
+    if junction_loss != "normalized" and not (target > 0).any():
         return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
 
     sum_pred_d = pred.sum(dim=1)
