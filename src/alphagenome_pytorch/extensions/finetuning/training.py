@@ -25,6 +25,10 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from alphagenome_pytorch import losses
+from alphagenome_pytorch.extensions.finetuning.gradient_utils import (
+    average_gradients_across_ranks,
+    unique_trainable_parameters,
+)
 from alphagenome_pytorch.losses import (
     multinomial_loss,
     cross_entropy_loss,
@@ -1777,6 +1781,13 @@ def train_epoch_ddp(
             # Get trainable parameters for gradient clipping
             trainable_params = [p for p in head.parameters() if p.requires_grad]
             trainable_params += [p for p in model.parameters() if p.requires_grad]
+            trainable_params = unique_trainable_parameters(trainable_params)
+
+            # A no-grad backbone forward does not prepare DDP's backward
+            # reducer for the externally evaluated head. Synchronize once at
+            # the accumulated optimizer boundary, before clipping.
+            if (frozen_backbone or encoder_only) and world_size > 1:
+                average_gradients_across_ranks(trainable_params)
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
             optimizer.step()
@@ -2168,6 +2179,7 @@ def train_epoch_multihead(
     opt_step = 0
 
     gene_loss_weights = gene_loss_weights or {}
+    organism_idx_value = int(organism_idx)
 
     for batch_idx, batch_data in enumerate(pbar):
         if batch_idx < skip_batches:
@@ -2207,7 +2219,9 @@ def train_epoch_multihead(
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
-        organism_idx = torch.full((sequences.shape[0],), organism_idx, dtype=torch.long, device=device)
+        organism_idx = torch.full(
+            (sequences.shape[0],), organism_idx_value, dtype=torch.long, device=device
+        )
 
         if is_profiling:
             _cuda_sync(device)
@@ -2489,6 +2503,9 @@ def train_epoch_multihead(
             for head in heads.values():
                 trainable_params.extend([p for p in head.parameters() if p.requires_grad])
             trainable_params.extend([p for p in model.parameters() if p.requires_grad])
+            # Heads are also registered children of model: clip/reduce each
+            # parameter exactly once, even when reachable through both paths.
+            trainable_params = unique_trainable_parameters(trainable_params)
 
             # SP bypasses DDP's allreduce hook — sum gradients across ranks.
             # Each rank holds complementary sequence shards (not data-parallel copies),
@@ -2497,6 +2514,10 @@ def train_epoch_multihead(
                 for p in trainable_params:
                     if p.grad is not None:
                         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            elif (frozen_backbone or encoder_only) and world_size > 1:
+                # Frozen-backbone DDP forward runs under no_grad, so head
+                # gradients computed outside it need explicit DP averaging.
+                average_gradients_across_ranks(trainable_params)
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
             optimizer.step()
@@ -2717,12 +2738,15 @@ def validate_multihead(
     # @torch.no_grad() already wraps this whole function; the nested
     # `with torch.no_grad():` here is redundant but kept to match this
     # function's original indentation depth without a large reflow.
+    organism_idx_value = int(organism_idx)
     with torch.no_grad():
         for batch_data in pbar:
             sequences, modality_targets, extras = _unpack_batch(batch_data)
             coords = extras.get("coords")
             sequences = sequences.to(device)
-            organism_idx = torch.full((sequences.shape[0],), organism_idx, dtype=torch.long, device=device)
+            organism_idx = torch.full(
+                (sequences.shape[0],), organism_idx_value, dtype=torch.long, device=device
+            )
 
             # Collect all resolutions
             all_resolutions = set()
