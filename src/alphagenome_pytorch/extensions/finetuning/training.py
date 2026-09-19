@@ -25,6 +25,10 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from alphagenome_pytorch import losses
+from alphagenome_pytorch.extensions.finetuning.gradient_utils import (
+    average_gradients_across_ranks,
+    unique_trainable_parameters,
+)
 from alphagenome_pytorch.losses import (
     multinomial_loss,
     cross_entropy_loss,
@@ -48,6 +52,23 @@ SPLICE_HEAD_TYPES = (SpliceSitesClassificationHead, SpliceSitesUsageHead, Splice
 
 if TYPE_CHECKING:
     from torch.optim import Optimizer
+
+
+def _completed_accumulation_boundary(
+    next_batch_idx: int, accumulation_steps: int
+) -> int:
+    """Return the next batch after the last fully-applied optimizer window.
+
+    Model/optimizer checkpoints do not serialize partially accumulated
+    ``parameter.grad`` buffers.  A signal observed after (say) 5 of 16
+    microbatches must therefore replay those 5 microbatches after resume, not
+    skip them.  Periodic saves occur on a complete window and are unchanged.
+    """
+    if next_batch_idx < 0:
+        raise ValueError("next_batch_idx must be non-negative")
+    if accumulation_steps < 1:
+        raise ValueError("accumulation_steps must be positive")
+    return next_batch_idx - next_batch_idx % accumulation_steps
 
 
 def collate_genomic(
@@ -242,6 +263,7 @@ def _call_splice_junction_head_sp(
         "pos_counts": pred_counts[..., :n_tissues],
         "neg_counts": pred_counts[..., n_tissues:],
         "positions":  positions,
+        "positions_are_predicted": junction_top_k is not None,
     }
 
 
@@ -312,7 +334,8 @@ def _call_splice_head(
         return {
             "pos_counts": out["pred_counts"][..., :n_tissues],
             "neg_counts": out["pred_counts"][..., n_tissues:],
-            "positions":  positions,  # (B, 4, K) — present only in predicted mode
+            "positions":  positions,
+            "positions_are_predicted": junction_top_k is not None,
         }
     else:
         out = head(emb, org, channels_last=channels_last)
@@ -431,14 +454,22 @@ def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
     ], dim=-1)
 
     if not pairs_mask.any():
+        if junction_loss == "normalized":
+            # A masked example contributes zero, but keep the autograd graph
+            # connected, matching the JAX loss and supporting junction-only
+            # training batches that happen to have no valid pairs.
+            return torch.where(pairs_mask, pred_counts, torch.zeros_like(pred_counts)).sum() * 0.0
         return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
 
     target = torch.where(pairs_mask, target_counts, torch.zeros_like(target_counts))
     pred   = torch.where(pairs_mask, pred_counts,   torch.zeros_like(pred_counts))
 
-    # Skip intervals with no observed junction counts — the JAX cross-entropy
-    # goes negative when targets are all zero, polluting the loss with noise.
-    if not (target > 0).any():
+    # Preserve legacy original/sparse behavior. The normalized formulation
+    # has well-defined smoothed ratios even for zero observed counts and must
+    # still apply the Poisson penalty to positive predictions, as JAX does.
+    # Skipping it here would make the objective depend on whether this sample
+    # shares a batch with a nonempty sample.
+    if junction_loss != "normalized" and not (target > 0).any():
         return torch.tensor(0.0, device=device, dtype=pred_counts.dtype)
 
     sum_pred_d = pred.sum(dim=1)
@@ -472,12 +503,12 @@ def _compute_junction_loss(pos_pred, pos_target, pos_donor_pos, pos_accept_pos,
 def _get_junction_targets(predictions, targets_dict, device):
     """Return (junc_matrix, positions) aligned to the current predictions.
 
-    In predicted mode (``"positions"`` key present in predictions): builds the
+    In predicted mode (``positions_are_predicted=True``): builds the
     junction matrix on-the-fly from pre-filtered DataFrames in
     ``targets_dict["all_junctions"]`` and the predicted splice-site positions.
     In annotated mode: uses the pre-built tensors from ``targets_dict``.
     """
-    if "positions" in predictions:
+    if predictions.get("positions_are_predicted", False):
         from alphagenome_pytorch.extensions.finetuning.star_junctions import (
             junctions_to_junction_matrix,
         )
@@ -1777,6 +1808,13 @@ def train_epoch_ddp(
             # Get trainable parameters for gradient clipping
             trainable_params = [p for p in head.parameters() if p.requires_grad]
             trainable_params += [p for p in model.parameters() if p.requires_grad]
+            trainable_params = unique_trainable_parameters(trainable_params)
+
+            # A no-grad backbone forward does not prepare DDP's backward
+            # reducer for the externally evaluated head. Synchronize once at
+            # the accumulated optimizer boundary, before clipping.
+            if (frozen_backbone or encoder_only) and world_size > 1:
+                average_gradients_across_ranks(trainable_params)
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
             optimizer.step()
@@ -2087,6 +2125,7 @@ def train_epoch_multihead(
     global_step_offset: int = 0,
     skip_batches: int = 0,
     save_state: dict | None = None,
+    checkpoint_sync_group: Any | None = None,
     organism_idx: int = 0,
     junction_top_k: int | None = None,
     junction_loss: str = "original",
@@ -2168,24 +2207,25 @@ def train_epoch_multihead(
     opt_step = 0
 
     gene_loss_weights = gene_loss_weights or {}
+    organism_idx_value = int(organism_idx)
 
     for batch_idx, batch_data in enumerate(pbar):
         if batch_idx < skip_batches:
             continue
 
-        # Kept current so an async preemption signal (which can fire between any
-        # two batches, not just on save_every_steps boundaries) always saves an
-        # accurate resume position instead of the stale value from the last
-        # periodic checkpoint.
+        # A checkpoint contains model/optimizer state but not a partially
+        # accumulated ``.grad`` buffer.  Keep the resume point at the last
+        # complete optimizer boundary so a signal between microbatches safely
+        # replays only the unfinished accumulation window.
         if save_state is not None:
-            save_state["batch_idx"] = batch_idx
+            save_state["batch_idx"] = _completed_accumulation_boundary(
+                batch_idx, accumulation_steps
+            )
 
         # Break as soon as a preemption signal is seen instead of only at
         # epoch boundaries. The signal handler's own save runs in a background
-        # thread concurrently with this loop, which can race and capture a
-        # stale batch_idx/model state; stopping here promptly shrinks that
-        # race window and lets the caller's post-loop save_and_exit() (which
-        # joins the background thread) capture a consistent, current state.
+        # thread only sets a flag; stopping here lets the caller's synchronous
+        # post-loop save_and_exit() capture a consistent state.
         if handler is not None and handler.preempted:
             break
 
@@ -2207,7 +2247,9 @@ def train_epoch_multihead(
             t0 = time.perf_counter()
 
         sequences = sequences.to(device)
-        organism_idx = torch.full((sequences.shape[0],), organism_idx, dtype=torch.long, device=device)
+        organism_idx = torch.full(
+            (sequences.shape[0],), organism_idx_value, dtype=torch.long, device=device
+        )
 
         if is_profiling:
             _cuda_sync(device)
@@ -2489,6 +2531,9 @@ def train_epoch_multihead(
             for head in heads.values():
                 trainable_params.extend([p for p in head.parameters() if p.requires_grad])
             trainable_params.extend([p for p in model.parameters() if p.requires_grad])
+            # Heads are also registered children of model: clip/reduce each
+            # parameter exactly once, even when reachable through both paths.
+            trainable_params = unique_trainable_parameters(trainable_params)
 
             # SP bypasses DDP's allreduce hook — sum gradients across ranks.
             # Each rank holds complementary sequence shards (not data-parallel copies),
@@ -2497,6 +2542,10 @@ def train_epoch_multihead(
                 for p in trainable_params:
                     if p.grad is not None:
                         dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            elif (frozen_backbone or encoder_only) and world_size > 1:
+                # Frozen-backbone DDP forward runs under no_grad, so head
+                # gradients computed outside it need explicit DP averaging.
+                average_gradients_across_ranks(trainable_params)
 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=max_grad_norm)
             optimizer.step()
@@ -2512,8 +2561,43 @@ def train_epoch_multihead(
                 global_step = global_step_offset + opt_step
                 if global_step % save_every_steps == 0:
                     if save_state is not None:
-                        save_state["batch_idx"] = batch_idx + 1
-                    save_fn()
+                        save_state["batch_idx"] = _completed_accumulation_boundary(
+                            batch_idx + 1, accumulation_steps
+                        )
+                    if world_size > 1 and dist.is_initialized():
+                        # Finish every rank's asynchronous optimizer/NCCL work
+                        # before rank 0 starts reading CUDA tensors for a save.
+                        if device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                        dist.barrier(group=checkpoint_sync_group)
+                    save_error: Exception | None = None
+                    try:
+                        save_fn()
+                    except Exception as exc:  # coordinate failure across ranks
+                        save_error = exc
+                        import traceback
+
+                        traceback.print_exc()
+
+                    if world_size > 1 and dist.is_initialized():
+                        # This CPU collective both waits for rank 0's save and
+                        # propagates a rank-local serialization failure.  A
+                        # plain barrier would strand the other ranks forever
+                        # if rank 0 raised before reaching it.
+                        save_ok = torch.tensor(
+                            [0 if save_error is not None else 1], dtype=torch.int32
+                        )
+                        dist.all_reduce(
+                            save_ok,
+                            op=dist.ReduceOp.MIN,
+                            group=checkpoint_sync_group,
+                        )
+                        if save_ok.item() == 0:
+                            raise RuntimeError(
+                                "Checkpoint save failed on at least one DDP rank"
+                            ) from save_error
+                    elif save_error is not None:
+                        raise save_error
 
         raw_loss = loss.item()
         total_loss_accum += raw_loss
@@ -2717,12 +2801,15 @@ def validate_multihead(
     # @torch.no_grad() already wraps this whole function; the nested
     # `with torch.no_grad():` here is redundant but kept to match this
     # function's original indentation depth without a large reflow.
+    organism_idx_value = int(organism_idx)
     with torch.no_grad():
         for batch_data in pbar:
             sequences, modality_targets, extras = _unpack_batch(batch_data)
             coords = extras.get("coords")
             sequences = sequences.to(device)
-            organism_idx = torch.full((sequences.shape[0],), organism_idx, dtype=torch.long, device=device)
+            organism_idx = torch.full(
+                (sequences.shape[0],), organism_idx_value, dtype=torch.long, device=device
+            )
 
             # Collect all resolutions
             all_resolutions = set()
@@ -3157,6 +3244,7 @@ def train_epoch_sequence_parallel(
     global_step_offset: int = 0,
     skip_batches: int = 0,
     save_state: dict | None = None,
+    checkpoint_sync_group: Any | None = None,
     junction_top_k: int | None = None,
     junction_loss: str = "original",
     gene_loss_weights: dict[str, float] | None = None,
@@ -3179,7 +3267,8 @@ def train_epoch_sequence_parallel(
         max_grad_norm=max_grad_norm, profile_batches=profile_batches, log_fn=log_fn,
         encoder_only=encoder_only, save_every_steps=save_every_steps, save_fn=save_fn,
         global_step_offset=global_step_offset, skip_batches=skip_batches,
-        save_state=save_state, junction_top_k=junction_top_k, junction_loss=junction_loss,
+        save_state=save_state, checkpoint_sync_group=checkpoint_sync_group,
+        junction_top_k=junction_top_k, junction_loss=junction_loss,
         sequence_parallel=sequence_parallel, gene_loss_weights=gene_loss_weights,
         gene_cross_track_weight=gene_cross_track_weight,
         strand_channel_masks=strand_channel_masks, organism_idx=organism_idx,

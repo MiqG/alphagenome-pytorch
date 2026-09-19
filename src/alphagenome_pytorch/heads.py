@@ -140,8 +140,14 @@ class MultiOrganismLinear(nn.Module):
         stdv = 1.0 / math.sqrt(self.in_features)
 
         if self._init_scheme == 'truncated_normal':
-            # Match JAX: TruncatedNormal for weights, zeros for bias
-            nn.init.trunc_normal_(self.weight, std=stdv)
+            # Haiku's TruncatedNormal(stddev=stdv) samples a standard normal
+            # truncated to [-2, 2] and then scales it by stdv.  PyTorch's
+            # bounds are in output units, so its defaults a=-2, b=2 would be
+            # effectively untruncated for this small stddev.  Scale the bounds
+            # explicitly to match JAX's distribution.
+            nn.init.trunc_normal_(
+                self.weight, std=stdv, a=-2.0 * stdv, b=2.0 * stdv,
+            )
             nn.init.zeros_(self.bias)
         else:  # 'uniform'
             # Legacy PyTorch-style uniform initialization
@@ -182,7 +188,9 @@ class MultiOrganismConv1d(nn.Module):
         stdv = 1.0 / math.sqrt(self.in_channels)
 
         if self._init_scheme == 'truncated_normal':
-            nn.init.trunc_normal_(self.weight, std=stdv)
+            nn.init.trunc_normal_(
+                self.weight, std=stdv, a=-2.0 * stdv, b=2.0 * stdv,
+            )
             nn.init.zeros_(self.bias)
         else:  # 'uniform'
             self.weight.data.uniform_(-stdv, stdv)
